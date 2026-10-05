@@ -1,0 +1,20 @@
+{
+  "name": "pi-loop",
+  "version": "0.1.0",
+  "description": "Recurring prompts for the Pi coding agent: /loop and loop_manage, with DST-aware daily times, script gates that decide whether to wake the model, and a Herdr sidebar countdown.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package", "pi", "pi-extension", "loop", "schedule", "cron", "herdr"],
+  "repository": { "type": "git", "url": "git+https://github.com/recursive-systems/pi-loop.git" },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test --test-concurrency=4 tests/*.test.ts"
+  }
+}
