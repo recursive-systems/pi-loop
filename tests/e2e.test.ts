@@ -438,10 +438,50 @@ test("a lock left by a process that is gone, even with its pid reused, is taken 
 	const a = new Pi(t, p);
 	await a.ready();
 	assert.match(await a.command("/loop 1h mine"), /loop mine:/);
-	assert.equal(fs.readFileSync(path.join(p.cwd, ".pi/loops.lock"), "utf8").split(" ")[0], String(a.proc.pid));
+	assert.equal(JSON.parse(fs.readFileSync(path.join(p.cwd, ".pi/loops.lock"), "utf8")).pid, a.proc.pid);
 	const b = new Pi(t, p);
 	await b.ready();
 	assert.match(await b.command("/loop 1h theirs"), /owned by pid/);
+});
+
+test("an owner in another time zone is still recognised as alive", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	const a = new Pi(t, p, { TZ: "Asia/Tokyo", LC_ALL: "C" });
+	await a.ready();
+	assert.match(await a.command("/loop 1h mine"), /loop mine:/);
+	const b = new Pi(t, p, { TZ: "America/Los_Angeles" });
+	await b.ready();
+	assert.match(await b.command("/loop 1h theirs"), /owned by pid/);
+});
+
+test("several sessions starting at once against a dead owner's lock: exactly one takes it over", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), JSON.stringify({ pid: process.pid, started: "not this process", token: "dead" }));
+	const all = [0, 1, 2, 3].map(() => new Pi(t, p));
+	await Promise.all(all.map(x => x.ready()));
+	const notes = [];
+	for (const [i, x] of all.entries()) notes.push(await x.command(`/loop 1h from-${i}`));
+	assert.equal(notes.filter(n => !/owned by pid/.test(n)).length, 1, notes.join(" | "));
+	assert.equal(p.loops().length, 1);
+	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loops.lock.takeover")), "no takeover file left behind");
+});
+
+test("at shutdown a running gate is waited for even if its loop was removed meanwhile", { timeout: 120_000 }, async t => {
+	const gate = '#!/bin/sh\ndate +%s > "$LOOP_STATE_DIR/began"\nsleep 30\ndate +%s > "$LOOP_STATE_DIR/ended"\necho \'{"action":"skip","reason":"done"}\'\n';
+	const p = project(t, { files: { ".pi/loop.json": JSON.stringify([{ id: "slow", prompt: "x", every: "1h", gate: ".pi/gates/slow", gateTimeout: "60s" }]), ".pi/gates/slow": gate },
+		loops: [due("slow", { prompt: "x", source: ".pi/loop.json", rev: 1, gate: { command: ".pi/gates/slow", timeoutMs: 60_000, onError: "wake" } })] });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	const state = path.join(p.cwd, ".pi/loop-state/slow");
+	const end = Date.now() + TICK * 2 + 5_000;
+	while (!fs.existsSync(path.join(state, "began")) && Date.now() < end) await new Promise(r => setTimeout(r, 200));
+	fs.writeFileSync(path.join(p.cwd, ".pi/loop.json"), "[]"); // the loop goes away while its gate runs
+	await new Promise(r => setTimeout(r, TICK + 1_000));
+	assert.ok(!fs.existsSync(path.join(state, "ended")), "the gate is still running");
+	pi.proc.kill("SIGTERM");
+	const lock = path.join(p.cwd, ".pi/loops.lock");
+	while (fs.existsSync(lock)) await new Promise(r => setTimeout(r, 100));
+	assert.ok(fs.existsSync(path.join(state, "ended")), "the lock was released only after the gate finished");
 });
 
 test("two sessions starting at once in a folder: exactly one owns its loops", { timeout: 60_000 }, async t => {

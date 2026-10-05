@@ -33,6 +33,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -189,7 +190,16 @@ const startedCache = new Map<number, string>();
 function startedOf(pid: number): string {
 	if (startedCache.has(pid) && pid === process.pid) return startedCache.get(pid)!;
 	let v = "";
-	try { v = String(execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 })).trim().replace(/\s+/g, " "); } catch { /* gone, or no ps */ }
+	try {
+		// Linux: boot id plus start time in clock ticks, the kernel's own identity for the process.
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		const ticks = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+		const boot = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+		if (ticks) v = `${boot}:${ticks}`;
+	} catch {
+		// Elsewhere: ps, in a fixed zone and locale so every reader formats it the same way.
+		try { v = String(execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2000, env: { ...process.env, TZ: "UTC", LC_ALL: "C" } })).trim().replace(/\s+/g, " "); } catch { /* gone, or no ps: the pid alone counts */ }
+	}
 	if (pid === process.pid) startedCache.set(pid, v);
 	return v;
 }
@@ -225,7 +235,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Loops whose gate is running now; they are not due again until it returns. */
 	const gating = new Set<string>();
 	/** Gates still running, so shutdown can wait for them (a wake they return is kept, not lost). */
-	const inflight = new Set<Promise<void>>();
+	const inflight = new Map<Promise<void>, number>(); // each running gate, and when it must have finished
 	let closing = false;
 	/** Loops that came due while the session was busy, and since when; they fire once it is free. */
 	const waited = new Map<string, number>();
@@ -287,43 +297,57 @@ export default function loopExtension(pi: ExtensionAPI) {
 		fs.renameSync(tmp, file);
 	}
 	/**
-	 * One owner per project: the lock is created exclusively and holds "<pid> <start time>". A lock
-	 * whose process is gone (or whose pid now belongs to another process) is taken over, by moving it
-	 * aside first so two claimants can't both win.
+	 * One owner per project. The lock appears with its whole record at once (written aside, then
+	 * hard-linked into place, which fails if it exists) and names its owner by a token of its own.
+	 * A lock whose process is gone, or whose pid now belongs to another process (start time differs),
+	 * is taken over under a short-lived takeover file, so two claimants can't both replace it.
+	 * Without /proc or ps, only the pid is checked, and a reused pid looks alive.
 	 */
-	const me = () => `${process.pid} ${startedOf(process.pid)}`.trim();
-	function lockOwner(): { pid: number; started?: string } | undefined {
-		try {
-			const [pid, ...rest] = fs.readFileSync(lock, "utf8").trim().split(" ");
-			return Number(pid) > 0 ? { pid: Number(pid), ...(rest.length ? { started: rest.join(" ") } : {}) } : undefined;
-		} catch { return undefined; }
+	const token = randomUUID();
+	type Owner = { pid: number; started?: string; token?: string; raw: string };
+	function lockOwner(): Owner | undefined {
+		let raw: string;
+		try { raw = fs.readFileSync(lock, "utf8").trim(); } catch { return undefined; }
+		try { const o = JSON.parse(raw); if (Number(o.pid) > 0) return { pid: Number(o.pid), started: o.started || undefined, token: o.token, raw }; } catch { /* older plain format */ }
+		const [pid, ...rest] = raw.split(" ");
+		return Number(pid) > 0 ? { pid: Number(pid), ...(rest.length ? { started: rest.join(" ") } : {}), raw } : { pid: 0, raw };
 	}
-	function ownerAlive(o: { pid: number; started?: string }): boolean {
-		if (!pidAlive(o.pid)) return false;
-		return o.started === undefined || startedOf(o.pid) === "" || startedOf(o.pid) === o.started;
+	function ownerAlive(o: Owner): boolean {
+		if (!(o.pid > 0) || !pidAlive(o.pid)) return false;
+		const now = startedOf(o.pid);
+		return o.started === undefined || now === "" || now === o.started;
 	}
 	function claimLock(): boolean {
 		fs.mkdirSync(path.dirname(lock), { recursive: true });
-		for (let attempt = 0; attempt < 3; attempt++) {
-			try {
-				const fd = fs.openSync(lock, "wx", 0o600);
-				fs.writeSync(fd, me()); fs.closeSync(fd);
-				return true;
-			} catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; }
-			const o = lockOwner();
-			if (o?.pid === process.pid) return true;
-			if (o && ownerAlive(o)) return false;
-			// Stale (or unreadable): move it aside, then try the exclusive create again.
-			const aside = `${lock}.stale.${process.pid}`;
-			try { fs.renameSync(lock, aside); fs.unlinkSync(aside); } catch { /* someone else moved it first */ }
-		}
-		return false;
+		const tmp = `${lock}.${token}.tmp`;
+		fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, started: startedOf(process.pid), token }), { mode: 0o600 });
+		try {
+			for (let attempt = 0; attempt < 3; attempt++) {
+				try { fs.linkSync(tmp, lock); return true; } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; }
+				const o = lockOwner();
+				if (!o) continue; // gone meanwhile: try again
+				if (o.token === token) return true;
+				if (ownerAlive(o)) return false;
+				// Stale: take it over, one claimant at a time.
+				const takeover = `${lock}.takeover`;
+				try { fs.closeSync(fs.openSync(takeover, "wx", 0o600)); }
+				catch {
+					try { if (Date.now() - fs.statSync(takeover).mtimeMs > 30_000) fs.unlinkSync(takeover); } catch { /* gone */ }
+					return false; // someone else is taking it over; look again next time
+				}
+				try {
+					const again = lockOwner();
+					if (again && again.raw === o.raw) fs.unlinkSync(lock); // still the stale record we judged
+				} finally { try { fs.unlinkSync(takeover); } catch { /* fine */ } }
+			}
+			return false;
+		} finally { try { fs.unlinkSync(tmp); } catch { /* fine */ } }
 	}
 	function releaseLock() {
-		try { if (lockOwner()?.pid === process.pid) fs.unlinkSync(lock); } catch { /* fine */ }
+		try { if (lockOwner()?.token === token) fs.unlinkSync(lock); } catch { /* fine */ }
 	}
 	function ownerPid(): string {
-		return String(lockOwner()?.pid ?? "?");
+		return String(lockOwner()?.pid || "?");
 	}
 
 	// -------------------------------------------------------------- display --
@@ -493,7 +517,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 				waited.delete(l.id); // the occurrence was handled (skipped, deferred, or a quiet gate error)
 				save(); refreshStatus();
 			});
-		inflight.add(done);
+		inflight.set(done, started + (l.gate!.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS));
 		void done.finally(() => inflight.delete(done));
 	}
 
@@ -519,16 +543,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	function fire(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
 		try { home(l); } catch (e) { const msg = `loop ${l.id}: ${(e as Error).message}; not fired`; notify(msg, "warning"); return msg; }
-		waited.delete(l.id);
-		delete l.pendingWake;
+		// The occurrence is recorded as sent only after it is handed over (below): a crash in between
+		// sends it again with the same fire number, which a host recognises as the same occurrence.
+		const before = { fires: l.fires, lastFiredAt: l.lastFiredAt, lastWokeAt: l.lastWokeAt, nextAt: l.nextAt, pendingWake: l.pendingWake, waited: waited.get(l.id) };
 		l.fires += 1;
 		l.lastFiredAt = Date.now();
 		l.lastWokeAt = l.lastFiredAt;
-		phase = { state: "queued", id: l.id };
-		phaseAt = Date.now();
 		// A manual run of a loop that is due (or waiting) is that occurrence; a manual run ahead of time isn't.
 		if (reason !== "manual" || l.nextAt <= Date.now()) l.nextAt = nextFor(l, Date.now());
-		save();
 		// One line: a gate's reason may hold newlines (a JSON "\n"), and readers of the header
 		// (the model, and any extension that recognises loop turns) take it to end at the line's closing "]".
 		const why = gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : "";
@@ -540,7 +562,20 @@ export default function loopExtension(pi: ExtensionAPI) {
 		let commands: CommandInfo[] = [];
 		try { commands = (pi as any).getCommands?.() ?? []; } catch { /* older Pi */ }
 		const { text, expand } = compose(l.prompt, header + where, evidence, home(l), commands, !!l.dir);
-		pi.sendUserMessage(text, { deliverAs: "followUp", expandPromptTemplates: expand });
+		try {
+			// `loop` names the occurrence for a host (Pi ignores it): the same id and fire mean the same turn.
+			pi.sendUserMessage(text, { deliverAs: "followUp", expandPromptTemplates: expand, loop: { id: l.id, fire: l.fires, rev: l.rev ?? 0 } } as any);
+		} catch (e) {
+			Object.assign(l, { fires: before.fires, lastFiredAt: before.lastFiredAt, lastWokeAt: before.lastWokeAt, nextAt: before.nextAt });
+			const msg = `loop ${l.id}: couldn't send its turn (${(e as Error).message}); it stays due`;
+			notify(msg, "warning"); refreshStatus();
+			return msg;
+		}
+		waited.delete(l.id);
+		delete l.pendingWake;
+		phase = { state: "queued", id: l.id };
+		phaseAt = Date.now();
+		save();
 		refreshStatus();
 	}
 
@@ -814,8 +849,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// next owner instead of lost; a gate may already have recorded that it reported it.
 		closing = true;
 		if (inflight.size && !readOnly) {
-			const longest = Math.max(...loops.filter(l => gating.has(l.id)).map(l => l.gate?.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS), 1000);
-			await Promise.race([Promise.allSettled([...inflight]), new Promise(r => setTimeout(r, longest + 2000))]);
+			// Each gate is bounded by its own timeout from when it started (runGate kills it then).
+			const until = Math.max(...inflight.values()) + 2000;
+			await Promise.race([Promise.allSettled([...inflight.keys()]), new Promise(r => setTimeout(r, Math.max(0, until - Date.now())))]);
 		}
 		closing = false;
 		if (herdrPane && !readOnly) herdr.clear();

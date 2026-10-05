@@ -19,8 +19,10 @@ schedule. Optional gate scripts decide whether a due loop wakes the model.
   with the package (a git install runs `npm install`).
 - A host (a scheduler that embeds this extension per folder, such as herdr-pi-loops) passes a context
   with `mode: "host"`, its own `isIdle`/`hasPendingMessages`, and runs the turns it is sent through
-  `sendUserMessage`. Keep that contract working: the lock, kept wakes and draining gates at shutdown
-  are what make it safe.
+  `sendUserMessage`, whose options carry `loop: { id, fire, rev }` (Pi ignores it). A fire is recorded
+  only after `sendUserMessage` returns, so a crash re-sends the same id and fire: a host must treat
+  that as the same occurrence. Keep that contract working: the lock, kept wakes and draining gates at
+  shutdown are what make it safe.
 - The `[loop <id> · … ]` header line is a public contract. Change it only in a major version.
 
 ## Writing for people
