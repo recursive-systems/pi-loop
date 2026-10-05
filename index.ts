@@ -32,6 +32,7 @@
  * `at HH:MM` exists because the daily job is the case this was built for.
  */
 
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -84,6 +85,12 @@ interface Loop {
 	declaredPaused?: boolean;
 	/** Bumped whenever the loop's definition changes, so a gate run for an older definition is discarded. */
 	rev?: number;
+	/**
+	 * A gate said wake but the turn couldn't be sent yet (the session was busy, or shutting down).
+	 * Gates may record what they reported, so the wake is kept, with its reason and context, and
+	 * sent once the session is free; the gate isn't run again. Dropped if the loop is redefined.
+	 */
+	pendingWake?: { reason: string; context?: string; at: number; rev: number };
 }
 
 /** Most text attached from context files to one turn. */
@@ -108,7 +115,7 @@ function agentDir(): string {
  * Default zone for `at` loops: `loop.timezone` from the project's
  * .pi/settings.json, else the agent dir's settings.json, else the system zone.
  */
-function configuredZone(cwd: string): { tz: string; source: string; warning?: string } {
+export function configuredZone(cwd: string): { tz: string; source: string; warning?: string } {
 	const files = [path.join(cwd, ".pi", "settings.json"), path.join(agentDir(), "settings.json")];
 	for (const file of files) {
 		let raw: unknown;
@@ -174,6 +181,18 @@ function sessionOf(c: ExtensionContext | undefined): GateSession {
 	} catch { return {}; }
 }
 
+/**
+ * When a process started, as the OS reports it, so a lock left by a dead process whose pid was
+ * reused isn't mistaken for a live owner. Empty if it can't be read (then the pid alone counts).
+ */
+const startedCache = new Map<number, string>();
+function startedOf(pid: number): string {
+	if (startedCache.has(pid) && pid === process.pid) return startedCache.get(pid)!;
+	let v = "";
+	try { v = String(execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 })).trim().replace(/\s+/g, " "); } catch { /* gone, or no ps */ }
+	if (pid === process.pid) startedCache.set(pid, v);
+	return v;
+}
 function pidAlive(pid: number): boolean {
 	try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
@@ -205,6 +224,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 	let phaseAt = 0;
 	/** Loops whose gate is running now; they are not due again until it returns. */
 	const gating = new Set<string>();
+	/** Gates still running, so shutdown can wait for them (a wake they return is kept, not lost). */
+	const inflight = new Set<Promise<void>>();
+	let closing = false;
 	/** Loops that came due while the session was busy, and since when; they fire once it is free. */
 	const waited = new Map<string, number>();
 	/** Counts runs the session started; a gate's wake is used only if none started while it ran. */
@@ -264,20 +286,44 @@ export default function loopExtension(pi: ExtensionAPI) {
 		fs.writeFileSync(tmp, JSON.stringify(loops, null, 2), { mode: 0o600 });
 		fs.renameSync(tmp, file);
 	}
-	function claimLock(): boolean {
+	/**
+	 * One owner per project: the lock is created exclusively and holds "<pid> <start time>". A lock
+	 * whose process is gone (or whose pid now belongs to another process) is taken over, by moving it
+	 * aside first so two claimants can't both win.
+	 */
+	const me = () => `${process.pid} ${startedOf(process.pid)}`.trim();
+	function lockOwner(): { pid: number; started?: string } | undefined {
 		try {
-			const pid = Number(fs.readFileSync(lock, "utf8").trim());
-			if (pid && pid !== process.pid && pidAlive(pid)) return false;
-		} catch { /* no lock */ }
+			const [pid, ...rest] = fs.readFileSync(lock, "utf8").trim().split(" ");
+			return Number(pid) > 0 ? { pid: Number(pid), ...(rest.length ? { started: rest.join(" ") } : {}) } : undefined;
+		} catch { return undefined; }
+	}
+	function ownerAlive(o: { pid: number; started?: string }): boolean {
+		if (!pidAlive(o.pid)) return false;
+		return o.started === undefined || startedOf(o.pid) === "" || startedOf(o.pid) === o.started;
+	}
+	function claimLock(): boolean {
 		fs.mkdirSync(path.dirname(lock), { recursive: true });
-		fs.writeFileSync(lock, String(process.pid), { mode: 0o600 });
-		return true;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			try {
+				const fd = fs.openSync(lock, "wx", 0o600);
+				fs.writeSync(fd, me()); fs.closeSync(fd);
+				return true;
+			} catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; }
+			const o = lockOwner();
+			if (o?.pid === process.pid) return true;
+			if (o && ownerAlive(o)) return false;
+			// Stale (or unreadable): move it aside, then try the exclusive create again.
+			const aside = `${lock}.stale.${process.pid}`;
+			try { fs.renameSync(lock, aside); fs.unlinkSync(aside); } catch { /* someone else moved it first */ }
+		}
+		return false;
 	}
 	function releaseLock() {
-		try { if (fs.readFileSync(lock, "utf8").trim() === String(process.pid)) fs.unlinkSync(lock); } catch { /* fine */ }
+		try { if (lockOwner()?.pid === process.pid) fs.unlinkSync(lock); } catch { /* fine */ }
 	}
 	function ownerPid(): string {
-		try { return fs.readFileSync(lock, "utf8").trim(); } catch { return "?"; }
+		return String(lockOwner()?.pid ?? "?");
 	}
 
 	// -------------------------------------------------------------- display --
@@ -404,28 +450,37 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/**
 	 * Run a gated loop's gate, then wake, skip or defer. Runs only while the session is free.
-	 * The loop is rescheduled first so it is not due twice; if the session became busy while
-	 * the gate ran, a wake is not used: the loop is due again and its gate runs afresh later.
+	 * The loop is rescheduled first so it is not due twice. A wake that comes back while the
+	 * session is busy (or was busy meanwhile, or is shutting down) is kept as pendingWake and sent
+	 * once the session is free, without running the gate again.
 	 */
 	function gateThen(l: Loop, reason: Reason) {
 		const started = Date.now();
-		const dueAt = l.nextAt, rev = l.rev ?? 0, act = activity;
+		const rev = l.rev ?? 0, act = activity;
 		l.nextAt = nextFor(l, started);
 		gating.add(l.id);
 		save();
 		let run: Promise<GateDecision>;
 		try { run = runGate(home(l), l.gate!, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: stateDirOf(l), session: sessionOf(ctx) }); }
 		catch (e) { run = Promise.resolve({ action: l.gate!.onError, reason: `gate error: ${(e as Error).message}`, error: true }); }
-		void run
+		const done = run
 			.catch((e): GateDecision => ({ action: l.gate!.onError, reason: `gate error: ${(e as Error)?.message ?? e}`, error: true }))
 			.then(raw => {
 				gating.delete(l.id);
 				if (!ctx || readOnly || !loops.includes(l)) return;
 				// The loop was redefined while its gate ran: this answer is about the old one. Its schedule stands.
 				if ((l.rev ?? 0) !== rev) { refreshStatus(); return; }
-				// The session worked (or is working) while the gate ran: the evidence may be stale. Due again, gated afresh.
-				if (raw.action === "wake" && (busy() || activity !== act)) {
-					l.nextAt = dueAt; waited.set(l.id, waited.get(l.id) ?? started);
+				// The session is busy, worked while the gate ran, or is shutting down: keep the wake and send
+				// it once free. Gates may record what they reported, so running this one again could lose it.
+				if (raw.action === "wake" && !l.paused && (closing || busy() || activity !== act)) {
+					const d = backoff(l, raw, Date.now());
+					l.gateRuns = (l.gateRuns ?? 0) + 1;
+					l.lastGate = { at: Date.now(), action: d.action, reason: d.reason };
+					logDecision(gateLog, { ts: new Date().toISOString(), id: l.id, action: d.action, reason: d.reason, ms: Date.now() - started, ...(d.error ? { error: true } : {}) });
+					if (d.action === "wake") {
+						l.pendingWake = { reason: d.reason, ...(d.context ? { context: d.context } : {}), at: started, rev };
+						waited.set(l.id, waited.get(l.id) ?? started);
+					}
 					save(); refreshStatus(); return;
 				}
 				if (raw.action !== "wake") waited.delete(l.id);
@@ -438,6 +493,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 				waited.delete(l.id); // the occurrence was handled (skipped, deferred, or a quiet gate error)
 				save(); refreshStatus();
 			});
+		inflight.add(done);
+		void done.finally(() => inflight.delete(done));
 	}
 
 	/**
@@ -463,6 +520,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function fire(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
 		try { home(l); } catch (e) { const msg = `loop ${l.id}: ${(e as Error).message}; not fired`; notify(msg, "warning"); return msg; }
 		waited.delete(l.id);
+		delete l.pendingWake;
 		l.fires += 1;
 		l.lastFiredAt = Date.now();
 		l.lastWokeAt = l.lastFiredAt;
@@ -515,6 +573,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const out: string[] = [];
 		const at = (dir: string) => { const f = path.join(dir, ".pi", "loop.json"); if (fs.existsSync(f)) out.push(f); };
 		at(cwd);
+		// A host (a scheduler that embeds this extension for one folder) serves only that folder's loops.
+		if (ctx!.mode === "host") return out;
 		let entries: fs.Dirent[] = [];
 		try { entries = fs.readdirSync(cwd, { withFileTypes: true }); } catch { /* unreadable */ }
 		for (const e of entries) if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules") at(path.join(cwd, e.name));
@@ -658,7 +718,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (phase?.state === "queued" && now - phaseAt > 2 * TICK_MS && ctx.isIdle?.() && !ctx.hasPendingMessages?.()) phase = undefined;
 		syncDeclared();
 		for (const id of waited.keys()) if (!loops.some(l => l.id === id && !l.paused)) waited.delete(id);
-		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && l.nextAt <= now);
+		// A kept wake whose loop was redefined since is about the old definition: drop it.
+		for (const l of loops) if (l.pendingWake && l.pendingWake.rev !== (l.rev ?? 0)) { delete l.pendingWake; save(); }
+		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && (l.nextAt <= now || l.pendingWake));
 		if (!dueNow.length) { refreshStatus(); return; }
 		// Busy: due loops wait, once each, for the session to be free; nothing is queued behind the turn.
 		if (busy() || gating.size) {
@@ -675,7 +737,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			waited.delete(due.id); due.nextAt = nextFor(due, now); save(); refreshStatus();
 			return;
 		}
-		const since = waited.get(due.id);
+		const since = waited.get(due.id) ?? due.pendingWake?.at;
+		if (due.pendingWake) {
+			const w = due.pendingWake;
+			fire(due, `waited ${countdown(Math.max(0, now - w.at))}`, { action: "wake", reason: w.reason, ...(w.context ? { context: w.context } : {}) });
+			return;
+		}
 		if (since === undefined && now - due.nextAt > TICK_MS * 4 && due.catchUp === "none") {
 			// Missed by more than a minute with no session to run it (sleep, restart): short loops just realign.
 			due.nextAt = nextFor(due, now);
@@ -740,9 +807,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 		refreshStatus();
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		if (timer) clearInterval(timer);
 		timer = undefined;
+		// Let running gates finish (up to their own timeout), so a wake they return is kept for the
+		// next owner instead of lost; a gate may already have recorded that it reported it.
+		closing = true;
+		if (inflight.size && !readOnly) {
+			const longest = Math.max(...loops.filter(l => gating.has(l.id)).map(l => l.gate?.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS), 1000);
+			await Promise.race([Promise.allSettled([...inflight]), new Promise(r => setTimeout(r, longest + 2000))]);
+		}
+		closing = false;
 		if (herdrPane && !readOnly) herdr.clear();
 		if (!readOnly) releaseLock();
 		ctx = undefined;

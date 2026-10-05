@@ -17,6 +17,10 @@ schedule. Optional gate scripts decide whether a due loop wakes the model.
   the context layers, run those.
 - Pi supplies `@earendil-works/*` and `typebox`: keep them optional peer dependencies, never installed
   with the package (a git install runs `npm install`).
+- A host (a scheduler that embeds this extension per folder, such as herdr-pi-loops) passes a context
+  with `mode: "host"`, its own `isIdle`/`hasPendingMessages`, and runs the turns it is sent through
+  `sendUserMessage`. Keep that contract working: the lock, kept wakes and draining gates at shutdown
+  are what make it safe.
 - The `[loop <id> · … ]` header line is a public contract. Change it only in a major version.
 
 ## Writing for people

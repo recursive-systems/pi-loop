@@ -376,22 +376,81 @@ test("due loops wait while the session is busy, then fire once each, highest pri
 	assert.equal(byId.urgent.fires, 1);
 });
 
-test("a gate's wake isn't used if the session worked while the gate ran; the gate runs again", { timeout: 120_000 }, async t => {
-	const p = project(t, {
-		loops: [due("slow", { gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })],
-		gates: { slow: '#!/bin/sh\ndate +%s >> "$LOOP_STATE_DIR/ran"\nsleep 6\necho \'{"action":"wake","reason":"looked"}\'\n' },
-	});
+const slowGate = '#!/bin/sh\ndate +%s >> "$LOOP_STATE_DIR/ran"\nsleep 6\nif [ -f "$LOOP_STATE_DIR/told" ]; then echo \'{"action":"skip","reason":"already told"}\'; else touch "$LOOP_STATE_DIR/told"; echo \'{"action":"wake","reason":"queue grew","context":"42 waiting"}\'; fi\n';
+// Like real gates, slowGate records what it reported: run again, it has nothing to say.
+const gateRan = (cwd: string, id: string) => { try { return fs.readFileSync(path.join(cwd, ".pi/loop-state", id, "ran"), "utf8").trim().split("\n").length; } catch { return 0; } };
+async function untilRan(cwd: string, id: string) {
+	const end = Date.now() + TICK * 2 + 5_000;
+	while (!gateRan(cwd, id) && Date.now() < end) await new Promise(r => setTimeout(r, 200));
+}
+
+test("a gate's wake that comes back after the session worked is kept and sent once it's free; the gate isn't run again", { timeout: 120_000 }, async t => {
+	const p = project(t, { loops: [due("slow", { gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })], gates: { slow: slowGate } });
 	const pi = new Pi(t, p);
 	await pi.ready();
-	const ran = path.join(p.cwd, ".pi/loop-state/slow/ran");
-	const end = Date.now() + TICK * 2 + 5_000;
-	while (!fs.existsSync(ran) && Date.now() < end) await new Promise(r => setTimeout(r, 200));
-	// A prompt arrives while the gate runs; its run starts and (no model here) ends at once.
-	await pi.send({ type: "prompt", message: "something else" });
+	await untilRan(p.cwd, "slow");
+	await pi.send({ type: "prompt", message: "something else" }); // a run starts (and, with no model here, ends) while the gate runs
 	const msg = await pi.waitForUser(/^\[loop slow /, TICK * 3 + 15_000);
-	assert.match(msg, /gate: looked\]/);
-	assert.equal(fs.readFileSync(ran, "utf8").trim().split("\n").length, 2, "the first answer was discarded and the gate ran again");
+	assert.match(msg, /· waited [^·\]]+ · gate: queue grew\]/);
+	assert.match(msg, /<gate-context>\n42 waiting\n<\/gate-context>/);
+	assert.equal(gateRan(p.cwd, "slow"), 1, "the gate ran once");
 	assert.equal(p.loops()[0].fires, 1);
+	assert.equal(p.loops()[0].pendingWake, undefined);
+});
+
+test("a kept wake is dropped if its loop is redefined before it's sent", { timeout: 120_000 }, async t => {
+	const decl = (prompt: string) => JSON.stringify([{ id: "slow", prompt, every: "1h", gate: ".pi/gates/slow", gateTimeout: "30s" }]);
+	const p = project(t, { files: { ".pi/loop.json": decl("first"), ".pi/gates/slow": slowGate }, loops: [due("slow", { prompt: "first", source: ".pi/loop.json", rev: 1, gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })] });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	await untilRan(p.cwd, "slow");
+	await pi.send({ type: "prompt", message: "something else" });
+	fs.writeFileSync(path.join(p.cwd, ".pi/loop.json"), decl("second")); // redefined while the gate runs
+	await new Promise(r => setTimeout(r, TICK * 2 + 8_000));
+	assert.ok(!pi.userMessages().some(m => m.startsWith("[loop slow")), "the old evidence wasn't sent with the new prompt");
+	const [l] = p.loops();
+	assert.equal(l.prompt, "second");
+	assert.equal(l.pendingWake, undefined);
+	assert.ok(l.nextAt > Date.now(), "it waits for its next time");
+});
+
+test("a session stopped while a gate runs keeps the gate's wake; the next session sends it without running the gate again", { timeout: 120_000 }, async t => {
+	const p = project(t, { loops: [due("slow", { gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })], gates: { slow: slowGate } });
+	const first = new Pi(t, p);
+	await first.ready();
+	await untilRan(p.cwd, "slow");
+	first.proc.kill("SIGTERM");
+	await new Promise<void>(r => first.proc.on("exit", () => r()));
+	const kept = p.loops()[0].pendingWake;
+	assert.equal(kept?.reason, "queue grew", JSON.stringify(p.loops()[0]));
+	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loops.lock")), "the lock was released after the gate finished");
+	const second = new Pi(t, p);
+	await second.ready();
+	const msg = await second.waitForUser(/^\[loop slow /, TICK * 2 + 5_000);
+	assert.match(msg, /· gate: queue grew\]/);
+	assert.equal(gateRan(p.cwd, "slow"), 1);
+});
+
+test("a lock left by a process that is gone, even with its pid reused, is taken over; a live owner's is not", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	// This test's own pid is alive, but started at another time than the lock says: a reused pid.
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), `${process.pid} Sat Jan  1 00:00:00 2000`);
+	const a = new Pi(t, p);
+	await a.ready();
+	assert.match(await a.command("/loop 1h mine"), /loop mine:/);
+	assert.equal(fs.readFileSync(path.join(p.cwd, ".pi/loops.lock"), "utf8").split(" ")[0], String(a.proc.pid));
+	const b = new Pi(t, p);
+	await b.ready();
+	assert.match(await b.command("/loop 1h theirs"), /owned by pid/);
+});
+
+test("two sessions starting at once in a folder: exactly one owns its loops", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	const [a, b] = [new Pi(t, p), new Pi(t, p)];
+	await Promise.all([a.ready(), b.ready()]);
+	const notes = [await a.command("/loop 1h from-a"), await b.command("/loop 1h from-b")];
+	assert.equal(notes.filter(n => /owned by pid/.test(n)).length, 1, notes.join(" | "));
+	assert.equal(p.loops().length, 1);
 });
 
 test("/loop run on a loop that is due is that occurrence: it doesn't fire again", { timeout: 90_000 }, async t => {

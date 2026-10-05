@@ -19,7 +19,7 @@ The prompt comes back to *the same session*, so the agent remembers what it did 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.3.0
+pi install git:github.com/recursive-systems/pi-loop@v0.3.1
 ```
 
 Add `-l` to install it for one project only.
@@ -82,6 +82,13 @@ Log each decision to `$LOOP_STATE_DIR` so you can tune the thresholds later.
 ```json
 {"loops": [{"id": "api-check", "prompt": "/check", "every": "5m", "gate": ".pi/gates/check", "context": ["AGENTS.md"]}]}
 ```
+
+## Running loops with no session open
+
+[herdr-pi-loops](https://github.com/recursive-systems/herdr-pi-loops) is a Herdr plugin that runs
+declared loops for you: each role folder gets a pane, Pi starts there only for a turn, and one
+dashboard shows every loop. A scheduler like it embeds this extension with `mode: "host"` in the
+context it passes, and then serves only that folder's own `.pi/loop.json`.
 
 ## Good to know
 
