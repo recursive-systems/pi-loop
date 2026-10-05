@@ -19,7 +19,7 @@ The prompt comes back to *the same session*, so the agent remembers what it did 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.2.1
+pi install git:github.com/recursive-systems/pi-loop@v0.3.0
 ```
 
 Add `-l` to install it for one project only.
@@ -68,6 +68,20 @@ in a gate:
    agent only once a day to act on the results.
 
 Log each decision to `$LOOP_STATE_DIR` so you can tune the thresholds later.
+
+## One session, several jobs
+
+- **Loops never pile up.** A loop that comes due while the agent is busy waits and fires once when
+  it's free, with its gate run at that moment so the evidence is fresh. When several are waiting,
+  the one with the highest `priority` goes first.
+- **Each job can have its own folder** with its gate, its prompt template and its instructions
+  (`dir`, and `context: ["AGENTS.md"]` to attach them to that job's turns only).
+- **Declare loops in files.** A `.pi/loop.json` in the project, or in any folder directly under it,
+  defines loops; edit the file to change them. Adding a folder adds a job:
+
+```json
+{"loops": [{"id": "api-check", "prompt": "/check", "every": "5m", "gate": ".pi/gates/check", "context": ["AGENTS.md"]}]}
+```
 
 ## Good to know
 

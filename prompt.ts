@@ -57,19 +57,23 @@ export function stripFrontmatter(s: string): string {
 	return (m ? t.slice(m[0].length) : t).trim();
 }
 
-/** The template file for `/name`: the one Pi loaded, else the project's own. */
-export function templatePath(name: string, cwd: string, commands: CommandInfo[]): string | undefined {
+/**
+ * The template file for `/name`: the one Pi loaded, else the project's own. A loop with its
+ * own folder (`local`) looks in that folder first, so two folders can each have a `/check`.
+ */
+export function templatePath(name: string, cwd: string, commands: CommandInfo[], local = false): string | undefined {
+	const own = path.join(cwd, ".pi", "prompts", `${name}.md`);
+	if (local && fs.existsSync(own)) return own;
 	const loaded = commands.find(c => c.name === name && c.source === "prompt" && c.sourceInfo?.path);
 	if (loaded && fs.existsSync(loaded.sourceInfo!.path!)) return loaded.sourceInfo!.path;
 	if (commands.some(c => c.name === name && c.source !== "prompt")) return undefined; // a command, not a template
-	const local = path.join(cwd, ".pi", "prompts", `${name}.md`);
-	return fs.existsSync(local) ? local : undefined;
+	return fs.existsSync(own) ? own : undefined;
 }
 
-export function compose(prompt: string, header: string, evidence: string, cwd: string, commands: CommandInfo[]): Composed {
+export function compose(prompt: string, header: string, evidence: string, cwd: string, commands: CommandInfo[], local = false): Composed {
 	const m = prompt.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
 	if (m && !m[1].startsWith("skill:")) {
-		const file = templatePath(m[1], cwd, commands);
+		const file = templatePath(m[1], cwd, commands, local);
 		if (file) {
 			try {
 				const body = substitute(stripFrontmatter(fs.readFileSync(file, "utf8")), parseArgs(m[2] ?? ""));

@@ -67,7 +67,31 @@ shows its decision without waking. You can also run the file by hand with
 `LOOP_STATE_DIR=/tmp/x LOOP_TEST=1 .pi/gates/check`. Every decision is appended to
 `.pi/loops.log.jsonl`.
 
-## 4. When it fires
+## 4. Several jobs in one session
+
+One session can carry several responsibilities, each a loop:
+
+- **A loop waits while the session is busy.** It isn't queued behind the current turn and never
+  stacks: a 5-minute check through a 20-minute turn fires once, afterwards, and its gate runs then,
+  so the evidence is fresh. The header then says `· waited 18m`. When several are waiting,
+  `priority` (higher first) decides, then the longest overdue.
+- **Give each job its own folder** (`dir`): its gate, its `.pi/prompts/<name>.md` and its state
+  live there, so two folders can each have a `/check`. `context: ["AGENTS.md"]` attaches that
+  folder's instructions to the job's turns only. Gate paths are relative to the folder.
+- **Declare loops in files** so adding a job is adding a folder. `.pi/loop.json` in the project or
+  in any folder directly under it:
+
+  ```json
+  {"loops": [{"id": "api-check", "prompt": "/check", "every": "5m", "gate": ".pi/gates/check",
+              "maxSleep": "12h", "context": ["AGENTS.md"], "priority": 1}]}
+  ```
+
+  Fields match `loop_manage create` (`every` or `at`, `timezone`, `gate`, `maxSleep`, `gateTimeout`,
+  `gateOnError`, `priority`, `context`, `paused`). The folder holding the file is the loop's folder.
+  Edits apply within a tick; deleting the entry deletes the loop. Change a declared loop in its file,
+  not with `loop_manage` (pause and resume still work).
+
+## 5. When it fires
 
 The message starts with `[loop <id> · <schedule> · fire #N …]`. Do the template's work, send the
 result where it says, and keep "nothing to do" turns to one line. To stop or change the loop,

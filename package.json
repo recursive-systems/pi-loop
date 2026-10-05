@@ -1,6 +1,6 @@
 {
   "name": "pi-loop",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Recurring prompts for the Pi coding agent: /loop and loop_manage, with DST-aware daily times, script gates that decide whether to wake the model, and a Herdr sidebar countdown.",
   "license": "MIT",
   "private": true,

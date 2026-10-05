@@ -10,10 +10,19 @@
  *   /loop rm|pause|resume|run <id> manage one (only when <id> is an existing loop)
  *   /loop clear                    delete all
  *
- * When a loop is due, its prompt is sent to this session as a user message
- * (`sendUserMessage`, deliverAs "followUp"): idle -> a turn starts now; busy ->
- * it runs after the current turn. The turn shares this session's context, which
- * is the point of this design over a scheduled child. Loops persist in
+ * When a loop is due and the session is idle, its gate (if any) runs and its prompt
+ * is sent as a user message that starts a turn. While the session is busy, a due
+ * loop waits: it is not queued behind the current turn, it never stacks (a 5m loop
+ * through a 20-minute turn fires once, afterwards), and its gate runs only once the
+ * session is free, so the turn gets fresh evidence. When several loops are waiting,
+ * the highest `priority` goes first, then the longest overdue. The turn shares this
+ * session's context, which is the point of this design over a scheduled child.
+ *
+ * A loop may have its own folder (`dir`, inside the project): its gate, prompt
+ * template and state are found there, and `context` files from it are attached to
+ * its turn. Loops can also be declared in `.pi/loop.json` files, in the project or
+ * in any folder directly under it; a declared loop's folder is the one holding the
+ * file, and editing the file changes the loop (run state stays in .pi/loops.json). Loops persist in
  * .pi/loops.json and are restored on session start; a due loop missed while no
  * session was alive fires once on start (catchUp "latest") unless it is a short
  * interval (< 1h), which just advances. One session owns the loops per project
@@ -63,6 +72,23 @@ interface Loop {
 	/** Consecutive gate errors, and when one last woke the model (error backoff). */
 	gateErrors?: number;
 	gateErrorWokeAt?: number;
+	/** Higher goes first when several loops are waiting for the session. Default 0. */
+	priority?: number;
+	/** The loop's own folder, relative to the project: gate, prompt template and state are found there. */
+	dir?: string;
+	/** Files in the loop's folder (or the project) attached to each turn, e.g. AGENTS.md. */
+	context?: string[];
+	/** The .pi/loop.json that declares this loop, relative to the project; edit the loop there. */
+	source?: string;
+}
+
+/** Most text attached from context files to one turn. */
+const MAX_LOOP_CONTEXT_CHARS = 64_000;
+/** A declaration in a .pi/loop.json file. */
+interface Declared {
+	id: string; prompt: string; every?: string; at?: string; timezone?: string;
+	gate?: string; maxSleep?: string; gateTimeout?: string; gateOnError?: string;
+	priority?: number; context?: string[]; paused?: boolean;
 }
 
 // ------------------------------------------------------------ settings --
@@ -148,6 +174,19 @@ function pidAlive(pid: number): boolean {
 	try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
+/** A folder inside the project, normalized relative to it; undefined for the project itself. Throws if outside. */
+function insideDir(cwd: string, dir: string | undefined): string | undefined {
+	if (!dir || dir === "." || dir === "./") return undefined;
+	if (path.isAbsolute(dir)) throw new Error("dir must be a folder relative to the project");
+	const root = fs.realpathSync(cwd);
+	let abs: string;
+	try { abs = fs.realpathSync(path.resolve(root, dir)); } catch { throw new Error(`dir ${dir} does not exist`); }
+	if (abs === root) return undefined;
+	if (!abs.startsWith(root + path.sep)) throw new Error("dir must be inside the project");
+	if (!fs.statSync(abs).isDirectory()) throw new Error(`dir ${dir} is not a folder`);
+	return path.relative(root, abs);
+}
+
 export default function loopExtension(pi: ExtensionAPI) {
 	let ctx: ExtensionContext | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
@@ -162,6 +201,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 	let phaseAt = 0;
 	/** Loops whose gate is running now; they are not due again until it returns. */
 	const gating = new Set<string>();
+	/** Loops that came due while the session was busy, and since when; they fire once it is free. */
+	const waited = new Map<string, number>();
+	/** The declaring files as last read (path -> mtime), so unchanged ones aren't re-read every tick. */
+	let declaredSeen = "";
+	const declaredErrors = new Map<string, string>();
 	let gateLog = "";
 
 	const zoneOf = (l: Loop) => l.tz ?? zone.tz;
@@ -170,6 +214,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Loops whose fire times depend on a zone: daily `at` and whole-day intervals (1d, 7d). */
 	const zoned = (sch: Schedule) => sch.kind === "at" || sch.ms % 86_400_000 === 0;
 	const desc = (l: Loop) => describe(l.schedule, zoned(l.schedule) ? zoneOf(l) : undefined);
+	/** The loop's folder: where its gate, prompt template and state live. */
+	const home = (l: Loop) => l.dir ? path.join(ctx!.cwd, l.dir) : ctx!.cwd;
+	const stateDirOf = (l: Loop) => path.join(home(l), ".pi", "loop-state", l.id);
+	/** Busy: a run, compaction or queued prompt, or a loop turn of ours not finished yet. */
+	const busy = () => { try { return !ctx!.isIdle() || !!ctx!.hasPendingMessages?.() || !!phase; } catch { return true; } };
 
 	/**
 	 * Re-derive future zoned fire times (`at`, whole-day intervals) from the current zone, so a changed
@@ -233,7 +282,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (readOnly) { ctx.ui.setStatus(STATUS_KEY, `loops: ${loops.length} (owned by pid ${ownerPid()})`); return; }
 		const now = Date.now();
 		if (herdrPane) herdr.update(loopTokens(loops, now, phase), now);
-		if (phase) { ctx.ui.setStatus(STATUS_KEY, `loops: ${active.length} \u00b7 ${phase.id} ${phase.state}`); return; }
+		const waiting = waited.size ? ` \u00b7 ${waited.size} waiting` : "";
+		if (phase) { ctx.ui.setStatus(STATUS_KEY, `loops: ${active.length} \u00b7 ${phase.id} ${phase.state}${waiting}`); return; }
+		if (waited.size) { ctx.ui.setStatus(STATUS_KEY, `loops: ${active.length}${waiting} for this session to be free`); return; }
 		const next = active.slice().sort((a, b) => a.nextAt - b.nextAt)[0];
 		ctx.ui.setStatus(STATUS_KEY, next
 			? `loops: ${active.length}${loops.length > active.length ? ` (+${loops.length - active.length} paused)` : ""} · next ${next.id} ${when(next)} (in ${countdown(Math.max(0, next.nextAt - now))})`
@@ -247,7 +298,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return head + loops.map(l => {
 			const state = l.paused ? "paused" : `next ${when(l)}`;
 			const p = l.prompt.length > 70 ? `${l.prompt.slice(0, 67)}…` : l.prompt;
-			return `${l.id}  ${desc(l)}  ${state}  ×${l.fires}\n    ${p}${l.gate ? `\n    ${gateText(l)}` : ""}`;
+			const extra = [l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "", waited.has(l.id) ? "waiting for this session to be free" : ""].filter(Boolean);
+			return `${l.id}  ${desc(l)}  ${state}  ×${l.fires}\n    ${p}${extra.length ? `\n    ${extra.join(" · ")}` : ""}${l.gate ? `\n    ${gateText(l)}` : ""}`;
 		}).join("\n") + `\n${zoneLine}`;
 	}
 
@@ -266,7 +318,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// -------------------------------------------------------------- actions --
 
-	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig): Loop | string {
+	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Pick<Loop, "priority" | "dir" | "context"> = {}): Loop | string {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}; manage them from that session`;
 		if (tz && !zoned(schedule)) return "a time zone applies only to `at` loops and whole-day intervals (1d, 7d)";
 		const base = id?.trim() || slug(prompt);
@@ -279,6 +331,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			nextAt: 0,
 			...(tz ? { tz } : {}),
 			...(gate ? { gate } : {}),
+			...(more.priority ? { priority: more.priority } : {}),
+			...(more.dir ? { dir: more.dir } : {}),
+			...(more.context?.length ? { context: more.context } : {}),
 		};
 		loop.nextAt = nextFor(loop, now);
 		loops.push(loop);
@@ -295,6 +350,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}`;
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
+		if (l.source) return `${l.id} is declared in ${l.source}; remove it there (or pause it)`;
 		loops = loops.filter(x => x !== l);
 		save(); refreshStatus();
 		return `removed ${l.id}`;
@@ -314,6 +370,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}`;
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
+		if (l.source) return `${l.id} is declared in ${l.source}; change its gate there`;
 		if (gate) l.gate = gate; else delete l.gate;
 		save(); refreshStatus();
 		return gate ? `${l.id}: ${gateText(l)}` : `${l.id}: gate removed; every fire wakes the model`;
@@ -326,21 +383,30 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!l.gate) return `${l.id} has no gate`;
 		const t0 = Date.now();
 		const session = sessionOf(caller?.sessionManager ? caller : ctx);
-		const d = await runGate(ctx!.cwd, l.gate, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: path.join(ctx!.cwd, ".pi", "loop-state", l.id), test: true, session });
+		const d = await runGate(home(l), l.gate, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: stateDirOf(l), test: true, session });
 		const extra = d.action === "defer" ? ` (retry in ${countdown(d.retryInMs ?? 0)})` : "";
 		return `${l.id} gate (test, no wake) -> ${d.action}${extra} in ${Date.now() - t0}ms: ${d.reason}${d.context ? `\n${d.context}` : ""}`;
 	}
 
-	/** Run a gated loop's gate, then wake, skip or defer. The loop is rescheduled first so it is not due twice. */
-	function gateThen(l: Loop, reason: "due" | "catch-up") {
+	/**
+	 * Run a gated loop's gate, then wake, skip or defer. Runs only while the session is free.
+	 * The loop is rescheduled first so it is not due twice; if the session became busy while
+	 * the gate ran, a wake is not used: the loop is due again and its gate runs afresh later.
+	 */
+	function gateThen(l: Loop, reason: Reason) {
 		const started = Date.now();
+		const dueAt = l.nextAt;
 		l.nextAt = nextFor(l, started);
 		gating.add(l.id);
 		save();
-		void runGate(ctx!.cwd, l.gate!, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: path.join(ctx!.cwd, ".pi", "loop-state", l.id), session: sessionOf(ctx) })
+		void runGate(home(l), l.gate!, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: stateDirOf(l), session: sessionOf(ctx) })
 			.then(raw => {
 				gating.delete(l.id);
 				if (!ctx || readOnly || !loops.includes(l)) return;
+				if (raw.action === "wake" && busy()) {
+					l.nextAt = dueAt; waited.set(l.id, waited.get(l.id) ?? started);
+					save(); refreshStatus(); return;
+				}
 				const d = backoff(l, raw, Date.now());
 				l.gateRuns = (l.gateRuns ?? 0) + 1;
 				l.lastGate = { at: Date.now(), action: d.action, reason: d.reason };
@@ -371,7 +437,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return l.gateErrors > 1 ? { ...d, reason: `${d.reason} (still failing: ${l.gateErrors} errors in a row)` } : d;
 	}
 
-	function fire(l: Loop, reason: "due" | "catch-up" | "manual", gate?: GateDecision) {
+	function fire(l: Loop, reason: Reason, gate?: GateDecision) {
+		waited.delete(l.id);
 		l.fires += 1;
 		l.lastFiredAt = Date.now();
 		l.lastWokeAt = l.lastFiredAt;
@@ -384,14 +451,145 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const why = gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : "";
 		const header = `[loop ${l.id} · ${desc(l)} · fire #${l.fires}${reason === "due" ? "" : ` · ${reason}`}${why}]`;
 		const evidence = gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "";
+		const where = loopContext(l);
 		// A prompt template is expanded here from its file (fresh each fire), so the
 		// header and gate context survive intact; see prompt.ts.
 		let commands: CommandInfo[] = [];
 		try { commands = (pi as any).getCommands?.() ?? []; } catch { /* older Pi */ }
-		const { text, expand } = compose(l.prompt, header, evidence, ctx?.cwd ?? process.cwd(), commands);
+		const { text, expand } = compose(l.prompt, header + where, evidence, home(l), commands, !!l.dir);
 		pi.sendUserMessage(text, { deliverAs: "followUp", expandPromptTemplates: expand });
 		refreshStatus();
 	}
+
+	/** What a loop with a folder adds after its header: the folder, and its context files. */
+	function loopContext(l: Loop): string {
+		if (!l.dir && !l.context?.length) return "";
+		let out = l.dir ? `\nThis loop's folder is ${l.dir}/ in the project; paths in its instructions are relative to it.` : "";
+		let left = MAX_LOOP_CONTEXT_CHARS;
+		for (const f of l.context ?? []) {
+			const rel = path.join(l.dir ?? "", f);
+			let body: string;
+			try {
+				const abs = fs.realpathSync(path.join(home(l), f));
+				const root = fs.realpathSync(ctx!.cwd);
+				if (!abs.startsWith(root + path.sep)) throw new Error("outside");
+				body = fs.readFileSync(abs, "utf8").trim();
+			} catch { out += `\n<loop-context file="${rel}">(could not be read)</loop-context>`; continue; }
+			if (body.length > left) body = `${body.slice(0, Math.max(0, left))}\n…[truncated]`;
+			left -= body.length;
+			out += `\n<loop-context file="${rel}">\n${body}\n</loop-context>`;
+		}
+		return out;
+	}
+
+	// ------------------------------------------------------- declared loops --
+
+	/** .pi/loop.json in the project and in each folder directly under it (not hidden ones or node_modules). */
+	function declaringFiles(): string[] {
+		const cwd = ctx!.cwd;
+		const out: string[] = [];
+		const at = (dir: string) => { const f = path.join(dir, ".pi", "loop.json"); if (fs.existsSync(f)) out.push(f); };
+		at(cwd);
+		let entries: fs.Dirent[] = [];
+		try { entries = fs.readdirSync(cwd, { withFileTypes: true }); } catch { /* unreadable */ }
+		for (const e of entries) if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules") at(path.join(cwd, e.name));
+		return out.sort();
+	}
+
+	/** Bring loops in line with the .pi/loop.json files: add, update and remove declared loops; keep run state. */
+	function syncDeclared() {
+		if (!ctx || readOnly) return;
+		const files = declaringFiles();
+		const stamp = files.map(f => { try { return `${f}:${fs.statSync(f).mtimeMs}`; } catch { return f; } }).join("|");
+		if (stamp === declaredSeen) return;
+		declaredSeen = stamp;
+		const cwd = ctx.cwd;
+		const seen = new Set<string>();
+		const broken = new Set<string>();
+		let changed = false;
+		for (const file of files) {
+			const source = path.relative(cwd, file);
+			const folder = path.dirname(path.dirname(file));
+			let decls: Declared[];
+			try {
+				const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+				decls = Array.isArray(raw) ? raw : raw?.loops;
+				if (!Array.isArray(decls)) throw new Error("expected a list of loops, or {\"loops\": [...]}");
+			} catch (e) {
+				broken.add(source);
+				const msg = `${source}: ${(e as Error).message}; its loops are left as they were`;
+				if (declaredErrors.get(source) !== msg) { declaredErrors.set(source, msg); notify(msg, "warning"); }
+				continue;
+			}
+			declaredErrors.delete(source);
+			for (const d of decls) {
+				let def: ReturnType<typeof fromDeclared>;
+				try { def = fromDeclared(d, folder); } catch (e) {
+					const msg = `${source}: loop ${JSON.stringify(d?.id ?? "?")}: ${(e as Error).message}`;
+					if (declaredErrors.get(`${source}#${d?.id}`) !== msg) { declaredErrors.set(`${source}#${d?.id}`, msg); notify(msg, "warning"); }
+					broken.add(source);
+					if (typeof d?.id === "string") seen.add(d.id);
+					continue;
+				}
+				if (seen.has(def.id)) { notify(`${source}: loop id ${def.id} is declared twice; the first wins`, "warning"); continue; }
+				seen.add(def.id);
+				const l = loops.find(x => x.id === def.id);
+				if (!l) {
+					const now = Date.now();
+					const loop: Loop = { ...def, source, paused: !!d.paused, createdAt: now, fires: 0, nextAt: 0,
+						catchUp: def.schedule.kind === "at" || def.schedule.ms >= CATCH_UP_MIN_MS ? "latest" : "none" };
+					loop.nextAt = nextFor(loop, now);
+					loops.push(loop); changed = true;
+					continue;
+				}
+				const before = JSON.stringify(l);
+				const reschedule = JSON.stringify(l.schedule) !== JSON.stringify(def.schedule) || l.tz !== def.tz;
+				Object.assign(l, def, { source });
+				for (const k of ["tz", "gate", "priority", "dir", "context"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
+				l.catchUp = l.schedule.kind === "at" || l.schedule.ms >= CATCH_UP_MIN_MS ? "latest" : "none";
+				if (d.paused) l.paused = true;
+				if (reschedule) l.nextAt = nextFor(l, Date.now());
+				if (JSON.stringify(l) !== before) changed = true;
+			}
+		}
+		// A declared loop whose file no longer declares it is gone; one in a broken file is kept as it was.
+		const kept = loops.filter(l => !l.source || seen.has(l.id) || broken.has(l.source));
+		if (kept.length !== loops.length) { loops = kept; changed = true; }
+		if (changed) { save(); refreshStatus(); }
+	}
+
+	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context"> {
+		if (!d || typeof d !== "object") throw new Error("not an object");
+		if (typeof d.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(d.id)) throw new Error("id: letters, digits, . _ -");
+		if (typeof d.prompt !== "string" || !d.prompt.trim()) throw new Error("prompt is required");
+		if (d.every && d.at) throw new Error("use either every or at");
+		let schedule: Schedule;
+		if (d.at) { const a = parseAt(d.at); if (!a) throw new Error("at must be HH:MM"); schedule = { kind: "at", ...a }; }
+		else {
+			const ms = d.every ? parseInterval(d.every) : DEFAULT_INTERVAL_MS;
+			if (ms === undefined) throw new Error("every must look like 5m, 2h or 1d");
+			if (ms < MIN_INTERVAL_MS) throw new Error("minimum interval is 1m");
+			schedule = { kind: "every", ms };
+		}
+		const tz = d.timezone ? validZone(d.timezone) : undefined;
+		if (d.timezone && !tz) throw new Error(`unknown time zone "${d.timezone}"`);
+		if (tz && !zoned(schedule)) throw new Error("a time zone applies only to at loops and whole-day intervals");
+		const dir = insideDir(ctx!.cwd, path.relative(ctx!.cwd, folder) || undefined);
+		const gate = d.gate ? gateConfig({ gate: d.gate, maxSleep: d.maxSleep, gateTimeout: d.gateTimeout, gateOnError: d.gateOnError }, dir) : undefined;
+		if (d.priority !== undefined && !Number.isFinite(d.priority)) throw new Error("priority must be a number");
+		const context = contextFiles(d.context);
+		return { id: d.id, prompt: d.prompt.trim(), schedule, ...(tz ? { tz } : {}), ...(gate ? { gate } : {}),
+			...(d.priority ? { priority: d.priority } : {}), ...(dir ? { dir } : {}), ...(context ? { context } : {}) };
+	}
+
+	function contextFiles(v: unknown): string[] | undefined {
+		if (v === undefined) return undefined;
+		const list = typeof v === "string" ? [v] : v;
+		if (!Array.isArray(list) || list.some(f => typeof f !== "string" || !f.trim() || path.isAbsolute(f) || f.split(/[\\/]/).includes(".."))) throw new Error("context: file paths inside the loop's folder");
+		return list.length ? list.map(f => f.trim()) : undefined;
+	}
+
+	type Reason = "due" | "catch-up" | "manual" | `waited ${string}`;
 
 	function tick() {
 		if (!ctx) return;
@@ -399,21 +597,34 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (!claimLock()) return;
 			readOnly = false;
 			loops = load();
+			declaredSeen = "";
+			syncDeclared();
 			reconcile();
 		}
 		const now = Date.now();
 		// One loop per tick: a burst after sleep should not queue five turns at once.
 		// A fired prompt that never reached the transcript (dropped queue) must not read "queued" forever.
 		if (phase?.state === "queued" && now - phaseAt > 2 * TICK_MS && ctx.isIdle?.() && !ctx.hasPendingMessages?.()) phase = undefined;
-		const due = loops.filter(l => !l.paused && !gating.has(l.id) && l.nextAt <= now).sort((a, b) => a.nextAt - b.nextAt)[0];
-		if (!due) { refreshStatus(); return; }
-		if (now - due.nextAt > TICK_MS * 4 && due.catchUp === "none") {
-			// Missed by more than a minute (sleep, long turn): short loops just realign.
+		syncDeclared();
+		for (const id of waited.keys()) if (!loops.some(l => l.id === id && !l.paused)) waited.delete(id);
+		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && l.nextAt <= now);
+		if (!dueNow.length) { refreshStatus(); return; }
+		// Busy: due loops wait, once each, for the session to be free; nothing is queued behind the turn.
+		if (busy() || gating.size) {
+			for (const l of dueNow) if (!waited.has(l.id)) waited.set(l.id, now);
+			refreshStatus();
+			return;
+		}
+		// Free: the highest priority goes first, then the longest overdue.
+		const due = dueNow.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || a.nextAt - b.nextAt)[0];
+		const since = waited.get(due.id);
+		if (since === undefined && now - due.nextAt > TICK_MS * 4 && due.catchUp === "none") {
+			// Missed by more than a minute with no session to run it (sleep, restart): short loops just realign.
 			due.nextAt = nextFor(due, now);
 			save(); refreshStatus();
 			return;
 		}
-		const reason = now - due.nextAt > TICK_MS * 4 ? "catch-up" : "due";
+		const reason: Reason = since !== undefined ? `waited ${countdown(Math.max(0, now - Math.min(since, due.nextAt)))}` : now - due.nextAt > TICK_MS * 4 ? "catch-up" : "due";
 		if (!due.gate) { fire(due, reason); return; }
 		const g = due.gate;
 		if (g.maxSleepMs && now - (due.lastWokeAt ?? due.createdAt) >= g.maxSleepMs) {
@@ -437,8 +648,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		zone = configuredZone(c.cwd);
 		if (zone.warning) notify(zone.warning, "warning");
 		loops = load();
+		waited.clear(); declaredSeen = ""; declaredErrors.clear();
 		readOnly = !claimLock();
-		if (!readOnly) reconcile();
+		if (!readOnly) { syncDeclared(); reconcile(); }
 		if (timer) clearInterval(timer);
 		timer = setInterval(tick, TICK_MS);
 		// Headless modes have no pane to decorate (same gate as Herdr's Pi integration).
@@ -483,8 +695,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (!trimmed || trimmed === "list") { notify(listText()); return; }
 			if (trimmed === "clear") {
 				if (readOnly) { notify(`loops are owned by pid ${ownerPid()}`, "warning"); return; }
-				const n = loops.length; loops = []; save(); refreshStatus();
-				notify(`removed ${n} loop${n === 1 ? "" : "s"}`); return;
+				const keep = loops.filter(l => l.source);
+				const n = loops.length - keep.length; loops = keep; save(); refreshStatus();
+				notify(`removed ${n} loop${n === 1 ? "" : "s"}${keep.length ? `; ${keep.length} declared in .pi/loop.json files kept (edit them there)` : ""}`); return;
 			}
 			const [verb, target, ...more] = trimmed.split(/\s+/);
 			// Subcommands only when the target names an existing loop; otherwise
@@ -511,9 +724,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// ----------------------------------------------------------------- tool --
 
-	function gateConfig(p: { gate?: string; maxSleep?: string; gateTimeout?: string; gateOnError?: string }): GateConfig {
+	function gateConfig(p: { gate?: string; maxSleep?: string; gateTimeout?: string; gateOnError?: string }, dir?: string): GateConfig {
 		const command = p.gate!.trim();
-		const r = resolveGate(ctx!.cwd, command);
+		const r = resolveGate(dir ? path.join(ctx!.cwd, dir) : ctx!.cwd, command);
 		if ("error" in r) throw new Error(r.error);
 		if (p.gateOnError && p.gateOnError !== "wake" && p.gateOnError !== "skip") throw new Error("gateOnError must be wake or skip");
 		const cfg: GateConfig = { command, timeoutMs: DEFAULT_GATE_TIMEOUT_MS, onError: p.gateOnError === "skip" ? "skip" : "wake" };
@@ -538,8 +751,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 			"or test (run the gate once without waking). A loop re-sends its prompt to this same session on a schedule, and each fire is " +
 			"a full model turn with this conversation as context. `every` is a fixed interval (default 10m); `at` is a daily HH:MM wall-clock " +
 			"time that follows daylight saving in the loop's zone. A gate is a script in the project that runs when the loop is due and " +
-			"prints JSON deciding skip, wake or defer, so a frequent check wakes the model only when needed. Loops persist across restarts " +
-			"and fire only while a Pi session is open in this project.",
+			"prints JSON deciding skip, wake or defer, so a frequent check wakes the model only when needed. A due loop waits while the " +
+			"session is busy and fires once when it is free (highest priority first), never stacking. A loop can have its own folder " +
+			"(dir) holding its gate, prompt template and context files. Loops can also be declared in .pi/loop.json files (see the " +
+			"pi-loop skill). Loops persist across restarts and fire only while a Pi session is open in this project.",
 		promptSnippet: "Schedule recurring prompts in this session (/loop): create, list, delete, pause, resume, run, gate, test",
 		promptGuidelines: [
 			"Use loop_manage when the user wants something done periodically or daily in this session; reply with the loop id and next fire time. Run loop_manage list first and change an existing loop rather than adding a duplicate.",
@@ -561,6 +776,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			maxSleep: Type.Optional(Type.String({ description: "With gate: wake anyway once this long has passed since the last wake, e.g. 12h." })),
 			gateTimeout: Type.Optional(Type.String({ description: "With gate: kill the gate after this long (default 60s, e.g. 2m); a timeout counts as a gate error, which wakes the model." })),
 			gateOnError: Type.Optional(Type.String({ description: "With gate: what a gate error does, wake (default) or skip. A failing gate wakes once, then only every 6h until it succeeds again." })),
+			priority: Type.Optional(Type.Number({ description: "create: when several loops wait for the session to be free, higher goes first (default 0)." })),
+			dir: Type.Optional(Type.String({ description: "create: the loop's own folder inside the project (e.g. services/api). Its gate, prompt template (/name from <dir>/.pi/prompts) and state are found there." })),
+			context: Type.Optional(Type.Array(Type.String(), { description: "create: files in the loop's folder attached to each of its turns, e.g. [\"AGENTS.md\"]." })),
 		}),
 		async execute(_toolCallId, p, _signal, _onUpdate, toolCtx) {
 			refreshZone();
@@ -578,7 +796,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 					}
 					case "gate": {
 						if (!p.id) throw new Error("id is required");
-						return setGate(p.id, p.gate?.trim() ? gateConfig(p) : undefined);
+						return setGate(p.id, p.gate?.trim() ? gateConfig(p, find(p.id)?.dir) : undefined);
 					}
 					case "create": {
 						if (!p.prompt?.trim()) throw new Error("prompt is required");
@@ -594,7 +812,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 							if (ms < MIN_INTERVAL_MS) throw new Error("minimum interval is 1m");
 							schedule = { kind: "every", ms };
 						}
-						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p) : undefined);
+						const dir = insideDir(ctx!.cwd, p.dir?.trim());
+						if (p.priority !== undefined && !Number.isFinite(p.priority)) throw new Error("priority must be a number");
+						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p, dir) : undefined, { priority: p.priority, dir, context: contextFiles(p.context) });
 						if (typeof r === "string") throw new Error(r);
 						const hints: string[] = [];
 						const twins = loops.filter(l => l !== r && l.prompt === r.prompt);
