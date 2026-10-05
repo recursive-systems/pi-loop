@@ -151,7 +151,10 @@ class Pi {
 	}
 
 	stop() {
-		if (this.proc.exitCode === null) this.proc.kill("SIGTERM");
+		if (this.proc.exitCode !== null) return;
+		this.proc.kill("SIGTERM");
+		// A Pi still starting up when asked to stop may not exit: don't let it hold the suite.
+		setTimeout(() => { if (this.proc.exitCode === null) this.proc.kill("SIGKILL"); }, 10_000).unref();
 	}
 
 	async ready() {
@@ -434,7 +437,7 @@ test("a session stopped while a gate runs keeps the gate's wake; the next sessio
 test("a lock left by a process that is gone, even with its pid reused, is taken over; a live owner's is not", { timeout: 60_000 }, async t => {
 	const p = project(t);
 	// This test's own pid is alive, but started at another time than the lock says: a reused pid.
-	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), `${process.pid} Sat Jan  1 00:00:00 2000`);
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), JSON.stringify({ pid: process.pid, started: "Sat Jan  1 00:00:00 2000", token: "earlier" }));
 	const a = new Pi(t, p);
 	await a.ready();
 	assert.match(await a.command("/loop 1h mine"), /loop mine:/);
@@ -482,6 +485,28 @@ test("at shutdown a running gate is waited for even if its loop was removed mean
 	const lock = path.join(p.cwd, ".pi/loops.lock");
 	while (fs.existsSync(lock)) await new Promise(r => setTimeout(r, 100));
 	assert.ok(fs.existsSync(path.join(state, "ended")), "the lock was released only after the gate finished");
+});
+
+test("a live owner's lock from an older pi-loop is never taken over", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), `${process.pid} Mon Jan  1 00:00:00 2001`); // older plain format; this test is alive
+	const a = new Pi(t, p);
+	await a.ready();
+	assert.match(await a.command("/loop 1h mine"), /owned by pid/);
+});
+
+test("a takeover left by a claimant that died is cleared; the next claimant takes the dead owner's lock", { timeout: 90_000 }, async t => {
+	const p = project(t);
+	const dead = JSON.stringify({ pid: 999_999, started: "x", token: "dead" });
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), dead);
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock.takeover"), JSON.stringify({ pid: 999_998, started: "y", token: "died-mid-takeover" }));
+	const a = new Pi(t, p);
+	await a.ready();
+	const end = Date.now() + TICK * 3 + 5_000;
+	let note = "";
+	while (Date.now() < end) { note = await a.command("/loop 1h mine"); if (!/owned by pid/.test(note)) break; await new Promise(r => setTimeout(r, 2_000)); }
+	assert.match(note, /loop mine:/);
+	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loops.lock.takeover")));
 });
 
 test("two sessions starting at once in a folder: exactly one owns its loops", { timeout: 60_000 }, async t => {

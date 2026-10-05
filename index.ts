@@ -301,7 +301,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 	 * hard-linked into place, which fails if it exists) and names its owner by a token of its own.
 	 * A lock whose process is gone, or whose pid now belongs to another process (start time differs),
 	 * is taken over under a short-lived takeover file, so two claimants can't both replace it.
-	 * Without /proc or ps, only the pid is checked, and a reused pid looks alive.
+	 * Without /proc or ps, only the pid is checked, and a reused pid looks alive. Needs a file system
+	 * with hard links (any local one); elsewhere claiming fails with an error rather than guessing.
 	 */
 	const token = randomUUID();
 	type Owner = { pid: number; started?: string; token?: string; raw: string };
@@ -314,6 +315,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 	function ownerAlive(o: Owner): boolean {
 		if (!(o.pid > 0) || !pidAlive(o.pid)) return false;
+		if (o.token === undefined) return true; // an older pi-loop's lock: its start time isn't comparable, so a live pid counts
 		const now = startedOf(o.pid);
 		return o.started === undefined || now === "" || now === o.started;
 	}
@@ -328,17 +330,28 @@ export default function loopExtension(pi: ExtensionAPI) {
 				if (!o) continue; // gone meanwhile: try again
 				if (o.token === token) return true;
 				if (ownerAlive(o)) return false;
-				// Stale: take it over, one claimant at a time.
+				// Stale: take it over, one claimant at a time, under a takeover file that names its holder.
 				const takeover = `${lock}.takeover`;
-				try { fs.closeSync(fs.openSync(takeover, "wx", 0o600)); }
+				try { fs.linkSync(tmp, takeover); }
 				catch {
-					try { if (Date.now() - fs.statSync(takeover).mtimeMs > 30_000) fs.unlinkSync(takeover); } catch { /* gone */ }
-					return false; // someone else is taking it over; look again next time
+					// Someone holds it. Only a dead holder's is cleared (by moving it aside and checking it is still that one).
+					let holder: Owner | undefined;
+					try { const raw = fs.readFileSync(takeover, "utf8").trim(); holder = { ...JSON.parse(raw), raw }; } catch { /* gone or unreadable */ }
+					if (holder && !ownerAlive(holder)) {
+						const aside = `${takeover}.${token}`;
+						try {
+							fs.renameSync(takeover, aside);
+							// Not the one we judged dead (replaced meanwhile): put it back unless another is there now.
+							if (fs.readFileSync(aside, "utf8").trim() !== holder.raw) { try { fs.linkSync(aside, takeover); } catch { /* a newer one */ } }
+							fs.unlinkSync(aside);
+						} catch { /* moved by another */ }
+					}
+					return false; // look again next time
 				}
 				try {
 					const again = lockOwner();
 					if (again && again.raw === o.raw) fs.unlinkSync(lock); // still the stale record we judged
-				} finally { try { fs.unlinkSync(takeover); } catch { /* fine */ } }
+				} finally { try { if (JSON.parse(fs.readFileSync(takeover, "utf8")).token === token) fs.unlinkSync(takeover); } catch { /* fine */ } }
 			}
 			return false;
 		} finally { try { fs.unlinkSync(tmp); } catch { /* fine */ } }
@@ -564,10 +577,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const { text, expand } = compose(l.prompt, header + where, evidence, home(l), commands, !!l.dir);
 		try {
 			// `loop` names the occurrence for a host (Pi ignores it): the same id and fire mean the same turn.
-			pi.sendUserMessage(text, { deliverAs: "followUp", expandPromptTemplates: expand, loop: { id: l.id, fire: l.fires, rev: l.rev ?? 0 } } as any);
+			pi.sendUserMessage(text, { deliverAs: "followUp", expandPromptTemplates: expand, loop: { id: l.id, fire: l.fires, rev: l.rev ?? 0, since: l.createdAt } } as any);
 		} catch (e) {
 			Object.assign(l, { fires: before.fires, lastFiredAt: before.lastFiredAt, lastWokeAt: before.lastWokeAt, nextAt: before.nextAt });
-			const msg = `loop ${l.id}: couldn't send its turn (${(e as Error).message}); it stays due`;
+			// A gate may have recorded that it reported this: keep its wake rather than ask it again.
+			if (gate) { l.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: Date.now(), rev: l.rev ?? 0 }; save(); }
+			const msg = `loop ${l.id}: couldn't send its turn (${(e as Error).message}); it is kept and sent again`;
 			notify(msg, "warning"); refreshStatus();
 			return msg;
 		}
