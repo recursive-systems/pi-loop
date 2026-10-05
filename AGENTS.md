@@ -13,6 +13,8 @@ schedule. Optional gate scripts decide whether a due loop wakes the model.
 - Tests run the real `pi` binary with no mocks (`npm test`). Add end-to-end tests, never unit tests.
   With a Fireworks key, two of them check that a real agent uses the package correctly; when you change
   the context layers, run those.
+- Pi supplies `@earendil-works/*` and `typebox`: keep them optional peer dependencies, never installed
+  with the package (a git install runs `npm install`).
 - The `[loop <id> · … ]` header line is a public contract. Change it only in a major version.
 
 ## Writing for people

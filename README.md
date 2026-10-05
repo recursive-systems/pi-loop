@@ -19,7 +19,7 @@ The prompt comes back to *the same session*, so the agent remembers what it did 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.2.0
+pi install git:github.com/recursive-systems/pi-loop@v0.2.1
 ```
 
 Add `-l` to install it for one project only.
