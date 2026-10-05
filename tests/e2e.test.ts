@@ -8,12 +8,10 @@
 // gate context, expanded template: what this extension controls) and the model call after it
 // fails without anything answering in its place.
 //
-// The waiting test needs a session that is really busy: a real model (Fireworks) runs a real
-// `sleep` in bash. Without a key it is skipped, and says so.
-//
-// One test goes all the way to a real model: set FIREWORKS_API_KEY (or FIREWORKS_API_KEY_FILE,
-// a file holding it) and it runs a woken loop through Fireworks (PI_LOOP_E2E_MODEL to pick the
-// model). Without a key it is skipped, and says so.
+// Live-model tests are opt-in: PI_E2E_PROVIDER and PI_E2E_MODEL select the route.
+// For a gateway, PI_E2E_MODELS_FILE and PI_E2E_AUTH_FILE point at existing Pi files.
+// Only synthetic test data is sent. No automatic paid-provider fallback; without explicit
+// selection the model cases skip. The waiting case runs a real model and real bash sleep.
 //
 // Needs `pi` on PATH (PI_BIN to override). Run: npm test
 import assert from "node:assert/strict";
@@ -28,13 +26,20 @@ import { fileURLToPath } from "node:url";
 const PACKAGE = fileURLToPath(new URL("..", import.meta.url));
 const PI = process.env.PI_BIN || "pi";
 const TICK = 15_000;
-const MODEL = process.env.PI_LOOP_E2E_MODEL || "accounts/fireworks/models/deepseek-v4p1-flash";
+const PROVIDER = process.env.PI_E2E_PROVIDER;
+const MODEL = process.env.PI_E2E_MODEL;
+const real = PROVIDER && MODEL ? false : "set PI_E2E_PROVIDER and PI_E2E_MODEL to opt in to live-model tests";
 
-function fireworksKey(): string | undefined {
-	if (process.env.FIREWORKS_API_KEY) return process.env.FIREWORKS_API_KEY;
-	const file = process.env.FIREWORKS_API_KEY_FILE;
-	if (!file) return undefined;
-	try { return fs.readFileSync(file.replace(/^~(?=\/)/, process.env.HOME ?? "~"), "utf8").trim() || undefined; } catch { return undefined; }
+function configureLiveModel(agent: string) {
+	if (real) throw new Error(real);
+	if (process.env.PI_E2E_MODELS_FILE) {
+		const config = JSON.parse(fs.readFileSync(process.env.PI_E2E_MODELS_FILE, "utf8"));
+		const provider = config.providers?.[PROVIDER!];
+		if (!provider) throw new Error("Selected provider is absent from PI_E2E_MODELS_FILE");
+		fs.writeFileSync(path.join(agent, "models.json"), JSON.stringify({ providers: { [PROVIDER!]: provider } }), { mode: 0o600 });
+	}
+	// Existing API-key auth is read by Pi, not copied into logs or command arguments.
+	if (process.env.PI_E2E_AUTH_FILE) fs.symlinkSync(path.resolve(process.env.PI_E2E_AUTH_FILE), path.join(agent, "auth.json"));
 }
 
 for (const k of ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_PANE_ID", "PI_SESSION_ID", "PI_SESSION_FILE"]) delete process.env[k];
@@ -54,8 +59,9 @@ function project(t: any, opts: { tz?: string; loops?: any[]; gates?: Record<stri
 		fs.mkdirSync(path.dirname(path.join(cwd, rel)), { recursive: true });
 		fs.writeFileSync(path.join(cwd, rel), body, { mode: rel.includes("/gates/") ? 0o755 : 0o644 });
 	}
-	const model = opts.fireworks ? { defaultProvider: "fireworks", defaultModel: MODEL, defaultThinkingLevel: "off" } : { defaultProvider: "closed", defaultModel: "none" };
-	fs.writeFileSync(path.join(agent, "settings.json"), JSON.stringify({ ...model, ...(opts.tz ? { loop: { timezone: opts.tz } } : {}) }));
+	if (opts.fireworks) configureLiveModel(agent);
+	const model = opts.fireworks ? { defaultProvider: PROVIDER, defaultModel: MODEL, defaultThinkingLevel: "off" } : { defaultProvider: "closed", defaultModel: "none" };
+	fs.writeFileSync(path.join(agent, "settings.json"), JSON.stringify({ ...model, retry: { enabled: false }, ...(opts.tz ? { loop: { timezone: opts.tz } } : {}) }));
 	if (opts.loops) fs.writeFileSync(path.join(cwd, ".pi/loops.json"), JSON.stringify(opts.loops));
 	for (const [name, body] of Object.entries(opts.gates ?? {})) {
 		fs.mkdirSync(path.join(cwd, ".pi/gates"), { recursive: true });
@@ -285,9 +291,9 @@ test("a prompt template is read from disk when the loop fires, header and gate c
 	assert.match(msg, /Look at the queue and reply ok unless something is stuck\./);
 });
 
-test("a woken loop runs a real model turn to the end", { skip: fireworksKey() ? false : "set FIREWORKS_API_KEY or FIREWORKS_API_KEY_FILE to run against a real model" }, async t => {
+test("a woken loop runs a real model turn to the end", { skip: real }, async t => {
 	const p = project(t, { fireworks: true, loops: [{ ...due("ping"), prompt: "Reply with exactly the word pong and nothing else." }] });
-	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	const pi = new Pi(t, p);
 	await pi.ready();
 	await pi.waitForUser(/^\[loop ping · every 1h · fire #1/);
 	const end = await pi.waitFor(l => l.type === "agent_end", 120_000);
@@ -304,11 +310,10 @@ test("the package ships the pi-loop skill", async t => {
 });
 
 // The next two check that an agent, given only what this package puts in its context, uses it correctly.
-const real = fireworksKey() ? false : "set FIREWORKS_API_KEY or FIREWORKS_API_KEY_FILE to run against a real model";
 
 test("asked for a daily job in a stated time zone, the agent makes one `at` loop in that zone", { skip: real }, async t => {
 	const p = project(t, { fireworks: true });
-	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	const pi = new Pi(t, p);
 	await pi.ready();
 	await pi.ask("Every day at 08:00 Tokyo time, write today's date to dates.txt in this folder.");
 	const loops = p.loops();
@@ -319,7 +324,7 @@ test("asked for a daily job in a stated time zone, the agent makes one `at` loop
 test("asked for a frequent check, the agent gates the loop so quiet fires cost no turn", { skip: real }, async t => {
 	const p = project(t, { fireworks: true });
 	fs.writeFileSync(path.join(p.cwd, "status.txt"), "OK\n");
-	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	const pi = new Pi(t, p);
 	await pi.ready();
 	await pi.ask("Every 5 minutes, check status.txt in this folder. Only bother the model when it says FAILED; then append a line to incidents.txt.");
 	const [l] = p.loops();
@@ -351,7 +356,7 @@ test("due loops wait while the session is busy, then fire once each, highest pri
 		],
 		gates: { stamp: '#!/bin/sh\ndate +%s >> "$LOOP_STATE_DIR/ran"\necho \'{"action":"wake","reason":"checked"}\'\n' },
 	});
-	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	const pi = new Pi(t, p);
 	await pi.ready();
 	const r = await pi.send({ type: "prompt", message: "Run this exact bash command and nothing else: sleep 90. Then reply with the single word done." });
 	assert.equal(r.success, true);
@@ -426,7 +431,7 @@ test("a session stopped while a gate runs keeps the gate's wake; the next sessio
 	await new Promise<void>(r => first.proc.on("exit", () => r()));
 	const kept = p.loops()[0].pendingWake;
 	assert.equal(kept?.reason, "queue grew", JSON.stringify(p.loops()[0]));
-	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loops.lock")), "the lock was released after the gate finished");
+	assert.equal(fs.readFileSync(path.join(p.cwd, ".pi/loops.lock"), "utf8").trim(), "", "the lock was released after the gate finished");
 	const second = new Pi(t, p);
 	await second.ready();
 	const msg = await second.waitForUser(/^\[loop slow /, TICK * 2 + 5_000);
@@ -437,11 +442,13 @@ test("a session stopped while a gate runs keeps the gate's wake; the next sessio
 test("a lock left by a process that is gone, even with its pid reused, is taken over; a live owner's is not", { timeout: 60_000 }, async t => {
 	const p = project(t);
 	// This test's own pid is alive, but started at another time than the lock says: a reused pid.
-	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), JSON.stringify({ pid: process.pid, started: "Sat Jan  1 00:00:00 2000", token: "earlier" }));
+	// This test's own pid is alive, but nothing holds the lock: the record is from an owner that is gone.
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), `${process.pid}\n`);
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock.owner"), JSON.stringify({ pid: process.pid, token: "earlier" }));
 	const a = new Pi(t, p);
 	await a.ready();
 	assert.match(await a.command("/loop 1h mine"), /loop mine:/);
-	assert.equal(JSON.parse(fs.readFileSync(path.join(p.cwd, ".pi/loops.lock"), "utf8")).pid, a.proc.pid);
+	assert.equal(Number(fs.readFileSync(path.join(p.cwd, ".pi/loops.lock"), "utf8").trim()), a.proc.pid);
 	const b = new Pi(t, p);
 	await b.ready();
 	assert.match(await b.command("/loop 1h theirs"), /owned by pid/);
@@ -466,7 +473,7 @@ test("several sessions starting at once against a dead owner's lock: exactly one
 	for (const [i, x] of all.entries()) notes.push(await x.command(`/loop 1h from-${i}`));
 	assert.equal(notes.filter(n => !/owned by pid/.test(n)).length, 1, notes.join(" | "));
 	assert.equal(p.loops().length, 1);
-	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loops.lock.takeover")), "no takeover file left behind");
+
 });
 
 test("at shutdown a running gate is waited for even if its loop was removed meanwhile", { timeout: 120_000 }, async t => {
@@ -483,7 +490,8 @@ test("at shutdown a running gate is waited for even if its loop was removed mean
 	assert.ok(!fs.existsSync(path.join(state, "ended")), "the gate is still running");
 	pi.proc.kill("SIGTERM");
 	const lock = path.join(p.cwd, ".pi/loops.lock");
-	while (fs.existsSync(lock)) await new Promise(r => setTimeout(r, 100));
+	const held = () => { try { return fs.readFileSync(lock, "utf8").trim() !== ""; } catch { return false; } };
+	while (held()) await new Promise(r => setTimeout(r, 100));
 	assert.ok(fs.existsSync(path.join(state, "ended")), "the lock was released only after the gate finished");
 });
 
@@ -495,18 +503,19 @@ test("a live owner's lock from an older pi-loop is never taken over", { timeout:
 	assert.match(await a.command("/loop 1h mine"), /owned by pid/);
 });
 
-test("a takeover left by a claimant that died is cleared; the next claimant takes the dead owner's lock", { timeout: 90_000 }, async t => {
+test("an owner that crashes frees the lock at once: the next session owns the loops", { timeout: 60_000 }, async t => {
 	const p = project(t);
-	const dead = JSON.stringify({ pid: 999_999, started: "x", token: "dead" });
-	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), dead);
-	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock.takeover"), JSON.stringify({ pid: 999_998, started: "y", token: "died-mid-takeover" }));
 	const a = new Pi(t, p);
 	await a.ready();
-	const end = Date.now() + TICK * 3 + 5_000;
+	assert.match(await a.command("/loop 1h mine"), /loop mine:/);
+	a.proc.kill("SIGKILL");
+	await new Promise<void>(r => a.proc.on("exit", () => r()));
+	const b = new Pi(t, p);
+	await b.ready();
+	const end = Date.now() + 10_000;
 	let note = "";
-	while (Date.now() < end) { note = await a.command("/loop 1h mine"); if (!/owned by pid/.test(note)) break; await new Promise(r => setTimeout(r, 2_000)); }
-	assert.match(note, /loop mine:/);
-	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loops.lock.takeover")));
+	while (Date.now() < end) { note = await b.command("/loop 1h theirs"); if (!/owned by pid/.test(note)) break; await new Promise(r => setTimeout(r, 500)); }
+	assert.match(note, /loop theirs:/);
 });
 
 test("two sessions starting at once in a folder: exactly one owns its loops", { timeout: 60_000 }, async t => {

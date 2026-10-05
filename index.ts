@@ -32,8 +32,6 @@
  * `at HH:MM` exists because the daily job is the case this was built for.
  */
 
-import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -46,6 +44,7 @@ import {
 import { HerdrTokens, countdown, loopTokens, type Phase } from "./herdr.ts";
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
+import { FolderLock, lockAvailable } from "./lock.ts";
 
 const STATUS_KEY = "loop";
 const TICK_MS = 15_000;
@@ -182,31 +181,6 @@ function sessionOf(c: ExtensionContext | undefined): GateSession {
 	} catch { return {}; }
 }
 
-/**
- * When a process started, as the OS reports it, so a lock left by a dead process whose pid was
- * reused isn't mistaken for a live owner. Empty if it can't be read (then the pid alone counts).
- */
-const startedCache = new Map<number, string>();
-function startedOf(pid: number): string {
-	if (startedCache.has(pid) && pid === process.pid) return startedCache.get(pid)!;
-	let v = "";
-	try {
-		// Linux: boot id plus start time in clock ticks, the kernel's own identity for the process.
-		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-		const ticks = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
-		const boot = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-		if (ticks) v = `${boot}:${ticks}`;
-	} catch {
-		// Elsewhere: ps, in a fixed zone and locale so every reader formats it the same way.
-		try { v = String(execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2000, env: { ...process.env, TZ: "UTC", LC_ALL: "C" } })).trim().replace(/\s+/g, " "); } catch { /* gone, or no ps: the pid alone counts */ }
-	}
-	if (pid === process.pid) startedCache.set(pid, v);
-	return v;
-}
-function pidAlive(pid: number): boolean {
-	try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
-}
-
 /** A folder inside the project, normalized relative to it; undefined for the project itself. Throws if outside. */
 function insideDir(cwd: string, dir: string | undefined): string | undefined {
 	if (!dir || dir === "." || dir === "./") return undefined;
@@ -296,72 +270,24 @@ export default function loopExtension(pi: ExtensionAPI) {
 		fs.writeFileSync(tmp, JSON.stringify(loops, null, 2), { mode: 0o600 });
 		fs.renameSync(tmp, file);
 	}
-	/**
-	 * One owner per project. The lock appears with its whole record at once (written aside, then
-	 * hard-linked into place, which fails if it exists) and names its owner by a token of its own.
-	 * A lock whose process is gone, or whose pid now belongs to another process (start time differs),
-	 * is taken over under a short-lived takeover file, so two claimants can't both replace it.
-	 * Without /proc or ps, only the pid is checked, and a reused pid looks alive. Needs a file system
-	 * with hard links (any local one); elsewhere claiming fails with an error rather than guessing.
-	 */
-	const token = randomUUID();
-	type Owner = { pid: number; started?: string; token?: string; raw: string };
-	function lockOwner(): Owner | undefined {
-		let raw: string;
-		try { raw = fs.readFileSync(lock, "utf8").trim(); } catch { return undefined; }
-		try { const o = JSON.parse(raw); if (Number(o.pid) > 0) return { pid: Number(o.pid), started: o.started || undefined, token: o.token, raw }; } catch { /* older plain format */ }
-		const [pid, ...rest] = raw.split(" ");
-		return Number(pid) > 0 ? { pid: Number(pid), ...(rest.length ? { started: rest.join(" ") } : {}), raw } : { pid: 0, raw };
-	}
-	function ownerAlive(o: Owner): boolean {
-		if (!(o.pid > 0) || !pidAlive(o.pid)) return false;
-		if (o.token === undefined) return true; // an older pi-loop's lock: its start time isn't comparable, so a live pid counts
-		const now = startedOf(o.pid);
-		return o.started === undefined || now === "" || now === o.started;
-	}
-	function claimLock(): boolean {
-		fs.mkdirSync(path.dirname(lock), { recursive: true });
-		const tmp = `${lock}.${token}.tmp`;
-		fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, started: startedOf(process.pid), token }), { mode: 0o600 });
-		try {
-			for (let attempt = 0; attempt < 3; attempt++) {
-				try { fs.linkSync(tmp, lock); return true; } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; }
-				const o = lockOwner();
-				if (!o) continue; // gone meanwhile: try again
-				if (o.token === token) return true;
-				if (ownerAlive(o)) return false;
-				// Stale: take it over, one claimant at a time, under a takeover file that names its holder.
-				const takeover = `${lock}.takeover`;
-				try { fs.linkSync(tmp, takeover); }
-				catch {
-					// Someone holds it. Only a dead holder's is cleared (by moving it aside and checking it is still that one).
-					let holder: Owner | undefined;
-					try { const raw = fs.readFileSync(takeover, "utf8").trim(); holder = { ...JSON.parse(raw), raw }; } catch { /* gone or unreadable */ }
-					if (holder && !ownerAlive(holder)) {
-						const aside = `${takeover}.${token}`;
-						try {
-							fs.renameSync(takeover, aside);
-							// Not the one we judged dead (replaced meanwhile): put it back unless another is there now.
-							if (fs.readFileSync(aside, "utf8").trim() !== holder.raw) { try { fs.linkSync(aside, takeover); } catch { /* a newer one */ } }
-							fs.unlinkSync(aside);
-						} catch { /* moved by another */ }
-					}
-					return false; // look again next time
-				}
-				try {
-					const again = lockOwner();
-					if (again && again.raw === o.raw) fs.unlinkSync(lock); // still the stale record we judged
-				} finally { try { if (JSON.parse(fs.readFileSync(takeover, "utf8")).token === token) fs.unlinkSync(takeover); } catch { /* fine */ } }
+	/** One owner per project: an OS-held lock (lock.ts). Taking it is asynchronous; until then this session is read-only. */
+	let folderLock: FolderLock | undefined;
+	function claimLock(then: () => void) {
+		const l = folderLock;
+		if (!l) return;
+		void l.claim().then(ok => {
+			if (!ok || l !== folderLock || !ctx) {
+				if (!lockAvailable() && !lockWarned) { lockWarned = true; notify("pi-loop needs perl (in the base system on macOS and most Linux) for its lock; without it this session can't run loops", "warning"); }
+				return;
 			}
-			return false;
-		} finally { try { fs.unlinkSync(tmp); } catch { /* fine */ } }
+			readOnly = false;
+			then();
+		});
 	}
-	function releaseLock() {
-		try { if (lockOwner()?.token === token) fs.unlinkSync(lock); } catch { /* fine */ }
-	}
-	function ownerPid(): string {
-		return String(lockOwner()?.pid || "?");
-	}
+	let lockWarned = false;
+	function releaseLock() { folderLock?.release(); }
+	function ownerPid(): string { return String(folderLock?.owner()?.pid ?? "?"); }
+
 
 	// -------------------------------------------------------------- display --
 
@@ -755,12 +681,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function tick() {
 		if (!ctx) return;
 		if (readOnly) {
-			if (!claimLock()) return;
-			readOnly = false;
-			loops = load();
-			declaredSeen = undefined;
-			syncDeclared();
-			reconcile();
+			claimLock(() => { loops = load(); declaredSeen = undefined; syncDeclared(); reconcile(); refreshStatus(); });
+			return;
 		}
 		const now = Date.now();
 		// One loop per tick: a burst after sleep should not queue five turns at once.
@@ -824,8 +746,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (zone.warning) notify(zone.warning, "warning");
 		loops = load();
 		waited.clear(); declaredSeen = undefined; declaredErrors.clear();
-		readOnly = !claimLock();
-		if (!readOnly) { syncDeclared(); reconcile(); }
+		folderLock?.release();
+		folderLock = new FolderLock(lock);
+		readOnly = true;
+		claimLock(() => { loops = load(); syncDeclared(); reconcile(); refreshStatus(); });
 		if (timer) clearInterval(timer);
 		timer = setInterval(tick, TICK_MS);
 		// Headless modes have no pane to decorate (same gate as Herdr's Pi integration).
@@ -870,7 +794,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		closing = false;
 		if (herdrPane && !readOnly) herdr.clear();
-		if (!readOnly) releaseLock();
+		releaseLock();
+		folderLock = undefined;
 		ctx = undefined;
 	});
 

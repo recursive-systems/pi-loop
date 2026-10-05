@@ -3,7 +3,8 @@
 A Pi extension: `/loop` and the `loop_manage` tool re-send a prompt to the same session on a
 schedule. Optional gate scripts decide whether a due loop wakes the model.
 
-- `index.ts` holds the extension: commands, the tool, the tick and persistence. `schedule.ts`
+- `index.ts` holds the extension: commands, the tool, the tick and persistence. `lock.ts` is the
+  one-owner-per-folder lock (an OS lock held by a small Perl helper; hosts use it too). `schedule.ts`
   holds intervals, daily times and DST. `gate.ts` runs gates. `prompt.ts` builds a fire's
   message. `herdr.ts` holds the Herdr countdown tokens.
 - What an agent using pi-loop knows comes in three layers. Keep each short and consistent with the others:
@@ -13,8 +14,9 @@ schedule. Optional gate scripts decide whether a due loop wakes the model.
 - Tests run the real `pi` binary with no mocks (`npm test`): end-to-end tests that drive Pi the way an
   agent or user does, never unit tests or stand-ins for Pi or a model. A test that can't reach a real piece
   (no model key) is skipped with the reason, not faked.
-  With a Fireworks key, two of them check that a real agent uses the package correctly; when you change
-  the context layers, run those.
+  Live models require explicit PI_E2E_PROVIDER and PI_E2E_MODEL (see README); never silently choose
+  a paid provider. Start with one selected case and run sequentially. Context-layer changes need the
+  cases checking that a real agent uses the package correctly.
 - Pi supplies `@earendil-works/*` and `typebox`: keep them optional peer dependencies, never installed
   with the package (a git install runs `npm install`).
 - A host (a scheduler that embeds this extension per folder, such as herdr-pi-loops) passes a context

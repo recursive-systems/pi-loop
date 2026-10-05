@@ -94,6 +94,8 @@ context it passes, and then serves only that folder's own `.pi/loop.json`.
 
 - Loops run only while a Pi session is open in the project. For anything that must never be
   missed, use cron.
+- One session per project owns its loops, through an OS lock held by a small Perl helper (Perl is in
+  the base system on macOS and Linux). Without Perl, loops can't run and the session says why.
 - The default time zone is your machine's. Set another in `.pi/settings.json` with
   `{"loop": {"timezone": "<Area/City>"}}`, using any IANA name, such as `Asia/Tokyo`.
 - In [Herdr](https://herdr.dev), the sidebar can show a countdown to the next loop: add the
@@ -102,7 +104,14 @@ context it passes, and then serves only that folder's own `.pi/loop.json`.
 
 ## Tests
 
-End-to-end against the real `pi`, with no mocks: `npm test`. Set `FIREWORKS_API_KEY` to also run
-a loop through a real model and check that a real agent sets loops up correctly.
+End-to-end against the real `pi`, with no mocks: `npm test`.
+
+Live-model tests are opt-in: set `PI_E2E_PROVIDER` and `PI_E2E_MODEL` explicitly.
+For an existing Pi gateway connection, also set `PI_E2E_MODELS_FILE` and
+`PI_E2E_AUTH_FILE` to absolute paths to your Pi models and API-key auth files.
+Pi reads authentication directly; credentials are not printed. Use synthetic test data only.
+Without an explicit model selection, those tests skip. There is no automatic provider fallback.
+Run one case first with Node's `--test-name-pattern`, then use `--test-concurrency=1`
+to avoid parallel model load.
 
 MIT
