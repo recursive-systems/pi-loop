@@ -534,16 +534,18 @@ export default function loopExtension(pi: ExtensionAPI) {
 		name: "loop_manage",
 		label: "Manage loops",
 		description:
-			"Create, list, delete, pause, resume, fire, gate or test recurring prompts (loops) in this session. A loop re-sends its prompt " +
-			"to this same session on a schedule; the resulting turn shares this conversation's context. Use it when the user asks " +
-			"for something to happen periodically, daily at a time, or 'every N minutes'. Interval default is 10m; `at` is a daily " +
-			"wall-clock time HH:MM in the loop's time zone (DST-aware): `timezone` if given, else the configured loop.timezone " +
-			"setting, else the machine's zone; `list` shows the default. Loops persist across session restarts and fire only while a Pi session is open in this project. " +
-			"A loop may have a gate (a script in the project) that runs when it is due and decides whether the model wakes; `gate` sets or removes it, `test` runs it once without waking, `run` always wakes.",
-		promptSnippet: "Schedule recurring prompts in this session (/loop): create, list, delete, pause, resume, run",
+			"Recurring prompts (loops) in this session: create, list, delete, pause, resume, run (fire now), gate (set or remove a gate) " +
+			"or test (run the gate once without waking). A loop re-sends its prompt to this same session on a schedule, and each fire is " +
+			"a full model turn with this conversation as context. `every` is a fixed interval (default 10m); `at` is a daily HH:MM wall-clock " +
+			"time that follows daylight saving in the loop's zone. A gate is a script in the project that runs when the loop is due and " +
+			"prints JSON deciding skip, wake or defer, so a frequent check wakes the model only when needed. Loops persist across restarts " +
+			"and fire only while a Pi session is open in this project.",
+		promptSnippet: "Schedule recurring prompts in this session (/loop): create, list, delete, pause, resume, run, gate, test",
 		promptGuidelines: [
-			"When the user asks for a recurring or daily task in this session, use loop_manage rather than a one-off reminder; state the id and next fire time.",
-			"Loop prompts should say where the result goes (a file, a message, a script): a loop turn's output stays in this session unless the prompt sends it somewhere.",
+			"Use loop_manage when the user wants something done periodically or daily in this session; reply with the loop id and next fire time. Run loop_manage list first and change an existing loop rather than adding a duplicate.",
+			"For loop_manage loops, put the instructions in a prompt template (.pi/prompts/<name>.md) and make the loop prompt /<name>, saying where results go; a loop turn's output stays in this session otherwise.",
+			"Give loop_manage loops that run more often than hourly a gate so most fires cost no model turn; read the pi-loop skill before writing a gate or a loop like that.",
+			"loop_manage loops fire only while a Pi session is open here; for a run that must never be missed, suggest the system scheduler (cron, launchd, systemd) instead.",
 		],
 		parameters: Type.Object({
 			action: Type.Union([
@@ -553,7 +555,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			prompt: Type.Optional(Type.String({ description: "create: the prompt to re-send each time." })),
 			every: Type.Optional(Type.String({ description: "create: fixed interval like 5m, 2h, 1d. Default 10m. Mutually exclusive with `at`." })),
 			at: Type.Optional(Type.String({ description: "create: daily wall-clock time HH:MM in the loop's time zone." })),
-			timezone: Type.Optional(Type.String({ description: "create with `at` or a whole-day `every` (1d, 7d): IANA zone such as America/Chicago. Omit to follow the configured default." })),
+			timezone: Type.Optional(Type.String({ description: "create with `at` or a whole-day `every` (1d, 7d): IANA zone such as Europe/Berlin or Asia/Tokyo. Omit to follow the configured default (loop.timezone, else the machine zone); ask the user for their zone rather than guessing." })),
 			id: Type.Optional(Type.String({ description: "Loop id (or unique prefix). Optional custom id on create." })),
 			gate: Type.Optional(Type.String({ description: "create or gate: executable inside the project (e.g. .pi/gates/check) run when the loop is due; it prints {action: skip|wake|defer, reason, context?, retryIn?} and only `wake` starts a model turn. With action gate, an empty string removes the gate." })),
 			maxSleep: Type.Optional(Type.String({ description: "With gate: wake anyway once this long has passed since the last wake, e.g. 12h." })),
@@ -582,7 +584,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 						if (!p.prompt?.trim()) throw new Error("prompt is required");
 						if (p.every && p.at) throw new Error("use either every or at");
 						const tz = p.timezone ? validZone(p.timezone) : undefined;
-						if (p.timezone && !tz) throw new Error(`unknown time zone "${p.timezone}"; use an IANA name like America/Chicago`);
+						if (p.timezone && !tz) throw new Error(`unknown time zone "${p.timezone}"; use an IANA name like Europe/Berlin or Asia/Tokyo`);
 						
 						let schedule: Schedule;
 						if (p.at) { const a = parseAt(p.at); if (!a) throw new Error("at must be HH:MM"); schedule = { kind: "at", ...a }; }
@@ -594,7 +596,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 						}
 						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p) : undefined);
 						if (typeof r === "string") throw new Error(r);
-						return `created loop ${r.id}: ${desc(r)}, next fire ${when(r)}, catch-up ${r.catchUp}${r.gate ? `; ${gateText(r)}` : ""}`;
+						const hints: string[] = [];
+						const twins = loops.filter(l => l !== r && l.prompt === r.prompt);
+						if (twins.length) hints.push(`loop ${twins.map(l => l.id).join(", ")} already sends this prompt; delete one unless both are intended`);
+						if (!r.gate && r.schedule.kind === "every" && r.schedule.ms < 3_600_000) hints.push("no gate: every fire is a full model turn; for a frequent check, add one with action gate (see the pi-loop skill)");
+						if (!r.prompt.startsWith("/")) hints.push("tip: a prompt template (.pi/prompts/<name>.md, prompt /<name>) keeps the instructions editable between fires");
+						return `created loop ${r.id}: ${desc(r)}, next fire ${when(r)}, catch-up ${r.catchUp}${r.gate ? `; ${gateText(r)}` : ""}${hints.map(h => `\n- ${h}`).join("")}`;
 					}
 				}
 			})();

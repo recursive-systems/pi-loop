@@ -5,10 +5,26 @@
   "license": "MIT",
   "private": true,
   "type": "module",
-  "keywords": ["pi-package", "pi", "pi-extension", "loop", "schedule", "cron", "herdr"],
-  "repository": { "type": "git", "url": "git+https://github.com/recursive-systems/pi-loop.git" },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "loop",
+    "schedule",
+    "cron",
+    "herdr"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/recursive-systems/pi-loop.git"
+  },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills/pi-loop"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

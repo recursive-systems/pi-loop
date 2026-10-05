@@ -21,7 +21,8 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const EXTENSION = fileURLToPath(new URL("../index.ts", import.meta.url));
+// The repository as a Pi package: the extension and its skill, as `pi install` would load them.
+const PACKAGE = fileURLToPath(new URL("..", import.meta.url));
 const PI = process.env.PI_BIN || "pi";
 const TICK = 15_000;
 const MODEL = process.env.PI_LOOP_E2E_MODEL || "accounts/fireworks/models/deepseek-v4p1-flash";
@@ -68,7 +69,7 @@ class Pi {
 	private seq = 0;
 
 	constructor(t: any, p: { cwd: string; agent: string }, env: Record<string, string> = {}) {
-		this.proc = spawn(PI, ["--mode", "rpc", "--no-session", "-e", EXTENSION], {
+		this.proc = spawn(PI, ["--mode", "rpc", "--no-session", "-e", PACKAGE], {
 			cwd: p.cwd, env: { ...process.env, PI_CODING_AGENT_DIR: p.agent, ...env },
 		});
 		this.proc.stdout.setEncoding("utf8");
@@ -107,6 +108,19 @@ class Pi {
 	userMessages() {
 		return this.lines.filter(l => l.type === "message_start" && l.message?.role === "user")
 			.map(l => (l.message.content ?? []).map((c: any) => c.text ?? "").join(""));
+	}
+
+	/** Prompt the model and wait for the whole run to settle. */
+	async ask(text: string, ms = 240_000) {
+		const from = this.lines.length;
+		const r = await this.send({ type: "prompt", message: text });
+		assert.equal(r.success, true, JSON.stringify(r));
+		const end = Date.now() + ms;
+		for (;;) {
+			if (this.lines.slice(from).some(l => l.type === "agent_end") && !this.lines.slice(from).some((l, i, a) => l.type === "agent_start" && !a.slice(i).some(x => x.type === "agent_end"))) return;
+			if (Date.now() > end) throw new Error("the model run did not finish in time");
+			await new Promise(res => setTimeout(res, 500));
+		}
 	}
 
 	async waitFor(pred: (l: any) => boolean, ms: number) {
@@ -271,4 +285,45 @@ test("a woken loop runs a real model turn to the end", { skip: fireworksKey() ? 
 		.flatMap((m: any) => m.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
 	assert.match(reply, /pong/i, JSON.stringify(end).slice(0, 800));
 	assert.equal(p.loops()[0].fires, 1);
+});
+
+test("the package ships the pi-loop skill", async t => {
+	const pi = new Pi(t, project(t));
+	const r = await pi.send({ type: "get_commands" });
+	assert.ok(r.data.commands.some((c: any) => c.name === "skill:pi-loop" && c.source === "skill"), JSON.stringify(r.data.commands.map((c: any) => c.name)));
+});
+
+// The next two check that an agent, given only what this package puts in its context, uses it correctly.
+const real = fireworksKey() ? false : "set FIREWORKS_API_KEY or FIREWORKS_API_KEY_FILE to run against a real model";
+
+test("asked for a daily job in a stated time zone, the agent makes one `at` loop in that zone", { skip: real }, async t => {
+	const p = project(t, { fireworks: true });
+	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	await pi.ready();
+	await pi.ask("Every day at 08:00 Tokyo time, write today's date to dates.txt in this folder.");
+	const loops = p.loops();
+	assert.equal(loops.length, 1, JSON.stringify(loops));
+	assert.deepEqual([loops[0].schedule.kind, loops[0].schedule.hh, loops[0].schedule.mm, loops[0].tz], ["at", 8, 0, "Asia/Tokyo"]);
+});
+
+test("asked for a frequent check, the agent gates the loop so quiet fires cost no turn", { skip: real }, async t => {
+	const p = project(t, { fireworks: true });
+	fs.writeFileSync(path.join(p.cwd, "status.txt"), "OK\n");
+	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	await pi.ready();
+	await pi.ask("Every 5 minutes, check status.txt in this folder. Only bother the model when it says FAILED; then append a line to incidents.txt.");
+	const [l] = p.loops();
+	assert.ok(l?.gate?.command, `a gate was set: ${JSON.stringify(p.loops())}`);
+	assert.ok(l.schedule.kind === "every" && l.schedule.ms <= 600_000, JSON.stringify(l.schedule));
+	const gate = path.join(p.cwd, l.gate.command);
+	assert.ok(fs.statSync(gate).mode & 0o100, "the gate is executable");
+	// Run the agent's gate as the extension would, against both states of the file.
+	const { execFileSync } = await import("node:child_process");
+	const run = () => {
+		const out = execFileSync(gate, [], { cwd: p.cwd, env: { ...process.env, LOOP_ID: l.id, LOOP_STATE_DIR: tmp(t, "gate-state-"), LOOP_TEST: "1" }, encoding: "utf8" });
+		return JSON.parse(out.trim().split("\n").pop()!).action;
+	};
+	assert.equal(run(), "skip", "quiet when status.txt says OK");
+	fs.writeFileSync(path.join(p.cwd, "status.txt"), "FAILED\n");
+	assert.equal(run(), "wake", "wakes when status.txt says FAILED");
 });

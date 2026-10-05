@@ -13,12 +13,13 @@ The prompt comes back to *the same session*, so the agent remembers what it did 
   waking the model for. No news, no tokens spent.
 - **Daily times follow daylight saving** in whatever time zone you set, or your machine's.
 - **Loops survive restarts.** They're saved in `.pi/loops.json`.
-- **You can ask in plain words**: "every morning at 9, triage new issues" works too.
+- **You can ask in plain words**: "every morning at 9, triage new issues" works too. The package
+  ships a skill that teaches the agent to gate frequent loops and keep instructions in a template.
 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.1.0
+pi install git:github.com/recursive-systems/pi-loop@v0.2.0
 ```
 
 Add `-l` to install it for one project only.
@@ -81,6 +82,6 @@ Log each decision to `$LOOP_STATE_DIR` so you can tune the thresholds later.
 ## Tests
 
 End-to-end against the real `pi`, with no mocks: `npm test`. Set `FIREWORKS_API_KEY` to also run
-a loop through a real model.
+a loop through a real model and check that a real agent sets loops up correctly.
 
 MIT
