@@ -10,7 +10,9 @@ schedule. Optional gate scripts decide whether a due loop wakes the model.
   1. Always in context: `loop_manage`'s description, `promptSnippet` and `promptGuidelines` in `index.ts`.
   2. On demand: the skill `skills/pi-loop/SKILL.md` (setting up loops, writing gates).
   3. Just in time: hints in `loop_manage`'s results (duplicate loop, no gate on a frequent loop).
-- Tests run the real `pi` binary with no mocks (`npm test`). Add end-to-end tests, never unit tests.
+- Tests run the real `pi` binary with no mocks (`npm test`): end-to-end tests that drive Pi the way an
+  agent or user does, never unit tests or stand-ins for Pi or a model. A test that can't reach a real piece
+  (no model key) is skipped with the reason, not faked.
   With a Fireworks key, two of them check that a real agent uses the package correctly; when you change
   the context layers, run those.
 - Pi supplies `@earendil-works/*` and `typebox`: keep them optional peer dependencies, never installed
