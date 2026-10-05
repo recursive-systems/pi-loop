@@ -14,4 +14,12 @@ schedule. Optional gate scripts decide whether a due loop wakes the model.
   With a Fireworks key, two of them check that a real agent uses the package correctly; when you change
   the context layers, run those.
 - The `[loop <id> · … ]` header line is a public contract. Change it only in a major version.
+
+## Writing for people
+
+- The README is for a person deciding in seconds whether this is worth their time. Lead with
+  what it does and why it matters, keep only what they need to start, and cut anything else.
+- Keep this file minimal: only what an agent needs to work here.
+- Readers can be anywhere in the world. Don't assume a time zone, place, language or setup;
+  where an example needs a zone, use a neutral one and say the default is theirs.
 - Keep it generic: nothing specific to any one user, company or setup.
