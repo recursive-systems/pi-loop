@@ -512,3 +512,20 @@ test("a declaration's paused pauses and resumes the loop when it changes, and on
 	while (!p.loops()[0].paused && Date.now() < end) await new Promise(r => setTimeout(r, 500));
 	assert.equal(p.loops()[0].paused, true, "a change to paused in the file applies");
 });
+
+test("a loop moved from one folder's .pi/loop.json to another's changes hands and keeps its run state", { timeout: 90_000 }, async t => {
+	const decl = JSON.stringify([{ id: "moving", prompt: "/check", every: "1h" }]);
+	const p = project(t, { files: { ...folderFiles, "svc/.pi/loop.json": decl, "web/.pi/prompts/check.md": "WEB CHECK" } });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	await new Promise(r => setTimeout(r, 1_000));
+	const before = p.loops()[0];
+	assert.equal(before.source, "svc/.pi/loop.json");
+	fs.rmSync(path.join(p.cwd, "svc/.pi/loop.json"));
+	fs.writeFileSync(path.join(p.cwd, "web/.pi/loop.json"), decl);
+	const end = Date.now() + TICK * 2 + 5_000;
+	while (p.loops()[0]?.source !== "web/.pi/loop.json" && Date.now() < end) await new Promise(r => setTimeout(r, 500));
+	const [after] = p.loops();
+	assert.deepEqual([after?.id, after?.source, after?.dir, after?.createdAt, after?.nextAt], ["moving", "web/.pi/loop.json", "web", before.createdAt, before.nextAt]);
+	assert.doesNotMatch(pi.notes(), /already declared/);
+});

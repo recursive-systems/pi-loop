@@ -460,8 +460,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return l.gateErrors > 1 ? { ...d, reason: `${d.reason} (still failing: ${l.gateErrors} errors in a row)` } : d;
 	}
 
-	function fire(l: Loop, reason: Reason, gate?: GateDecision) {
-		try { home(l); } catch (e) { notify(`loop ${l.id}: ${(e as Error).message}; not fired`, "warning"); return; }
+	function fire(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
+		try { home(l); } catch (e) { const msg = `loop ${l.id}: ${(e as Error).message}; not fired`; notify(msg, "warning"); return msg; }
 		waited.delete(l.id);
 		l.fires += 1;
 		l.lastFiredAt = Date.now();
@@ -532,6 +532,16 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const seen = new Set<string>();
 		const broken = new Set<string>();
 		let changed = false;
+		// Which ids each file declares right now, so a loop moved from one file to another changes hands.
+		const declaresNow = new Map<string, Set<string>>();
+		for (const file of files) {
+			try {
+				const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+				const list = Array.isArray(raw) ? raw : raw?.loops;
+				if (Array.isArray(list)) declaresNow.set(path.relative(cwd, file), new Set(list.map((d: any) => d?.id).filter((x: unknown) => typeof x === "string")));
+			} catch { declaresNow.set(path.relative(cwd, file), new Set(["*"])); /* unreadable: treat as still declaring all it did */ }
+		}
+		const stillDeclares = (source: string, id: string) => { const ids = declaresNow.get(source); return !!ids && (ids.has(id) || ids.has("*")); };
 		for (const file of files) {
 			const source = path.relative(cwd, file);
 			const folder = path.dirname(path.dirname(file));
@@ -558,6 +568,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 				}
 				if (seen.has(def.id)) { notify(`${source}: loop id ${def.id} is declared twice; the first wins`, "warning"); continue; }
 				const l = loops.find(x => x.id === def.id);
+				// Its old file no longer declares it (it moved here): this file takes it over, run state and all.
+				if (l && l.source && l.source !== source && !stillDeclares(l.source, def.id)) {
+					l.source = source; changed = true;
+				}
 				if (l && l.source !== source) {
 					// Never take over a loop made with loop_manage, or one another file declares.
 					const msg = `${source}: loop id ${def.id} is already ${l.source ? `declared in ${l.source}` : "a loop made with loop_manage"}; rename one`;
@@ -759,7 +773,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 					case "test": notify(await testGate(target, commandCtx)); return;
 					case "run": case "now": {
 						if (readOnly) { notify(`loops are owned by pid ${ownerPid()}`, "warning"); return; }
-						const l = find(target)!; fire(l, "manual"); notify(`fired ${l.id}`); return;
+						const l = find(target)!; const err = fire(l, "manual"); if (!err) notify(`fired ${l.id}`); return;
 					}
 				}
 			}
@@ -841,7 +855,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 					case "run": {
 						if (readOnly) return `loops are owned by pid ${ownerPid()}`;
 						const l = find(p.id ?? ""); if (!l) return `no loop "${p.id}"`;
-						fire(l, "manual"); return `fired ${l.id}; its prompt runs after this turn`;
+						const err = fire(l, "manual"); if (err) throw new Error(err);
+						return `fired ${l.id}; its prompt runs after this turn`;
 					}
 					case "gate": {
 						if (!p.id) throw new Error("id is required");
