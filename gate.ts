@@ -10,8 +10,8 @@
  *
  * Anything else (non-zero exit, timeout, no JSON) is a gate error and takes
  * the loop's `onError` action (default wake), so a broken gate cannot keep a
- * session asleep. The command is a file inside the project, run without a shell,
- * with cwd = the project and LOOP_ID / LOOP_STATE_DIR / LOOP_LAST_WOKE_AT set, and
+ * session asleep. The command is a file inside the loop's folder (the project, or the
+ * loop's `dir`), run without a shell, with cwd = that folder and LOOP_ID / LOOP_STATE_DIR / LOOP_LAST_WOKE_AT set, and
  * LOOP_TEST=1 on a `/loop test` run (decide, but record nothing).
  *
  * PI_SESSION_ID / PI_SESSION_FILE are the owning session's, the same values Pi's
@@ -29,7 +29,7 @@ export const MAX_CONTEXT_CHARS = 4_000;
 export const MIN_RETRY_MS = 15_000;
 
 export interface GateConfig {
-	/** Path relative to the project cwd; must stay inside it. */
+	/** Path relative to the loop's folder (the project, unless the loop has a dir); must stay inside it. */
 	command: string;
 	timeoutMs: number;
 	/** Wake without asking the gate once this long has passed since the last wake. */
@@ -50,7 +50,8 @@ export function resolveGate(cwd: string, command: string): { path: string } | { 
 	const rel = command.trim();
 	if (!rel) return { error: "gate path is empty" };
 	if (path.isAbsolute(rel)) return { error: "gate must be a path relative to the project, e.g. .pi/gates/check" };
-	const root = fs.realpathSync(cwd);
+	let root: string;
+	try { root = fs.realpathSync(cwd); } catch { return { error: `the loop's folder ${cwd} does not exist` }; }
 	let abs: string;
 	try { abs = fs.realpathSync(path.resolve(root, rel)); } catch { return { error: `gate ${rel} does not exist` }; }
 	if (abs !== root && !abs.startsWith(root + path.sep)) return { error: "gate must be inside the project" };

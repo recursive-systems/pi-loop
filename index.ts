@@ -80,6 +80,10 @@ interface Loop {
 	context?: string[];
 	/** The .pi/loop.json that declares this loop, relative to the project; edit the loop there. */
 	source?: string;
+	/** The `paused` its declaration last said, so only a change to it pauses or resumes the loop. */
+	declaredPaused?: boolean;
+	/** Bumped whenever the loop's definition changes, so a gate run for an older definition is discarded. */
+	rev?: number;
 }
 
 /** Most text attached from context files to one turn. */
@@ -203,8 +207,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 	const gating = new Set<string>();
 	/** Loops that came due while the session was busy, and since when; they fire once it is free. */
 	const waited = new Map<string, number>();
+	/** Counts runs the session started; a gate's wake is used only if none started while it ran. */
+	let activity = 0;
 	/** The declaring files as last read (path -> mtime), so unchanged ones aren't re-read every tick. */
-	let declaredSeen = "";
+	let declaredSeen: string | undefined;
 	const declaredErrors = new Map<string, string>();
 	let gateLog = "";
 
@@ -214,8 +220,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Loops whose fire times depend on a zone: daily `at` and whole-day intervals (1d, 7d). */
 	const zoned = (sch: Schedule) => sch.kind === "at" || sch.ms % 86_400_000 === 0;
 	const desc = (l: Loop) => describe(l.schedule, zoned(l.schedule) ? zoneOf(l) : undefined);
-	/** The loop's folder: where its gate, prompt template and state live. */
-	const home = (l: Loop) => l.dir ? path.join(ctx!.cwd, l.dir) : ctx!.cwd;
+	/** The loop's folder: where its gate, prompt template and state live. Checked inside the project at each use. */
+	const home = (l: Loop) => {
+		if (!l.dir) return ctx!.cwd;
+		const dir = insideDir(ctx!.cwd, l.dir);
+		if (!dir) throw new Error(`dir ${l.dir} is not a folder inside the project`);
+		return path.join(fs.realpathSync(ctx!.cwd), dir);
+	};
 	const stateDirOf = (l: Loop) => path.join(home(l), ".pi", "loop-state", l.id);
 	/** Busy: a run, compaction or queued prompt, or a loop turn of ours not finished yet. */
 	const busy = () => { try { return !ctx!.isIdle() || !!ctx!.hasPendingMessages?.() || !!phase; } catch { return true; } };
@@ -372,6 +383,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!l) return `no loop "${id}"`;
 		if (l.source) return `${l.id} is declared in ${l.source}; change its gate there`;
 		if (gate) l.gate = gate; else delete l.gate;
+		l.rev = (l.rev ?? 0) + 1;
 		save(); refreshStatus();
 		return gate ? `${l.id}: ${gateText(l)}` : `${l.id}: gate removed; every fire wakes the model`;
 	}
@@ -383,7 +395,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!l.gate) return `${l.id} has no gate`;
 		const t0 = Date.now();
 		const session = sessionOf(caller?.sessionManager ? caller : ctx);
-		const d = await runGate(home(l), l.gate, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: stateDirOf(l), test: true, session });
+		let where: string;
+		try { where = home(l); } catch (e) { return `${l.id}: ${(e as Error).message}`; }
+		const d = await runGate(where, l.gate, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: path.join(where, ".pi", "loop-state", l.id), test: true, session });
 		const extra = d.action === "defer" ? ` (retry in ${countdown(d.retryInMs ?? 0)})` : "";
 		return `${l.id} gate (test, no wake) -> ${d.action}${extra} in ${Date.now() - t0}ms: ${d.reason}${d.context ? `\n${d.context}` : ""}`;
 	}
@@ -395,24 +409,33 @@ export default function loopExtension(pi: ExtensionAPI) {
 	 */
 	function gateThen(l: Loop, reason: Reason) {
 		const started = Date.now();
-		const dueAt = l.nextAt;
+		const dueAt = l.nextAt, rev = l.rev ?? 0, act = activity;
 		l.nextAt = nextFor(l, started);
 		gating.add(l.id);
 		save();
-		void runGate(home(l), l.gate!, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: stateDirOf(l), session: sessionOf(ctx) })
+		let run: Promise<GateDecision>;
+		try { run = runGate(home(l), l.gate!, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: stateDirOf(l), session: sessionOf(ctx) }); }
+		catch (e) { run = Promise.resolve({ action: l.gate!.onError, reason: `gate error: ${(e as Error).message}`, error: true }); }
+		void run
+			.catch((e): GateDecision => ({ action: l.gate!.onError, reason: `gate error: ${(e as Error)?.message ?? e}`, error: true }))
 			.then(raw => {
 				gating.delete(l.id);
 				if (!ctx || readOnly || !loops.includes(l)) return;
-				if (raw.action === "wake" && busy()) {
+				// The loop was redefined while its gate ran: this answer is about the old one. Its schedule stands.
+				if ((l.rev ?? 0) !== rev) { refreshStatus(); return; }
+				// The session worked (or is working) while the gate ran: the evidence may be stale. Due again, gated afresh.
+				if (raw.action === "wake" && (busy() || activity !== act)) {
 					l.nextAt = dueAt; waited.set(l.id, waited.get(l.id) ?? started);
 					save(); refreshStatus(); return;
 				}
+				if (raw.action !== "wake") waited.delete(l.id);
 				const d = backoff(l, raw, Date.now());
 				l.gateRuns = (l.gateRuns ?? 0) + 1;
 				l.lastGate = { at: Date.now(), action: d.action, reason: d.reason };
 				logDecision(gateLog, { ts: new Date().toISOString(), id: l.id, action: d.action, reason: d.reason, ms: Date.now() - started, ...(d.error ? { error: true } : {}) });
 				if (d.action === "defer") l.nextAt = Math.min(Date.now() + (d.retryInMs ?? 60_000), l.nextAt);
 				if (d.action === "wake" && !l.paused) { fire(l, reason, d); return; }
+				waited.delete(l.id); // the occurrence was handled (skipped, deferred, or a quiet gate error)
 				save(); refreshStatus();
 			});
 	}
@@ -438,13 +461,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	function fire(l: Loop, reason: Reason, gate?: GateDecision) {
+		try { home(l); } catch (e) { notify(`loop ${l.id}: ${(e as Error).message}; not fired`, "warning"); return; }
 		waited.delete(l.id);
 		l.fires += 1;
 		l.lastFiredAt = Date.now();
 		l.lastWokeAt = l.lastFiredAt;
 		phase = { state: "queued", id: l.id };
 		phaseAt = Date.now();
-		if (reason !== "manual") l.nextAt = nextFor(l, Date.now());
+		// A manual run of a loop that is due (or waiting) is that occurrence; a manual run ahead of time isn't.
+		if (reason !== "manual" || l.nextAt <= Date.now()) l.nextAt = nextFor(l, Date.now());
 		save();
 		// One line: a gate's reason may hold newlines (a JSON "\n"), and readers of the header
 		// (the model, and any extension that recognises loop turns) take it to end at the line's closing "]".
@@ -532,24 +557,36 @@ export default function loopExtension(pi: ExtensionAPI) {
 					continue;
 				}
 				if (seen.has(def.id)) { notify(`${source}: loop id ${def.id} is declared twice; the first wins`, "warning"); continue; }
-				seen.add(def.id);
 				const l = loops.find(x => x.id === def.id);
+				if (l && l.source !== source) {
+					// Never take over a loop made with loop_manage, or one another file declares.
+					const msg = `${source}: loop id ${def.id} is already ${l.source ? `declared in ${l.source}` : "a loop made with loop_manage"}; rename one`;
+					if (declaredErrors.get(`${source}#${def.id}`) !== msg) { declaredErrors.set(`${source}#${def.id}`, msg); notify(msg, "warning"); }
+					continue;
+				}
+				seen.add(def.id);
+				const declaredPaused = !!d.paused;
 				if (!l) {
 					const now = Date.now();
-					const loop: Loop = { ...def, source, paused: !!d.paused, createdAt: now, fires: 0, nextAt: 0,
+					const loop: Loop = { ...def, source, paused: declaredPaused, declaredPaused, rev: 1, createdAt: now, fires: 0, nextAt: 0,
 						catchUp: def.schedule.kind === "at" || def.schedule.ms >= CATCH_UP_MIN_MS ? "latest" : "none" };
 					loop.nextAt = nextFor(loop, now);
 					loops.push(loop); changed = true;
 					continue;
 				}
-				const before = JSON.stringify(l);
+				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context]);
+				const before = defOf(l);
 				const reschedule = JSON.stringify(l.schedule) !== JSON.stringify(def.schedule) || l.tz !== def.tz;
-				Object.assign(l, def, { source });
+				Object.assign(l, def);
 				for (const k of ["tz", "gate", "priority", "dir", "context"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
 				l.catchUp = l.schedule.kind === "at" || l.schedule.ms >= CATCH_UP_MIN_MS ? "latest" : "none";
-				if (d.paused) l.paused = true;
+				// Only a change to the declared `paused` pauses or resumes; /loop pause and resume hold otherwise.
+				if (l.declaredPaused !== declaredPaused) {
+					l.declaredPaused = declaredPaused; changed = true;
+					if (l.paused !== declaredPaused) { l.paused = declaredPaused; if (!l.paused) l.nextAt = nextFor(l, Date.now()); }
+				}
 				if (reschedule) l.nextAt = nextFor(l, Date.now());
-				if (JSON.stringify(l) !== before) changed = true;
+				if (defOf(l) !== before) { l.rev = (l.rev ?? 0) + 1; waited.delete(l.id); changed = true; }
 			}
 		}
 		// A declared loop whose file no longer declares it is gone; one in a broken file is kept as it was.
@@ -597,7 +634,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (!claimLock()) return;
 			readOnly = false;
 			loops = load();
-			declaredSeen = "";
+			declaredSeen = undefined;
 			syncDeclared();
 			reconcile();
 		}
@@ -617,6 +654,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		// Free: the highest priority goes first, then the longest overdue.
 		const due = dueNow.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || a.nextAt - b.nextAt)[0];
+		try { home(due); } catch (e) {
+			// Its folder is gone or outside the project: skip this occurrence, say so, keep the others running.
+			notify(`loop ${due.id}: ${(e as Error).message}; skipped`, "warning");
+			logDecision(gateLog, { ts: new Date(now).toISOString(), id: due.id, action: "skip", reason: (e as Error).message, ms: 0, error: true });
+			waited.delete(due.id); due.nextAt = nextFor(due, now); save(); refreshStatus();
+			return;
+		}
 		const since = waited.get(due.id);
 		if (since === undefined && now - due.nextAt > TICK_MS * 4 && due.catchUp === "none") {
 			// Missed by more than a minute with no session to run it (sleep, restart): short loops just realign.
@@ -648,7 +692,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		zone = configuredZone(c.cwd);
 		if (zone.warning) notify(zone.warning, "warning");
 		loops = load();
-		waited.clear(); declaredSeen = ""; declaredErrors.clear();
+		waited.clear(); declaredSeen = undefined; declaredErrors.clear();
 		readOnly = !claimLock();
 		if (!readOnly) { syncDeclared(); reconcile(); }
 		if (timer) clearInterval(timer);
@@ -671,8 +715,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 		refreshStatus();
 	});
 
-	pi.on("agent_settled", (_event, c) => {
-		if (phase?.state !== "running" || c?.isIdle?.() === false) return;
+	// A run started: a gate that was running when it did may have looked at stale facts.
+	pi.on("agent_start", () => { activity++; });
+
+	// The loop's turn is over once Pi settles, even if a compaction starts right after: busy() still
+	// sees the compaction through isIdle(), and Pi sends no second agent_settled when it ends.
+	pi.on("agent_settled", () => {
+		if (phase?.state !== "running") return;
 		phase = undefined;
 		refreshStatus();
 	});

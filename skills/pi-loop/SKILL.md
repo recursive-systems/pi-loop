@@ -43,7 +43,8 @@ the loop is due and prints one JSON line as its last line of output:
 - `skip`: no model turn. `wake`: the prompt is sent with `· gate: <reason>` in its header and
   `context` (up to 4 KB) in a `<gate-context>` block. `defer`: run the gate again after `retryIn`
   (15 s minimum).
-- It runs without a shell, with cwd = the project and a 60 s timeout (`gateTimeout` to change).
+- It runs without a shell, with cwd = the loop's folder (the project, or its `dir`) and a 60 s
+  timeout (`gateTimeout` to change).
   Environment: `LOOP_ID`, `LOOP_PROMPT`, `LOOP_LAST_WOKE_AT`, `LOOP_STATE_DIR` (its own folder
   for memory between runs), `PI_SESSION_ID`, `PI_SESSION_FILE`, and `LOOP_TEST=1` on a test run.
 - An error (non-zero exit, timeout, no JSON) wakes the model once, then reminds every 6 h until
@@ -86,13 +87,15 @@ One session can carry several responsibilities, each a loop:
               "maxSleep": "12h", "context": ["AGENTS.md"], "priority": 1}]}
   ```
 
-  Fields match `loop_manage create` (`every` or `at`, `timezone`, `gate`, `maxSleep`, `gateTimeout`,
-  `gateOnError`, `priority`, `context`, `paused`). The folder holding the file is the loop's folder.
-  Edits apply within a tick; deleting the entry deletes the loop. Change a declared loop in its file,
-  not with `loop_manage` (pause and resume still work).
+  Fields are those of `loop_manage create` (`every` or `at`, `timezone`, `gate`, `maxSleep`,
+  `gateTimeout`, `gateOnError`, `priority`, `context`), plus `paused`. The folder holding the file is
+  the loop's folder. Edits apply within a tick; deleting the entry deletes the loop. An id already
+  used by a `loop_manage` loop is refused. Change a declared loop in its file: `loop_manage`
+  `delete` and `gate` refuse it; `pause` and `resume` work until the file's `paused` changes.
 
 ## 5. When it fires
 
 The message starts with `[loop <id> · <schedule> · fire #N …]`. Do the template's work, send the
 result where it says, and keep "nothing to do" turns to one line. To stop or change the loop,
-use `loop_manage` (`pause`, `delete`, `gate`). Don't just ignore the loop.
+use `loop_manage` (`pause`, `delete`, `gate`), or edit its `.pi/loop.json` if it is declared there.
+Don't just ignore the loop.

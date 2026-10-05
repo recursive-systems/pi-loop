@@ -8,10 +8,8 @@
 // gate context, expanded template: what this extension controls) and the model call after it
 // fails without anything answering in its place.
 //
-// The waiting tests need a session that stays busy. For those the provider's endpoint is a
-// local socket that accepts the model request and never answers, so Pi is genuinely mid-run
-// (waiting on its model) until the test aborts it over RPC. It stands in for a slow model,
-// not for anything this extension talks to.
+// The waiting test needs a session that is really busy: a real model (Fireworks) runs a real
+// `sleep` in bash. Without a key it is skipped, and says so.
 //
 // One test goes all the way to a real model: set FIREWORKS_API_KEY (or FIREWORKS_API_KEY_FILE,
 // a file holding it) and it runs a woken loop through Fireworks (PI_LOOP_E2E_MODEL to pick the
@@ -20,7 +18,6 @@
 // Needs `pi` on PATH (PI_BIN to override). Run: npm test
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import net from "node:net";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -48,20 +45,11 @@ function tmp(t: any, prefix: string) {
 	return dir;
 }
 
-/** A model endpoint that takes the request and never answers: the session stays busy until aborted. */
-async function silentModel(t: any): Promise<string> {
-	const socks = new Set<net.Socket>();
-	const server = net.createServer(sock => { socks.add(sock); sock.on("error", () => {}); });
-	await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
-	t.after(() => { for (const s of socks) s.destroy(); server.close(); });
-	return `http://127.0.0.1:${(server.address() as net.AddressInfo).port}/v1`;
-}
-
-function project(t: any, opts: { tz?: string; loops?: any[]; gates?: Record<string, string>; prompts?: Record<string, string>; fireworks?: boolean; endpoint?: string; files?: Record<string, string> } = {}) {
+function project(t: any, opts: { tz?: string; loops?: any[]; gates?: Record<string, string>; prompts?: Record<string, string>; fireworks?: boolean; files?: Record<string, string> } = {}) {
 	const cwd = tmp(t, "pi-loop-e2e-cwd-"), agent = tmp(t, "pi-loop-e2e-agent-");
 	fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
 	fs.writeFileSync(path.join(agent, "models.json"), JSON.stringify({ providers: { closed: {
-		baseUrl: opts.endpoint ?? "http://127.0.0.1:9/v1", api: "openai-completions", apiKey: "none", models: [{ id: "none" }] } } }));
+		baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions", apiKey: "none", models: [{ id: "none" }] } } }));
 	for (const [rel, body] of Object.entries(opts.files ?? {})) {
 		fs.mkdirSync(path.dirname(path.join(cwd, rel)), { recursive: true });
 		fs.writeFileSync(path.join(cwd, rel), body, { mode: rel.includes("/gates/") ? 0o755 : 0o644 });
@@ -350,44 +338,82 @@ test("asked for a frequent check, the agent gates the loop so quiet fires cost n
 
 // ---------------------------------------------------------------- waiting for a free session --
 
-test("due loops wait while the session is busy, then fire once each, highest priority first, gate run when free", { timeout: 240_000 }, async t => {
-	const endpoint = await silentModel(t);
+test("due loops wait while the session is busy, then fire once each, highest priority first, gate run when free", { skip: real, timeout: 420_000 }, async t => {
 	const p = project(t, {
-		endpoint,
+		fireworks: true,
 		loops: [
-			{ ...due("often"), schedule: { kind: "every", ms: 60_000 }, catchUp: "none", nextAt: Date.now() + 20_000,
+			{ ...due("often"), prompt: "Reply with the single word ok.", schedule: { kind: "every", ms: 60_000 }, catchUp: "none", nextAt: Date.now() + 15_000,
 				gate: { command: ".pi/gates/stamp", timeoutMs: 10_000, onError: "wake" } },
-			{ ...due("urgent"), priority: 5, nextAt: Date.now() + 20_000 },
+			{ ...due("urgent"), prompt: "Run this exact bash command and nothing else: sleep 35. Then reply with the single word done.", priority: 5, nextAt: Date.now() + 15_000 },
 		],
 		gates: { stamp: '#!/bin/sh\ndate +%s >> "$LOOP_STATE_DIR/ran"\necho \'{"action":"wake","reason":"checked"}\'\n' },
 	});
-	const pi = new Pi(t, p);
+	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
 	await pi.ready();
-	const r = await pi.send({ type: "prompt", message: "a long task" });
+	const r = await pi.send({ type: "prompt", message: "Run this exact bash command and nothing else: sleep 90. Then reply with the single word done." });
 	assert.equal(r.success, true);
-	await pi.waitFor(l => l.type === "agent_start", 10_000);
-	// Both come due while the model is still "thinking"; "often" (every 1m) comes due again too.
-	await new Promise(res => setTimeout(res, 95_000));
-	assert.deepEqual(pi.userMessages().filter(m => m.startsWith("[loop")), [], "nothing fires, nothing queues, while busy");
-	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loop-state/often/ran")), "the gate doesn't run while busy");
+	await pi.waitFor(l => l.type === "tool_execution_start" && l.toolName === "bash", 60_000);
+	// Both come due while the agent works; "often" (every 1m) comes due again too.
+	await pi.waitFor(l => l.type === "agent_settled", 240_000);
 	const freedAt = Math.floor(Date.now() / 1000);
-	await pi.send({ type: "abort" });
+	const loopsBefore = pi.userMessages().filter(m => m.startsWith("[loop")).length;
+	assert.equal(loopsBefore, 0, "nothing fired or queued while the agent worked");
+	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loop-state/often/ran")), "the gate doesn't run while the agent works");
 
 	const first = await pi.waitForUser(/^\[loop /, TICK * 2 + 5_000);
-	assert.match(first, /^\[loop urgent · every 1h · fire #1 · waited \d+m?\d*s?/, "the higher priority goes first, marked as having waited");
+	assert.match(first, /^\[loop urgent · every 1h · fire #1 · waited \d+m/, "the higher priority goes first, marked as having waited");
+	await pi.waitFor(l => l.type === "tool_execution_start" && l.toolName === "bash" && pi.lines.indexOf(l) > pi.lines.findIndex(x => x.type === "message_start" && JSON.stringify(x).includes("[loop urgent")), 60_000);
 	await new Promise(res => setTimeout(res, TICK + 3_000));
 	assert.equal(pi.userMessages().filter(m => m.startsWith("[loop")).length, 1, "one at a time: the next waits for this turn");
-	await pi.send({ type: "abort" });
 
-	const second = await pi.waitForUser(/^\[loop often /, TICK * 3 + 5_000);
+	const second = await pi.waitForUser(/^\[loop often /, 180_000);
 	assert.match(second, /fire #1 · waited .* · gate: checked\]/, "a short loop that waited fires once instead of being skipped");
 	const ran = fs.readFileSync(path.join(p.cwd, ".pi/loop-state/often/ran"), "utf8").trim().split("\n").map(Number);
 	assert.equal(ran.length, 1, "its gate ran once");
 	assert.ok(ran[0] >= freedAt, "and only after the session was free");
-	await pi.send({ type: "abort" });
 	const byId = Object.fromEntries(p.loops().map((l: any) => [l.id, l]));
 	assert.equal(byId.often.fires, 1, "no stacked copies");
 	assert.equal(byId.urgent.fires, 1);
+});
+
+test("a gate's wake isn't used if the session worked while the gate ran; the gate runs again", { timeout: 120_000 }, async t => {
+	const p = project(t, {
+		loops: [due("slow", { gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })],
+		gates: { slow: '#!/bin/sh\ndate +%s >> "$LOOP_STATE_DIR/ran"\nsleep 6\necho \'{"action":"wake","reason":"looked"}\'\n' },
+	});
+	const pi = new Pi(t, p);
+	await pi.ready();
+	const ran = path.join(p.cwd, ".pi/loop-state/slow/ran");
+	const end = Date.now() + TICK * 2 + 5_000;
+	while (!fs.existsSync(ran) && Date.now() < end) await new Promise(r => setTimeout(r, 200));
+	// A prompt arrives while the gate runs; its run starts and (no model here) ends at once.
+	await pi.send({ type: "prompt", message: "something else" });
+	const msg = await pi.waitForUser(/^\[loop slow /, TICK * 3 + 15_000);
+	assert.match(msg, /gate: looked\]/);
+	assert.equal(fs.readFileSync(ran, "utf8").trim().split("\n").length, 2, "the first answer was discarded and the gate ran again");
+	assert.equal(p.loops()[0].fires, 1);
+});
+
+test("/loop run on a loop that is due is that occurrence: it doesn't fire again", { timeout: 90_000 }, async t => {
+	const p = project(t, { loops: [{ ...due("hourly"), nextAt: Date.now() + 8_000 }] });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	await new Promise(r => setTimeout(r, 9_000)); // due now, before the first tick looks
+	assert.match(await pi.command("/loop run hourly"), /fired hourly/);
+	assert.ok(p.loops()[0].nextAt > Date.now() + 3_000_000, "its schedule moved on");
+	await new Promise(r => setTimeout(r, TICK * 2 + 2_000));
+	assert.equal(pi.userMessages().filter(m => m.startsWith("[loop hourly")).length, 1);
+	assert.equal(p.loops()[0].fires, 1);
+});
+
+test("a loop whose folder is gone is skipped with a warning; the others keep running", { timeout: 90_000 }, async t => {
+	const p = project(t, { loops: [due("lost", { dir: "gone", priority: 9 }), due("fine")] });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	await pi.waitForUser(/^\[loop fine /, TICK * 3 + 5_000);
+	assert.match(pi.notes(), /loop lost: dir gone does not exist; skipped/);
+	assert.ok(!pi.userMessages().some(m => m.startsWith("[loop lost")));
+	assert.ok(p.loops().find((l: any) => l.id === "lost").nextAt > Date.now());
 });
 
 // -------------------------------------------------------------------------- loop folders --
@@ -422,8 +448,8 @@ test("loops declared in a folder's .pi/loop.json are picked up, follow edits, an
 	const decl = (prompt: string) => JSON.stringify({ loops: [{ id: "svc-check", prompt, every: "1h", gate: ".pi/gates/check", maxSleep: "12h", context: ["AGENTS.md"], priority: 2 }] });
 	const p = project(t, {
 		files: { ...folderFiles, "svc/.pi/loop.json": decl("/check"), "notes/readme.txt": "not a loop folder" },
-		// Run state from before (same id): kept, and due now.
-		loops: [{ ...due("svc-check"), fires: 4 }],
+		// Its run state from an earlier session: kept, and due now.
+		loops: [{ ...due("svc-check"), fires: 4, source: "svc/.pi/loop.json", dir: "svc" }],
 	});
 	const pi = new Pi(t, p);
 	await pi.ready();
@@ -448,4 +474,41 @@ test("loops declared in a folder's .pi/loop.json are picked up, follow edits, an
 	const gone = Date.now() + TICK * 2 + 5_000;
 	while (p.loops().length && Date.now() < gone) await new Promise(r => setTimeout(r, 500));
 	assert.deepEqual(p.loops(), [], "removing the declaration removes the loop");
+});
+
+test("a declaration never takes over a loop made with loop_manage; one whose file is gone is removed at start", async t => {
+	const p = project(t, {
+		files: { ...folderFiles, "svc/.pi/loop.json": JSON.stringify([{ id: "mine", prompt: "/check", every: "1h" }]) },
+		loops: [
+			{ ...due("mine"), prompt: "my own loop", nextAt: Date.now() + 3_600_000 },
+			{ ...due("orphan"), source: "old/.pi/loop.json", nextAt: Date.now() + 3_600_000 },
+		],
+	});
+	const pi = new Pi(t, p);
+	await pi.ready();
+	await new Promise(r => setTimeout(r, 1_000));
+	const loops = p.loops();
+	assert.deepEqual(loops.map((l: any) => [l.id, l.prompt, l.source ?? null]), [["mine", "my own loop", null]]);
+	assert.match(pi.notes(), /svc\/.pi\/loop.json: loop id mine is already a loop made with loop_manage; rename one/);
+});
+
+test("a declaration's paused pauses and resumes the loop when it changes, and only then", { timeout: 90_000 }, async t => {
+	const decl = (paused: boolean) => JSON.stringify([{ id: "p", prompt: "/check", every: "1h", paused }]);
+	const p = project(t, { files: { ...folderFiles, "svc/.pi/loop.json": decl(true) } });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	await new Promise(r => setTimeout(r, 1_000));
+	assert.equal(p.loops()[0].paused, true);
+	await pi.command("/loop resume p");
+	assert.equal(p.loops()[0].paused, false, "resumed by hand");
+	fs.writeFileSync(path.join(p.cwd, "svc/AGENTS.md"), "touched"); // an unrelated change: nothing re-pauses it
+	fs.writeFileSync(path.join(p.cwd, "svc/.pi/loop.json"), decl(true) + "\n");
+	await new Promise(r => setTimeout(r, TICK + 2_000));
+	assert.equal(p.loops()[0].paused, false, "the file still says paused, unchanged: the hand resume holds");
+	fs.writeFileSync(path.join(p.cwd, "svc/.pi/loop.json"), decl(false));
+	await new Promise(r => setTimeout(r, TICK + 2_000));
+	fs.writeFileSync(path.join(p.cwd, "svc/.pi/loop.json"), decl(true));
+	const end = Date.now() + TICK * 2 + 5_000;
+	while (!p.loops()[0].paused && Date.now() < end) await new Promise(r => setTimeout(r, 500));
+	assert.equal(p.loops()[0].paused, true, "a change to paused in the file applies");
 });
