@@ -27,7 +27,8 @@ export class FolderLock {
 	private candidate?: ChildProcessWithoutNullStreams;
 	private claiming?: Promise<boolean>;
 	private generation = 0;
-	constructor(readonly file: string, private extra: Record<string, unknown> = {}) {}
+	/** onLost: called once if the lock is lost while held (its helper died), not on release(). */
+	constructor(readonly file: string, private extra: Record<string, unknown> = {}, private onLost?: () => void) {}
 
 	owner(): Owner | undefined {
 		let pid = 0;
@@ -60,7 +61,10 @@ export class FolderLock {
 			child.on("error", () => { clearTimeout(timer); done(false); });
 			child.on("exit", () => {
 				clearTimeout(timer);
-				if (this.holder === child) this.holder = undefined;
+				if (this.holder === child) {
+					this.holder = undefined;
+					try { this.onLost?.(); } catch { /* the caller's problem */ }
+				}
 				done(false);
 			});
 			child.stdout.on("data", d => {

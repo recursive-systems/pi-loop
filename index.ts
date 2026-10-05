@@ -265,6 +265,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		try { return JSON.parse(fs.readFileSync(file, "utf8")) as Loop[]; } catch { return []; }
 	}
 	function save() {
+		// Only the owner writes. If the lock went away (its helper died), stop at once: another session may own it now.
+		if (!holding()) return;
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		const tmp = `${file}.${process.pid}.tmp`;
 		fs.writeFileSync(tmp, JSON.stringify(loops, null, 2), { mode: 0o600 });
@@ -286,6 +288,19 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 	let lockWarned = false;
 	function releaseLock() { folderLock?.release(); }
+	/** This session owns the loops right now; if it has just lost the lock, it becomes read-only. */
+	function holding(): boolean {
+		if (readOnly) return false;
+		if (folderLock?.mine()) return true;
+		lostLock();
+		return false;
+	}
+	function lostLock() {
+		if (readOnly) return;
+		readOnly = true;
+		notify("pi-loop lost its lock on this folder's loops; this session is read-only until it can take it back", "warning");
+		refreshStatus();
+	}
 	function ownerPid(): string { return String(folderLock?.owner()?.pid ?? "?"); }
 
 
@@ -481,6 +496,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	function fire(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
+		if (!holding()) return `loops are owned by pid ${ownerPid()}`;
 		try { home(l); } catch (e) { const msg = `loop ${l.id}: ${(e as Error).message}; not fired`; notify(msg, "warning"); return msg; }
 		// The occurrence is recorded as sent only after it is handed over (below): a crash in between
 		// sends it again with the same fire number, which a host recognises as the same occurrence.
@@ -747,7 +763,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		loops = load();
 		waited.clear(); declaredSeen = undefined; declaredErrors.clear();
 		folderLock?.release();
-		folderLock = new FolderLock(lock);
+		folderLock = new FolderLock(lock, {}, () => lostLock());
 		readOnly = true;
 		claimLock(() => { loops = load(); syncDeclared(); reconcile(); refreshStatus(); });
 		if (timer) clearInterval(timer);

@@ -95,7 +95,8 @@ context it passes, and then serves only that folder's own `.pi/loop.json`.
 - Loops run only while a Pi session is open in the project. For anything that must never be
   missed, use cron.
 - One session per project owns its loops, through an OS lock held by a small Perl helper (Perl is in
-  the base system on macOS and Linux). Without Perl, loops can't run and the session says why.
+  the base system on macOS and Linux). Without Perl, loops can't run and the session says why. If a
+  session loses the lock, it stops changing loops at once and takes them back once the lock is free.
 - The default time zone is your machine's. Set another in `.pi/settings.json` with
   `{"loop": {"timezone": "<Area/City>"}}`, using any IANA name, such as `Asia/Tokyo`.
 - In [Herdr](https://herdr.dev), the sidebar can show a countdown to the next loop: add the

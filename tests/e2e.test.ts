@@ -15,7 +15,7 @@
 //
 // Needs `pi` on PATH (PI_BIN to override). Run: npm test
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -516,6 +516,31 @@ test("an owner that crashes frees the lock at once: the next session owns the lo
 	let note = "";
 	while (Date.now() < end) { note = await b.command("/loop 1h theirs"); if (!/owned by pid/.test(note)) break; await new Promise(r => setTimeout(r, 500)); }
 	assert.match(note, /loop theirs:/);
+});
+
+test("a session whose lock helper dies stops writing at once, and takes the loops back when the lock is free", { timeout: 90_000 }, async t => {
+	const p = project(t);
+	const a = new Pi(t, p);
+	await a.ready();
+	assert.match(await a.command("/loop 1h first"), /loop first:/);
+	const lock = path.join(p.cwd, ".pi/loops.lock");
+	const helper = execFileSync("pgrep", ["-f", lock], { encoding: "utf8" }).trim().split("\n").map(Number);
+	assert.equal(helper.length, 1, "one lock helper: A's");
+	// Another process takes the real lock the moment A's helper is gone, as a second session would.
+	process.kill(helper[0], "SIGKILL");
+	const other = spawn("perl", ["-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or exit 2; until (flock($f, LOCK_EX | LOCK_NB)) { select(undef, undef, undef, 0.02) } $| = 1; print "ok\\n"; 1 while <STDIN>;', lock]);
+	t.after(() => other.kill());
+	await new Promise<void>(r => other.stdout.once("data", () => r()));
+	assert.match(await a.command("/loop 1h second"), /owned by pid/, "A refuses to change the loops");
+	assert.match(a.notes(), /lost its lock/);
+	assert.deepEqual(p.loops().map((l: any) => l.prompt), ["first"], "nothing written after the lock was lost");
+	// The other holder lets go: A takes the lock back on its next tick and can change the loops again.
+	other.stdin.end();
+	const end = Date.now() + 40_000;
+	let note = "";
+	while (Date.now() < end) { note = await a.command("/loop 1h third"); if (!/owned by pid/.test(note)) break; await new Promise(r => setTimeout(r, 1_000)); }
+	assert.match(note, /loop third:/);
+	assert.deepEqual(p.loops().map((l: any) => l.prompt).sort(), ["first", "third"]);
 });
 
 test("two sessions starting at once in a folder: exactly one owns its loops", { timeout: 60_000 }, async t => {
