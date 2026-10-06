@@ -1323,6 +1323,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const seen = new Set<string>();
 		const broken = new Set<string>();
 		const root = fs.realpathSync(cwd);
+		const heldBack = new Set<string>();
 		// loop.folders not fully readable: the adopted folders' loops stay as they were rather than vanish.
 		const adopt = adoption(cwd);
 		for (const m of adopt.unsure) if (declaredErrors.get(`settings#${m}`) !== m) { declaredErrors.set(`settings#${m}`, m); notify(m, "warning"); }
@@ -1361,8 +1362,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		for (const file of files) {
 			const source = path.relative(cwd, file);
 			const folder = path.dirname(path.dirname(file));
-			// Another session holds its folder (or this one is still taking it): its loops wait as they were.
-			if (foreign.has(source)) { broken.add(source); continue; }
+			// Another session holds its folder (or this one is still taking it): its loops wait as they were, including
+			// one that has just moved to it from another file (it changes hands once the folder is held).
+			if (foreign.has(source)) { broken.add(source); for (const id of declaresNow.get(source) ?? []) heldBack.add(id); continue; }
 			let decls: Declared[];
 			try {
 				const raw = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -1422,7 +1424,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 		}
 		// A declared loop whose file no longer declares it is gone; one in a broken file is kept as it was.
-		const kept = loops.filter(l => !l.source || seen.has(l.id) || broken.has(l.source));
+		const kept = loops.filter(l => !l.source || seen.has(l.id) || broken.has(l.source) || heldBack.has(l.id));
 		if (kept.length !== loops.length) { loops = kept; changed = true; }
 		if (changed) { save(); refreshStatus(); }
 	}
