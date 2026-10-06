@@ -88,14 +88,29 @@ One session can carry several responsibilities, each a loop:
   ```
 
   Fields are those of `loop_manage create` (`every` or `at`, `timezone`, `gate`, `maxSleep`,
-  `gateTimeout`, `gateOnError`, `priority`, `context`), plus `paused`. The folder holding the file is
+  `gateTimeout`, `gateOnError`, `priority`, `context`, `run`), plus `paused` and `until`. One file
+  per project is the way forward; folders under the project still work for setups that use them. The folder holding the file is
   the loop's folder. Edits apply within a tick; deleting the entry deletes the loop. An id already
   used by a `loop_manage` loop is refused. Change a declared loop in its file: `loop_manage`
   `delete` and `gate` refuse it; `pause` and `resume` work until the file's `paused` changes.
 
-## 5. When it fires
+## 5. In the background, or watching something
+
+- **`run`** puts a loop's turn beside the conversation instead of in it: `fork` (a copy of the
+  conversation as it is then: use it when the job needs what was said), `thread` (the loop's own
+  conversation, continued each run: for jobs that build on their last run) or `fresh` (a new
+  conversation each run: for self-contained checks; the cheapest). Leave it out to run in the
+  conversation as before. The owner watches, steers and steps into runs from `/loop`.
+- **Watching something for a while** (a deploy, a PR, a migration): an ad hoc loop with `every: auto`
+  and `for` (how long at most). Each run picks the next time with `loop_report` `next` (short while it
+  changes, long when quiet) and ends the loop with `stop: true` when it's done. Ad hoc loops end after
+  7 days unless `for`/`until` says otherwise; standing jobs belong in `.pi/loop.json`.
+
+## 6. When it fires
 
 The message starts with `[loop <id> · <schedule> · fire #N …]`. Do the template's work, send the
-result where it says, and keep "nothing to do" turns to one line. To stop or change the loop,
+result where it says, and keep "nothing to do" turns to one line. End with `loop_report`: findings
+true only if there is something the owner should see (a background run with no findings stays
+quiet), a one-line summary, and `next` or `stop` when the timing should change. To stop or change the loop,
 use `loop_manage` (`pause`, `delete`, `gate`), or edit its `.pi/loop.json` if it is declared there.
 Don't just ignore the loop.

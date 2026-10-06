@@ -9,7 +9,23 @@
  * - a wall time repeated by fall-back (01:30 twice) fires once, the first time.
  */
 
-export type Schedule = { kind: "every"; ms: number } | { kind: "at"; hh: number; mm: number };
+export type Schedule = { kind: "every"; ms: number } | { kind: "at"; hh: number; mm: number } | { kind: "auto" };
+
+/** A self-paced loop (every: "auto") runs again when its run says (loop_report next); without that, after this. */
+export const AUTO_FALLBACK_MS = 20 * 60_000;
+/** Ad hoc loops (made with /loop or loop_manage) end after this unless they say otherwise. */
+export const AD_HOC_LIFETIME_MS = 7 * 24 * 60 * 60_000;
+
+/** "<1m", "14m", "2h05m", "1d3h": whole minutes rounded up, so it never reads "0m" before firing. */
+export function countdown(ms: number): string {
+	if (ms < 60_000) return "<1m";
+	const mins = Math.ceil(ms / 60_000);
+	if (mins < 60) return `${mins}m`;
+	const h = Math.floor(mins / 60), m = mins % 60;
+	if (h < 24) return `${h}h${String(m).padStart(2, "0")}m`;
+	const d = Math.floor(h / 24), rh = h % 24;
+	return rh ? `${d}d${rh}h` : `${d}d`;
+}
 
 export const MIN_INTERVAL_MS = 60_000;
 export const DEFAULT_INTERVAL_MS = 10 * 60_000;
@@ -91,6 +107,7 @@ export function wallToInstant(y: number, mo: number, d: number, hh: number, mm: 
 const DAY_MS = 86_400_000;
 
 export function nextAtFor(s: Schedule, from: number, anchor: number, tz: string): number {
+	if (s.kind === "auto") return from + AUTO_FALLBACK_MS;
 	if (s.kind === "every" && s.ms % DAY_MS === 0) return nextDayGrid(s.ms / DAY_MS, from, anchor, tz);
 	if (s.kind === "every") {
 		// Advance from the planned grid (anchor + k*ms), no completion drift.
@@ -139,6 +156,7 @@ export function zoneAbbrev(ts: number, tz: string): string {
 }
 
 export function describe(s: Schedule, tz?: string): string {
+	if (s.kind === "auto") return "self-paced";
 	if (s.kind === "at") return `daily at ${pad(s.hh)}:${pad(s.mm)}${tz ? ` ${tz}` : ""}`;
 	const ms = s.ms;
 	if (ms % 86_400_000 === 0) return `every ${ms / 86_400_000}d${tz ? ` (${tz})` : ""}`;

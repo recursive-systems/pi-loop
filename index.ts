@@ -38,14 +38,58 @@ import * as os from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-	DEFAULT_INTERVAL_MS, MIN_INTERVAL_MS, describe, fmtTime, nextAtFor, parseAt, parseInterval, validZone, systemZone,
+	AD_HOC_LIFETIME_MS, DEFAULT_INTERVAL_MS, MIN_INTERVAL_MS, countdown, describe, fmtTime, nextAtFor, parseAt, parseInterval, validZone, systemZone,
 	type Schedule,
 } from "./schedule.ts";
-import { HerdrTokens, countdown, loopTokens, type Phase } from "./herdr.ts";
+import { Run, RUN_MODES, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord } from "./background.ts";
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
+import { FolderLock, lockAvailable } from "./lock.ts";
+import { LoopsView, type LoopRow, type ViewAction } from "./view.ts";
+
+type Phase = { state: "queued" | "running"; id: string } | undefined;
 
 const STATUS_KEY = "loop";
+/** What a loop run is asked to do at the end, so findings and pacing don't depend on its wording. */
+const REPORT_HINT = "When you finish, call loop_report once: findings true only if there is something the owner should see " +
+	"(false when all is as expected), a one-line summary, and optionally next (e.g. \"15m\") to choose when this loop runs again, or stop: true to end it.";
+const TAKEOVER_NOTE = "[loop] The owner is taking over this conversation now. Stop here and reply with one line saying where you are.";
+const CONTINUE_NOTE = "[loop] The owner stepped out. Carry on from where you are, and call loop_report when you are done.";
+/** Longest a self-paced loop may put off its next run. */
+const MAX_NEXT_MS = 7 * 24 * 60 * 60_000;
+
+/** Process-wide: background runs and the folder lock outlive one extension instance (Pi rebuilds extensions on /new, /resume and session switches). */
+interface Away { id: string; file: string; home: string; homeId?: string; fire: number; mode: RunMode; report: string; /** It was running when you went in (not just opened to read). */ live?: boolean }
+interface Note { content: string; details: Record<string, unknown> }
+interface Shared {
+	lock?: FolderLock; lockPath?: string;
+	runs: Map<string, Run>;
+	/** Loops that came due while their previous run was still going: they run once more after it. */
+	again: Set<string>;
+	/** You are in this loop run's conversation (taken over); the main session waits. */
+	away?: Away;
+	/** Findings that came in while you were away, delivered when you are back. */
+	notes: Note[];
+	/** The live extension instance: finished runs report to it, whichever instance started them. */
+	current?: Instance;
+	/** Run events that came while no instance was live (Pi rebuilding extensions on a switch): the next one takes them. */
+	pending: ((cur: Instance) => void | Promise<void>)[];
+}
+interface Instance {
+	finishRun(id: string, run: Run, report: string): Promise<void>;
+	afterLeave(a: Away, finish: boolean): Promise<void>;
+	runStarted(id: string, run: Run, note?: string): void;
+	runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision): void;
+}
+const shared: Shared = ((globalThis as any)[Symbol.for("pi-loop.shared")] ??= { runs: new Map(), again: new Set(), notes: [], pending: [] });
+shared.pending ??= [];
+/** Hand a run event to the live instance now, or to the next one. */
+function live(fn: (cur: Instance) => void | Promise<void>) {
+	if (shared.current) void fn(shared.current);
+	else shared.pending.push(fn);
+}
+
+const catchUpOf = (s: Schedule): "latest" | "none" => s.kind !== "every" || s.ms >= CATCH_UP_MIN_MS ? "latest" : "none";
 const TICK_MS = 15_000;
 const CATCH_UP_MIN_MS = 60 * 60_000;
 /** While a gate keeps failing, remind (wake) at most this often. */
@@ -84,6 +128,20 @@ interface Loop {
 	declaredPaused?: boolean;
 	/** Bumped whenever the loop's definition changes, so a gate run for an older definition is discarded. */
 	rev?: number;
+	/**
+	 * A gate said wake but the turn couldn't be sent yet (the session was busy, or shutting down).
+	 * Gates may record what they reported, so the wake is kept, with its reason and context, and
+	 * sent once the session is free; the gate isn't run again. Dropped if the loop is redefined.
+	 */
+	pendingWake?: { reason: string; context?: string; at: number; rev: number };
+	/** Where its turn runs: in this conversation (absent), or in the background as a fork of it, its own thread, or fresh. */
+	run?: RunMode;
+	/** It ends then: ad hoc loops after 7 days unless they say otherwise; absent = never. */
+	expiresAt?: number;
+	/** Its latest background run. */
+	lastRun?: RunRecord;
+	/** Background runs that couldn't start in a row (retried soon, up to 3 times). */
+	startFailures?: number;
 }
 
 /** Most text attached from context files to one turn. */
@@ -93,6 +151,7 @@ interface Declared {
 	id: string; prompt: string; every?: string; at?: string; timezone?: string;
 	gate?: string; maxSleep?: string; gateTimeout?: string; gateOnError?: string;
 	priority?: number; context?: string[]; paused?: boolean;
+	run?: string; for?: string; until?: string;
 }
 
 // ------------------------------------------------------------ settings --
@@ -108,7 +167,7 @@ function agentDir(): string {
  * Default zone for `at` loops: `loop.timezone` from the project's
  * .pi/settings.json, else the agent dir's settings.json, else the system zone.
  */
-function configuredZone(cwd: string): { tz: string; source: string; warning?: string } {
+export function configuredZone(cwd: string): { tz: string; source: string; warning?: string } {
 	const files = [path.join(cwd, ".pi", "settings.json"), path.join(agentDir(), "settings.json")];
 	for (const file of files) {
 		let raw: unknown;
@@ -119,6 +178,52 @@ function configuredZone(cwd: string): { tz: string; source: string; warning?: st
 		return { tz: systemZone(), source: "system", warning: `loop.timezone ${JSON.stringify(raw)} in ${file} is not an IANA zone; using ${systemZone()}` };
 	}
 	return { tz: systemZone(), source: "system" };
+}
+
+/** loop.maxBackground in the project's or agent's settings.json: background runs at once (absent or 0 = no limit). */
+export function configuredMaxBackground(cwd: string): number {
+	for (const file of [path.join(cwd, ".pi", "settings.json"), path.join(agentDir(), "settings.json")]) {
+		let raw: unknown;
+		try { raw = (JSON.parse(fs.readFileSync(file, "utf8")) as { loop?: { maxBackground?: unknown } }).loop?.maxBackground; } catch { continue; }
+		if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) return Math.floor(raw);
+	}
+	return 0;
+}
+
+/** "2d", "12h", "30m" from now, or an ISO time: when an ad hoc loop ends. */
+export function parseLifetime(p: { for?: string; until?: string }, now: number): number | string | undefined {
+	if (p.for && p.until) return "use either for or until";
+	if (p.for) { const ms = parseInterval(p.for.trim()); if (ms === undefined || ms < MIN_INTERVAL_MS) return "for must look like 30m, 12h or 2d"; return now + ms; }
+	if (p.until) { const t = Date.parse(p.until); if (!Number.isFinite(t)) return "until must be a time like 2026-10-12T09:00-05:00"; if (t <= now) return "until is in the past"; return t; }
+	return undefined;
+}
+
+/** loop_report: how a loop's run says what it found and when to run again. Writes to `file()`; in a background run that is PI_LOOP_REPORT. */
+function registerReportTool(pi: ExtensionAPI, file: () => string | undefined) {
+	pi.registerTool({
+		name: "loop_report",
+		label: "Loop report",
+		description: "Only in a loop's turn (its message starts with [loop <id> ...]): say whether this run found something the owner should see, " +
+			"in one line, and optionally when the loop should run next or that it should stop. Call it once, at the end of the run.",
+		promptSnippet: "End a loop's run: findings or not, a one-line summary, optional next time or stop",
+		parameters: Type.Object({
+			findings: Type.Boolean({ description: "true only if there is something the owner should see; false when everything is as expected (the run then stays quiet)." }),
+			summary: Type.String({ description: "One line: what this run found or did." }),
+			next: Type.Optional(Type.String({ description: "When this loop should run again, e.g. 2m while something is changing, 1h when quiet (1m to 7d)." })),
+			stop: Type.Optional(Type.Boolean({ description: "true when what this loop watches is done, so it should end." })),
+		}),
+		async execute(_id, p) {
+			const f = file();
+			if (!f) return { content: [{ type: "text", text: "No loop run is in progress here, so there is nothing to report to." }], details: {} };
+			fs.mkdirSync(path.dirname(f), { recursive: true });
+			fs.writeFileSync(f, JSON.stringify({ findings: !!p.findings, summary: p.summary, ...(p.next ? { next: p.next } : {}), ...(p.stop ? { stop: true } : {}) }));
+			return { content: [{ type: "text", text: "Reported." }], details: {} };
+		},
+	});
+}
+
+function readReport(file: string): Report | undefined {
+	try { const r = JSON.parse(fs.readFileSync(file, "utf8")); return { findings: !!r.findings, summary: r.summary, next: r.next, stop: !!r.stop }; } catch { return undefined; }
 }
 
 function slug(prompt: string): string {
@@ -137,7 +242,10 @@ function parseAdd(args: string): { schedule: Schedule; prompt: string; tz?: stri
 	let schedule: Schedule = { kind: "every", ms: DEFAULT_INTERVAL_MS };
 	let rest = tokens;
 	const every = parseInterval(tokens[0] ?? "");
-	if (every !== undefined) {
+	if (tokens[0]?.toLowerCase() === "auto") {
+		schedule = { kind: "auto" };
+		rest = tokens.slice(1);
+	} else if (every !== undefined) {
 		if (every < MIN_INTERVAL_MS) return { error: "minimum interval is 1m" };
 		schedule = { kind: "every", ms: every };
 		rest = tokens.slice(1);
@@ -154,7 +262,7 @@ function parseAdd(args: string): { schedule: Schedule; prompt: string; tz?: stri
 		}
 	}
 	const prompt = rest.join(" ").trim();
-	if (!prompt) return { error: "usage: /loop [10m|2h|1d|at HH:MM [Area/City]] <prompt>" };
+	if (!prompt) return { error: "usage: /loop [10m|2h|1d|auto|at HH:MM [Area/City]] [--fork|--thread|--fresh] [--for 2d|--until <time>] <prompt>" };
 	return { schedule, prompt, tz };
 }
 
@@ -174,10 +282,6 @@ function sessionOf(c: ExtensionContext | undefined): GateSession {
 	} catch { return {}; }
 }
 
-function pidAlive(pid: number): boolean {
-	try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
-}
-
 /** A folder inside the project, normalized relative to it; undefined for the project itself. Throws if outside. */
 function insideDir(cwd: string, dir: string | undefined): string | undefined {
 	if (!dir || dir === "." || dir === "./") return undefined;
@@ -193,18 +297,29 @@ function insideDir(cwd: string, dir: string | undefined): string | undefined {
 
 export default function loopExtension(pi: ExtensionAPI) {
 	let ctx: ExtensionContext | undefined;
+	// A loop's background run: no loops of its own here (they belong to the session that started it), only loop_report.
+	if (process.env.PI_LOOP_CHILD === "1") {
+		registerReportTool(pi, () => process.env.PI_LOOP_REPORT || undefined);
+		pi.on("session_start", (_e, c) => { ctx = c; });
+		pi.registerCommand("loop", {
+			description: "This is a loop's background run; its loops belong to the session that started it",
+			handler: async () => { try { ctx?.ui.notify("This is a loop's background run. Its loops belong to the session that started it; /loop leave there brings you back.", "info"); } catch { /* no UI */ } },
+		});
+		return;
+	}
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let file = "";
 	let lock = "";
 	let readOnly = false;
 	let loops: Loop[] = [];
 	let zone: ReturnType<typeof configuredZone> = { tz: systemZone(), source: "system" };
-	const herdr = new HerdrTokens();
-	let herdrPane = false;
 	let phase: Phase;
 	let phaseAt = 0;
 	/** Loops whose gate is running now; they are not due again until it returns. */
 	const gating = new Set<string>();
+	/** Gates still running, so shutdown can wait for them (a wake they return is kept, not lost). */
+	const inflight = new Map<Promise<void>, number>(); // each running gate, and when it must have finished
+	let closing = false;
 	/** Loops that came due while the session was busy, and since when; they fire once it is free. */
 	const waited = new Map<string, number>();
 	/** Counts runs the session started; a gate's wake is used only if none started while it ran. */
@@ -229,7 +344,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 	};
 	const stateDirOf = (l: Loop) => path.join(home(l), ".pi", "loop-state", l.id);
 	/** Busy: a run, compaction or queued prompt, or a loop turn of ours not finished yet. */
-	const busy = () => { try { return !ctx!.isIdle() || !!ctx!.hasPendingMessages?.() || !!phase; } catch { return true; } };
+	const busy = () => { if (shared.away) return true; try { return !ctx!.isIdle() || !!ctx!.hasPendingMessages?.() || !!phase; } catch { return true; } };
+	let maxBackground = 0;
+	const overLimit = () => maxBackground > 0 && shared.runs.size >= maxBackground;
+	/** Background loops waiting for a slot (to say so, rather than "waiting for this session"). */
+	const slotWait = new Set<string>();
+	const reportFileOf = (l: Loop, fire: number) => path.join(stateDirOf(l), `report-${fire}.json`);
 
 	/**
 	 * Re-derive future zoned fire times (`at`, whole-day intervals) from the current zone, so a changed
@@ -259,41 +379,58 @@ export default function loopExtension(pi: ExtensionAPI) {
 		try { return JSON.parse(fs.readFileSync(file, "utf8")) as Loop[]; } catch { return []; }
 	}
 	function save() {
+		// Only the owner writes. If the lock went away (its helper died), stop at once: another session may own it now.
+		if (!holding()) return;
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		const tmp = `${file}.${process.pid}.tmp`;
 		fs.writeFileSync(tmp, JSON.stringify(loops, null, 2), { mode: 0o600 });
 		fs.renameSync(tmp, file);
 	}
-	function claimLock(): boolean {
-		try {
-			const pid = Number(fs.readFileSync(lock, "utf8").trim());
-			if (pid && pid !== process.pid && pidAlive(pid)) return false;
-		} catch { /* no lock */ }
-		fs.mkdirSync(path.dirname(lock), { recursive: true });
-		fs.writeFileSync(lock, String(process.pid), { mode: 0o600 });
-		return true;
+	/** One owner per project: an OS-held lock (lock.ts). Taking it is asynchronous; until then this session is read-only. */
+	let folderLock: FolderLock | undefined;
+	function claimLock(then: () => void) {
+		const l = folderLock;
+		if (!l) return;
+		void l.claim().then(ok => {
+			if (!ok || l !== folderLock || !ctx) {
+				if (!lockAvailable() && !lockWarned) { lockWarned = true; notify("pi-loop needs perl (in the base system on macOS and most Linux) for its lock; without it this session can't run loops", "warning"); }
+				return;
+			}
+			readOnly = false;
+			then();
+		});
 	}
-	function releaseLock() {
-		try { if (fs.readFileSync(lock, "utf8").trim() === String(process.pid)) fs.unlinkSync(lock); } catch { /* fine */ }
+	let lockWarned = false;
+	function releaseLock() { folderLock?.release(); }
+	/** This session owns the loops right now; if it has just lost the lock, it becomes read-only. */
+	function holding(): boolean {
+		if (readOnly) return false;
+		if (folderLock?.mine()) return true;
+		lostLock();
+		return false;
 	}
-	function ownerPid(): string {
-		try { return fs.readFileSync(lock, "utf8").trim(); } catch { return "?"; }
+	function lostLock() {
+		if (readOnly) return;
+		readOnly = true;
+		notify("pi-loop lost its lock on this folder's loops; this session is read-only until it can take it back", "warning");
+		refreshStatus();
 	}
+	function ownerPid(): string { return String(folderLock?.owner()?.pid ?? "?"); }
+
 
 	// -------------------------------------------------------------- display --
 
 	function refreshStatus() {
 		if (!ctx) return;
 		const active = loops.filter(l => !l.paused);
-		if (!loops.length) {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-			if (herdrPane && !readOnly) herdr.clear();
-			return;
-		}
+		if (!loops.length) { ctx.ui.setStatus(STATUS_KEY, undefined); return; }
 		if (readOnly) { ctx.ui.setStatus(STATUS_KEY, `loops: ${loops.length} (owned by pid ${ownerPid()})`); return; }
+		if (shared.away) { ctx.ui.setStatus(STATUS_KEY, `loops: in ${shared.away.id}'s run · /loop leave or /loop done`); return; }
 		const now = Date.now();
-		if (herdrPane) herdr.update(loopTokens(loops, now, phase), now);
-		const waiting = waited.size ? ` \u00b7 ${waited.size} waiting` : "";
+		const bg = shared.runs.size ? ` · ${shared.runs.size} in background` : "";
+		const unread = loops.filter(l => l.lastRun?.unread).length;
+		const inbox = unread ? ` · ${unread} to see (/loop)` : "";
+		const waiting = (waited.size ? ` \u00b7 ${waited.size} waiting` : "") + bg + inbox;
 		if (phase) { ctx.ui.setStatus(STATUS_KEY, `loops: ${active.length} \u00b7 ${phase.id} ${phase.state}${waiting}`); return; }
 		if (waited.size) { ctx.ui.setStatus(STATUS_KEY, `loops: ${active.length}${waiting} for this session to be free`); return; }
 		const next = active.slice().sort((a, b) => a.nextAt - b.nextAt)[0];
@@ -305,12 +442,16 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function listText(): string {
 		const zoneLine = `default zone ${zone.tz} (${zone.source === "system" ? "system" : `loop.timezone in ${zone.source}`})`;
 		if (!loops.length) return `No loops. /loop [10m|2h|1d|at HH:MM [Area/City]] <prompt>\n${zoneLine}`;
-		const head = readOnly ? `(read-only: loops owned by pid ${ownerPid()})\n` : "";
+		const head = (readOnly ? `(read-only: loops owned by pid ${ownerPid()})\n` : "") + (shared.away ? `(you are in ${shared.away.id}'s run: /loop leave lets it carry on, /loop done finishes it)\n` : "");
 		return head + loops.map(l => {
-			const state = l.paused ? "paused" : `next ${when(l)}`;
+			const live = shared.runs.get(l.id);
+			const state = live ? `running in background (${live.mode}, ${live.working ? "working" : "idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
 			const p = l.prompt.length > 70 ? `${l.prompt.slice(0, 67)}…` : l.prompt;
-			const extra = [l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "", waited.has(l.id) ? "waiting for this session to be free" : ""].filter(Boolean);
-			return `${l.id}  ${desc(l)}  ${state}  ×${l.fires}\n    ${p}${extra.length ? `\n    ${extra.join(" · ")}` : ""}${l.gate ? `\n    ${gateText(l)}` : ""}`;
+			const extra = [l.run ? `runs in background: ${l.run}` : "", l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "",
+				l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "", slotWait.has(l.id) ? `waiting for a background slot (loop.maxBackground ${maxBackground})` : waited.has(l.id) ? "waiting for this session to be free" : ""].filter(Boolean);
+			const r = l.lastRun;
+			const last = r && !live ? `\n    last run #${r.fire} ${r.status}${r.endedAt ? ` ${countdown(Math.max(0, Date.now() - r.endedAt))} ago` : ""}${r.unread ? " (new)" : ""}${r.result ? `: ${r.result.split("\n")[0].slice(0, 120)}` : ""}${r.needsYou ? ` · needs you: ${r.needsYou}` : ""}` : "";
+			return `${l.id}  ${desc(l)}  ${state}  ×${l.fires}\n    ${p}${extra.length ? `\n    ${extra.join(" · ")}` : ""}${l.gate ? `\n    ${gateText(l)}` : ""}${last}`;
 		}).join("\n") + `\n${zoneLine}`;
 	}
 
@@ -329,7 +470,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// -------------------------------------------------------------- actions --
 
-	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Pick<Loop, "priority" | "dir" | "context"> = {}): Loop | string {
+	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Pick<Loop, "priority" | "dir" | "context" | "run" | "expiresAt"> = {}): Loop | string {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}; manage them from that session`;
 		if (tz && !zoned(schedule)) return "a time zone applies only to `at` loops and whole-day intervals (1d, 7d)";
 		const base = id?.trim() || slug(prompt);
@@ -338,8 +479,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const now = Date.now();
 		const loop: Loop = {
 			id: unique, prompt, schedule, paused: false, createdAt: now, fires: 0,
-			catchUp: schedule.kind === "at" || schedule.ms >= CATCH_UP_MIN_MS ? "latest" : "none",
+			catchUp: catchUpOf(schedule),
 			nextAt: 0,
+			// Ad hoc loops end: after 7 days unless they say when.
+			expiresAt: more.expiresAt ?? now + AD_HOC_LIFETIME_MS,
+			...(more.run ? { run: more.run } : {}),
 			...(tz ? { tz } : {}),
 			...(gate ? { gate } : {}),
 			...(more.priority ? { priority: more.priority } : {}),
@@ -404,28 +548,39 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/**
 	 * Run a gated loop's gate, then wake, skip or defer. Runs only while the session is free.
-	 * The loop is rescheduled first so it is not due twice; if the session became busy while
-	 * the gate ran, a wake is not used: the loop is due again and its gate runs afresh later.
+	 * The loop is rescheduled first so it is not due twice. A wake that comes back while the
+	 * session is busy (or was busy meanwhile, or is shutting down) is kept as pendingWake and sent
+	 * once the session is free, without running the gate again.
 	 */
 	function gateThen(l: Loop, reason: Reason) {
 		const started = Date.now();
-		const dueAt = l.nextAt, rev = l.rev ?? 0, act = activity;
+		const rev = l.rev ?? 0, act = activity;
 		l.nextAt = nextFor(l, started);
 		gating.add(l.id);
 		save();
 		let run: Promise<GateDecision>;
 		try { run = runGate(home(l), l.gate!, { id: l.id, prompt: l.prompt, lastWokeAt: l.lastWokeAt, stateDir: stateDirOf(l), session: sessionOf(ctx) }); }
 		catch (e) { run = Promise.resolve({ action: l.gate!.onError, reason: `gate error: ${(e as Error).message}`, error: true }); }
-		void run
+		const done = run
 			.catch((e): GateDecision => ({ action: l.gate!.onError, reason: `gate error: ${(e as Error)?.message ?? e}`, error: true }))
 			.then(raw => {
 				gating.delete(l.id);
 				if (!ctx || readOnly || !loops.includes(l)) return;
 				// The loop was redefined while its gate ran: this answer is about the old one. Its schedule stands.
 				if ((l.rev ?? 0) !== rev) { refreshStatus(); return; }
-				// The session worked (or is working) while the gate ran: the evidence may be stale. Due again, gated afresh.
-				if (raw.action === "wake" && (busy() || activity !== act)) {
-					l.nextAt = dueAt; waited.set(l.id, waited.get(l.id) ?? started);
+				// The session is busy, worked while the gate ran, or is shutting down: keep the wake and send
+				// it once free. Gates may record what they reported, so running this one again could lose it.
+				// A background loop needs only its own run slot, not the session.
+				const blocked = l.run ? shared.runs.has(l.id) || overLimit() : busy() || activity !== act;
+				if (raw.action === "wake" && !l.paused && (closing || blocked)) {
+					const d = backoff(l, raw, Date.now());
+					l.gateRuns = (l.gateRuns ?? 0) + 1;
+					l.lastGate = { at: Date.now(), action: d.action, reason: d.reason };
+					logDecision(gateLog, { ts: new Date().toISOString(), id: l.id, action: d.action, reason: d.reason, ms: Date.now() - started, ...(d.error ? { error: true } : {}) });
+					if (d.action === "wake") {
+						l.pendingWake = { reason: d.reason, ...(d.context ? { context: d.context } : {}), at: started, rev };
+						waited.set(l.id, waited.get(l.id) ?? started);
+					}
 					save(); refreshStatus(); return;
 				}
 				if (raw.action !== "wake") waited.delete(l.id);
@@ -438,6 +593,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 				waited.delete(l.id); // the occurrence was handled (skipped, deferred, or a quiet gate error)
 				save(); refreshStatus();
 			});
+		inflight.set(done, started + (l.gate!.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS));
+		void done.finally(() => inflight.delete(done));
 	}
 
 	/**
@@ -461,16 +618,24 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	function fire(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
+		if (!holding()) return `loops are owned by pid ${ownerPid()}`;
 		try { home(l); } catch (e) { const msg = `loop ${l.id}: ${(e as Error).message}; not fired`; notify(msg, "warning"); return msg; }
-		waited.delete(l.id);
+		if (l.run) return fireBackground(l, reason, gate);
+		// You are in a run's conversation: an in-conversation loop waits for you to be back.
+		if (shared.away) {
+			if (gate) l.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: Date.now(), rev: l.rev ?? 0 };
+			waited.set(l.id, waited.get(l.id) ?? Date.now());
+			save(); refreshStatus();
+			return `you are in ${shared.away.id}'s run; ${l.id} runs when you are back`;
+		}
+		// The occurrence is recorded as sent only after it is handed over (below): a crash in between
+		// sends it again with the same fire number, which a host recognises as the same occurrence.
+		const before = { fires: l.fires, lastFiredAt: l.lastFiredAt, lastWokeAt: l.lastWokeAt, nextAt: l.nextAt, pendingWake: l.pendingWake, waited: waited.get(l.id) };
 		l.fires += 1;
 		l.lastFiredAt = Date.now();
 		l.lastWokeAt = l.lastFiredAt;
-		phase = { state: "queued", id: l.id };
-		phaseAt = Date.now();
 		// A manual run of a loop that is due (or waiting) is that occurrence; a manual run ahead of time isn't.
 		if (reason !== "manual" || l.nextAt <= Date.now()) l.nextAt = nextFor(l, Date.now());
-		save();
 		// One line: a gate's reason may hold newlines (a JSON "\n"), and readers of the header
 		// (the model, and any extension that recognises loop turns) take it to end at the line's closing "]".
 		const why = gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : "";
@@ -481,10 +646,399 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// header and gate context survive intact; see prompt.ts.
 		let commands: CommandInfo[] = [];
 		try { commands = (pi as any).getCommands?.() ?? []; } catch { /* older Pi */ }
-		const { text, expand } = compose(l.prompt, header + where, evidence, home(l), commands, !!l.dir);
-		pi.sendUserMessage(text, { deliverAs: "followUp", expandPromptTemplates: expand });
+		const { text, expand } = compose(l.prompt, header + where, evidence + `\n\n${REPORT_HINT}`, home(l), commands, !!l.dir);
+		inConversation = { id: l.id, report: reportFileOf(l, l.fires) };
+		try { fs.rmSync(inConversation.report, { force: true }); } catch { /* none */ }
+		try {
+			// `loop` names the occurrence for a host (Pi ignores it): the same id and fire mean the same turn.
+			pi.sendUserMessage(text, { deliverAs: "followUp", expandPromptTemplates: expand, loop: { id: l.id, fire: l.fires, rev: l.rev ?? 0, since: l.createdAt } } as any);
+		} catch (e) {
+			Object.assign(l, { fires: before.fires, lastFiredAt: before.lastFiredAt, lastWokeAt: before.lastWokeAt, nextAt: before.nextAt });
+			// A gate may have recorded that it reported this: keep its wake rather than ask it again.
+			if (gate) { l.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: Date.now(), rev: l.rev ?? 0 }; save(); }
+			const msg = `loop ${l.id}: couldn't send its turn (${(e as Error).message}); it is kept and sent again`;
+			notify(msg, "warning"); refreshStatus();
+			return msg;
+		}
+		waited.delete(l.id);
+		delete l.pendingWake;
+		phase = { state: "queued", id: l.id };
+		phaseAt = Date.now();
+		save();
 		refreshStatus();
 	}
+
+	/** The loop whose turn is running in this conversation now, and where its loop_report goes. */
+	let inConversation: { id: string; report: string } | undefined;
+
+	/** The prompt a loop's run gets: its header, folder, gate context and the report hint. */
+	function runText(l: Loop, fireNo: number, reason: Reason, gate?: GateDecision, mode?: RunMode): { text: string; expand: boolean } {
+		const why = gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : "";
+		const header = `[loop ${l.id} · ${desc(l)} · fire #${fireNo}${mode ? ` · background ${mode}` : ""}${reason === "due" ? "" : ` · ${reason}`}${why}]`;
+		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
+		let commands: CommandInfo[] = [];
+		try { commands = (pi as any).getCommands?.() ?? []; } catch { /* older Pi */ }
+		return compose(l.prompt, header + loopContext(l), evidence, home(l), commands, !!l.dir);
+	}
+
+	/** The session arguments for a background run of `mode`, and the mode it really gets. */
+	function sessionArgsFor(l: Loop, mode: RunMode): { args: string[]; mode: RunMode; note?: string } {
+		// While you are in a run, "this conversation" is still the one you left.
+		const main = shared.away?.home ?? ctx!.sessionManager.getSessionFile?.();
+		// Beside this session's folder: Pi's own per-project folder (--<cwd>--), or the --session-dir it was given.
+		const own = main ? path.dirname(main) : undefined;
+		const root = !own ? path.join(agentDir(), "sessions") : /^--.*--$/.test(path.basename(own)) ? path.dirname(own) : own;
+		const dir = sessionFolder(root, fs.realpathSync(ctx!.cwd), `-loop-${l.id}`);
+		if (mode === "fork" && !main) return { args: ["--session-dir", dir], mode: "fresh", note: "this session isn't saved, so it ran fresh" };
+		if (mode === "fork") return { args: ["--fork", main!, "--session-dir", dir], mode };
+		if (mode === "thread") return { args: ["--session-dir", dir, "--continue"], mode };
+		return { args: ["--session-dir", dir], mode };
+	}
+
+	function childEnv(l: Loop, report: string): NodeJS.ProcessEnv {
+		const sm = ctx!.sessionManager;
+		// The parent's session id (as subagents pass it), so tools that group sessions can file the run under it.
+		const id = shared.away ? shared.away.homeId ?? "" : sm.getSessionId?.() ?? "";
+		const file = shared.away?.home ?? sm.getSessionFile?.() ?? "";
+		return { ...process.env, PI_LOOP_CHILD: "1", PI_LOOP_ID: l.id, PI_LOOP_REPORT: report, PI_LOOP_PARENT_SESSION: id, PI_LOOP_PARENT_FILE: file };
+	}
+
+	function modelArgs(): { model?: string; thinking?: string } {
+		const m = ctx?.model;
+		let thinking: string | undefined;
+		try { thinking = (pi as any).getThinkingLevel?.(); } catch { /* older Pi */ }
+		return m ? { model: `${m.provider}/${m.id}`, thinking } : {};
+	}
+
+	/**
+	 * A background loop's turn: a child Pi on a fork of this session, the loop's own thread, or a fresh one.
+	 * The loop is rescheduled at once; the occurrence counts as fired once the child has accepted its prompt.
+	 */
+	function fireBackground(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
+		if (shared.runs.has(l.id)) { shared.again.add(l.id); return; }
+		if (shared.away?.id === l.id) { shared.again.add(l.id); return; }
+		const now = Date.now();
+		if (overLimit()) {
+			// Its turn waits for a slot (loop.maxBackground); a gate's wake is kept.
+			if (gate) l.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: now, rev: l.rev ?? 0 };
+			slotWait.add(l.id); waited.set(l.id, waited.get(l.id) ?? now);
+			l.nextAt = Math.min(l.nextAt, now);
+			save(); refreshStatus();
+			return `loop ${l.id} waits for a background slot (loop.maxBackground ${maxBackground})`;
+		}
+		slotWait.delete(l.id);
+		const fireNo = l.fires + 1;
+		const s = sessionArgsFor(l, l.run!);
+		const report = reportFileOf(l, fireNo);
+		try { fs.rmSync(report, { force: true }); } catch { /* none */ }
+		const composed = runText(l, fireNo, reason, gate, s.mode);
+		// A command (not a prompt template here) runs only as its own message: Pi doesn't read "/cmd" followed by the
+		// header on new lines as that command. It then has no header or report hint; what it does is its own.
+		// A skill (/skill:name) reads its name up to the first space, so the header can follow on the same line.
+		const head = `[loop ${l.id} · ${desc(l)} · fire #${fireNo} · background ${s.mode}${reason === "due" ? "" : ` · ${reason}`}${gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : ""}]`;
+		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
+		const text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
+			: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
+		const run = new Run(l.id, fireNo, s.mode, { cwd: ctx!.cwd, sessionArgs: s.args, ...modelArgs(), env: childEnv(l, report) });
+		shared.runs.set(l.id, run);
+		if (reason !== "manual" || l.nextAt <= now) l.nextAt = nextFor(l, now);
+		waited.delete(l.id);
+		l.lastRun = { fire: fireNo, mode: s.mode, status: "starting", startedAt: now, host: process.pid };
+		save(); refreshStatus();
+		void (async () => {
+			try {
+				await run.start();
+				if (run.handedOver) return; // taken over while starting: the run is yours now
+				await run.prompt(text);
+			} catch (e) {
+				if (run.handedOver) return;
+				await run.stop();
+				if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
+				// Recorded by whichever instance is live now (a session switch may have replaced this one).
+				live(cur => cur.runFailed(l.id, run, (e as Error).message, now, gate));
+				return;
+			}
+			if (run.handedOver) return;
+			live(cur => cur.runStarted(l.id, run, s.note));
+			await watchRun(run, report);
+		})();
+		return undefined;
+	}
+
+	function runStarted(id: string, run: Run, note?: string) {
+		const cur = loops.find(x => x.id === id);
+		if (!cur || run.handedOver) return;
+		delete cur.startFailures;
+		cur.fires = Math.max(cur.fires, run.fire);
+		cur.lastFiredAt = cur.lastWokeAt = Date.now();
+		delete cur.pendingWake;
+		cur.lastRun = { ...(cur.lastRun ?? { fire: run.fire, mode: run.mode, startedAt: Date.now() }), status: "running", session: run.sessionFile, host: process.pid };
+		save(); refreshStatus();
+		if (note) notify(`loop ${id}: ${note}`, "info");
+	}
+
+	function runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision) {
+		const cur = loops.find(x => x.id === id);
+		if (!cur) return;
+		// A gate may have recorded that it reported this: keep its wake rather than ask it again. Otherwise try
+		// this occurrence again soon, a few times, before leaving it to the schedule.
+		cur.startFailures = (cur.startFailures ?? 0) + 1;
+		const retry = cur.startFailures <= 3;
+		if (gate) cur.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: Date.now(), rev: cur.rev ?? 0 };
+		else if (retry) cur.nextAt = Math.min(cur.nextAt, Date.now() + 2 * 60_000);
+		// A run started again on its own conversation (leave, steer) keeps that conversation: it can still be opened.
+		const session = run.sessionFile ?? (cur.lastRun?.fire === run.fire ? cur.lastRun?.session : undefined);
+		cur.lastRun = { fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid, ...(session ? { session } : {}) };
+		save(); refreshStatus();
+		notify(`loop ${id}: its background run couldn't start (${why}); ${gate || retry ? "it is tried again soon" : "it runs again at its next time"}`, "warning");
+	}
+
+	/** Wait until a run has really finished (idle and staying idle), then hand it to the live instance. */
+	async function watchRun(run: Run, report: string) {
+		for (;;) {
+			await run.waitIdle(24 * 60 * 60_000);
+			if (run.handedOver) return;
+			if (run.exited) break;
+			await new Promise(r => setTimeout(r, 1500));
+			if (!run.working || run.exited) break;
+		}
+		if (run.handedOver) return;
+		live(cur => cur.finishRun(run.loopId, run, report));
+	}
+
+	/** A run is over: record it, apply what it reported, and tell the owner only when it found something. */
+	async function finishRun(id: string, run: Run, report: string) {
+		if (run.handedOver) return;
+		run.finishing = true;
+		const text = run.exited ? (run.sessionFile ? lastAssistantText(run.sessionFile) : undefined) : await run.lastText();
+		if (run.handedOver) return; // taken over while its answer was being read
+		const crashed = run.exited && !run.cancelled;
+		await run.stop();
+		if (run.handedOver) return;
+		if (shared.runs.get(id) === run) shared.runs.delete(id);
+		const l = loops.find(x => x.id === id);
+		const rep = readReport(report);
+		const status = run.cancelled ? "cancelled" : crashed ? "failed" : "done";
+		const findings = status === "failed" || !!run.needsYou || (rep ? rep.findings : true);
+		const summary = (crashed ? "its Pi exited before the run finished" : rep?.summary) ?? text?.split("\n").find(x => x.trim())?.trim() ?? "(no answer)";
+		const rec: RunRecord = { fire: run.fire, mode: run.mode, status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
+			result: summary.slice(0, 2000), findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), unread: findings && status !== "cancelled" };
+		if (l) {
+			l.lastRun = rec;
+			if (status === "done" && rep) applyReport(l, rep);
+			// Due again while it ran: once more now, unless the run chose its own next time (or the loop paces itself).
+			const again = shared.again.delete(id) && !rep?.next && l.schedule.kind !== "auto";
+			if (again && loops.includes(l) && !l.paused) l.nextAt = Math.min(l.nextAt, Date.now());
+			save(); refreshStatus();
+		}
+		if (rec.unread) deliver({ content: `[loop ${id} · background ${run.mode} · run #${run.fire} · ${status}] ${rec.result}${rec.needsYou ? `\nneeds you: ${rec.needsYou}` : ""}${rec.session ? `\n(/loop open ${id} to go into it)` : ""}`,
+			details: { id, fire: run.fire, mode: run.mode, status, session: rec.session } });
+	}
+
+	/** A loop_report's next / stop. */
+	function applyReport(l: Loop, rep: Report) {
+		if (rep.stop) {
+			if (l.source) { l.paused = true; notify(`loop ${l.id} asked to stop; it is declared in ${l.source}, so it is paused`, "info"); }
+			else { loops = loops.filter(x => x !== l); notify(`loop ${l.id} finished what it was watching and ended`, "info"); }
+			return;
+		}
+		if (rep.next) {
+			const ms = parseInterval(rep.next.trim());
+			if (ms !== undefined) l.nextAt = Date.now() + Math.min(Math.max(ms, MIN_INTERVAL_MS), MAX_NEXT_MS);
+		}
+	}
+
+	/** Findings into the main conversation, quietly (no turn); kept until you are back if you are in a run. */
+	function deliver(n: Note) {
+		if (shared.away) { shared.notes.push(n); return; }
+		try {
+			pi.sendMessage({ customType: "loop-result", content: n.content, display: true, details: n.details }, busy() ? { deliverAs: "nextTurn" } : undefined);
+		} catch { shared.notes.push(n); }
+	}
+
+	function flushNotes() { for (const n of shared.notes.splice(0)) deliver(n); }
+
+	/** Go into a loop's run as a regular session: the background Pi stops at a safe point first (or now). */
+	async function takeOver(id: string, now: boolean, cctx: any): Promise<string | undefined> {
+		if (readOnly) return `loops are owned by pid ${ownerPid()}`;
+		if (shared.away) return `you are already in ${shared.away.id}'s run; /loop leave or /loop done first`;
+		const l = find(id);
+		if (!l) return `no loop "${id}"`;
+		const run = shared.runs.get(l.id);
+		const file = run?.sessionFile ?? l.lastRun?.session;
+		if (!file) return `${l.id} has no run to go into`;
+		const homeFile = ctx!.sessionManager.getSessionFile?.();
+		if (!homeFile) return "this session isn't saved, so pi-loop couldn't bring you back to it";
+		// Pi writes a conversation to disk after its first exchange; before that there is nothing to come back to.
+		if (!fs.existsSync(homeFile)) return "this conversation has nothing saved yet (Pi saves it after its first exchange), so pi-loop couldn't bring you back to it; say something here first";
+		if (run?.working) notify(`waiting for ${l.id}'s run to stop at its next step${now ? "" : " (up to a minute)"}…`, "info");
+		await cctx.waitForIdle?.();
+		const fireNo = run?.fire ?? l.lastRun?.fire ?? l.fires;
+		if (run) {
+			run.handedOver = true;
+			if (run.working) {
+				if (now) await run.abort();
+				else { await run.steer(TAKEOVER_NOTE); if (!(await run.waitIdle(60_000))) await run.abort(); }
+			}
+			await run.stop();
+			shared.runs.delete(l.id);
+		}
+		l.lastRun = { ...(l.lastRun ?? { fire: fireNo, mode: l.run ?? "fresh", startedAt: Date.now() }), status: "away", session: file, unread: false, host: process.pid };
+		const away: Away = { id: l.id, file, home: homeFile, homeId: ctx!.sessionManager.getSessionId?.(), fire: fireNo, mode: l.lastRun.mode, report: reportFileOf(l, fireNo), live: !!run };
+		shared.away = away;
+		save(); refreshStatus();
+		const res = await cctx.switchSession(file, { withSession: async (c: any) => {
+			try { c.ui.notify(`You are in ${l.id}'s run #${fireNo}. /loop leave lets it carry on in the background; /loop done finishes it; both bring you back.`, "info"); } catch { /* no UI */ }
+		} });
+		if (res?.cancelled) {
+			// The switch didn't happen: you are still here, so the run carries on in the background.
+			shared.away = undefined;
+			live(cur => cur.afterLeave(away, false));
+			return "couldn't switch into the run; it carries on in the background";
+		}
+		return undefined;
+	}
+
+	/** Back to the main session: the run carries on in the background (leave) or is finished (done). */
+	async function leave(finish: boolean, cctx: any): Promise<string | undefined> {
+		const a = shared.away;
+		if (!a) return "you are not in a loop's run";
+		await cctx.waitForIdle?.();
+		// Cleared before the switch, so the session that starts there doesn't read it as leaving some other way.
+		shared.away = undefined;
+		const res = await cctx.switchSession(a.home, { withSession: async (c: any) => {
+			try { c.ui.notify(finish ? `Back. ${a.id}'s run is finished.` : `Back. ${a.id}'s run carries on in the background.`, "info"); } catch { /* no UI */ }
+		} });
+		if (res?.cancelled) { shared.away = a; return "couldn't switch back"; }
+		// The instance that runs from here on picks this up (Pi rebuilds extensions on a switch). Not awaited: you
+		// are back at once; the run carries on by itself.
+		live(cur => cur.afterLeave(a, finish));
+		return undefined;
+	}
+
+	/** In the instance that runs after a switch back: finish the run, or start it again in the background. */
+	async function afterLeave(a: Away, finish: boolean) {
+		const l = loops.find(x => x.id === a.id);
+		if (finish || !l) {
+			const text = lastAssistantText(a.file);
+			const rep = readReport(a.report);
+			const rec: RunRecord = { fire: a.fire, mode: a.mode, status: "done", startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: a.file, host: process.pid,
+				result: (rep?.summary ?? text?.split("\n").find(x => x.trim())?.trim() ?? "(no answer)").slice(0, 2000), findings: false, unread: false };
+			if (l) { l.lastRun = rec; if (rep) applyReport(l, rep); save(); }
+			flushNotes(); refreshStatus();
+			return;
+		}
+		try { fs.rmSync(a.report, { force: true }); } catch { /* none */ }
+		const run = new Run(l.id, a.fire, a.mode, { cwd: ctx!.cwd, sessionArgs: ["--session", a.file], ...modelArgs(), env: childEnv(l, a.report) });
+		shared.runs.set(l.id, run);
+		l.lastRun = { ...(l.lastRun ?? { fire: a.fire, mode: a.mode, startedAt: Date.now() }), status: "running", session: a.file, host: process.pid };
+		save(); refreshStatus(); flushNotes();
+		try { await run.start(); if (!run.handedOver) await run.prompt(CONTINUE_NOTE); }
+		catch (e) {
+			if (run.handedOver) return;
+			await run.stop(); if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
+			live(cur => cur.runFailed(l.id, run, `couldn't carry on in the background: ${(e as Error).message}`, Date.now()));
+			return;
+		}
+		if (run.handedOver) return;
+		void watchRun(run, a.report);
+	}
+
+	/** Stop a running background run. */
+	async function cancelRun(id: string): Promise<string> {
+		const l = find(id);
+		const run = l && shared.runs.get(l.id);
+		if (!run) return `${l?.id ?? id} has no run in the background`;
+		run.cancelled = true;
+		await run.abort();
+		await run.stop();
+		// Its watcher records it; if none is left to (a lost event), record it here.
+		await new Promise(r => setTimeout(r, 2500));
+		if (shared.runs.get(l!.id) === run) await finishRun(l!.id, run, reportFileOf(l!, run.fire));
+		return `stopped ${l!.id}'s run #${run.fire}`;
+	}
+
+	/** Your words to a running background run: steered in at its next step, or a new turn if it is idle. */
+	async function steerRun(id: string, text: string): Promise<string> {
+		const l = find(id);
+		let run = l && shared.runs.get(l.id);
+		// Its result is being collected: wait for that, then start it again with your words.
+		if (run?.finishing) {
+			const end = Date.now() + 30_000;
+			while (shared.runs.get(l!.id) === run && Date.now() < end) await new Promise(r => setTimeout(r, 200));
+			run = shared.runs.get(l!.id);
+		}
+		if (!run && l?.lastRun?.session && !readOnly && shared.away?.id !== l.id) return resumeRun(l, text);
+		if (!run) return `${l?.id ?? id} has no run in the background${l?.lastRun?.session ? `; /loop open ${l.id} goes into its last one` : ""}`;
+		const err = await run.steer(text);
+		return err ? `couldn't steer ${l!.id}: ${err}` : `sent to ${l!.id}'s run #${run.fire}`;
+	}
+
+	/** A finished (or interrupted) run, started again in the background on its own conversation with your words. */
+	async function resumeRun(l: Loop, text: string): Promise<string> {
+		const r = l.lastRun!;
+		const report = reportFileOf(l, r.fire);
+		try { fs.rmSync(report, { force: true }); } catch { /* none */ }
+		const run = new Run(l.id, r.fire, r.mode, { cwd: ctx!.cwd, sessionArgs: ["--session", r.session!], ...modelArgs(), env: childEnv(l, report) });
+		shared.runs.set(l.id, run);
+		l.lastRun = { ...r, status: "running", unread: false, host: process.pid };
+		save(); refreshStatus();
+		try { await run.start(); if (!run.handedOver) await run.prompt(`${text}\n\n${REPORT_HINT}`); }
+		catch (e) {
+			if (run.handedOver) return `${l.id}'s run is yours now`;
+			await run.stop(); if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
+			live(cur => cur.runFailed(l.id, run, `couldn't carry on: ${(e as Error).message}`, Date.now()));
+			return `couldn't start ${l.id}'s run again: ${(e as Error).message}`;
+		}
+		if (run.handedOver) return `${l.id}'s run is yours now`;
+		void watchRun(run, report);
+		return `${l.id}'s run #${r.fire} carries on in the background with your words`;
+	}
+
+	/** Rows for the loops view. */
+	function viewRows(): LoopRow[] {
+		return loops.map(l => {
+			const live = shared.runs.get(l.id);
+			const r = l.lastRun;
+			const state = live ? `running in background (${live.mode}${live.working ? "" : ", idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
+			const detail = [desc(l), l.run ? `background ${l.run}` : "in conversation", l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
+				r && !live ? `last #${r.fire} ${r.status}${r.result ? `: ${r.result.split("\n")[0]}` : ""}${r.needsYou ? ` · needs you` : ""}` : ""].filter(Boolean).join(" · ");
+			return { id: l.id, state, detail, running: !!live, hasRun: !!r?.session, unread: !!r?.unread, paused: l.paused };
+		});
+	}
+
+	/** The loops view in the terminal UI; acts on what you picked once it closes. */
+	async function openView(cctx: any, watch?: string) {
+		const action: ViewAction = await cctx.ui.custom((tui: any, theme: any, _kb: any, done: (a: ViewAction) => void) => new LoopsView(tui, theme, {
+			rows: viewRows,
+			lines: (id: string) => { const l = find(id); return l ? runLines(l) : []; },
+			steer: (id: string, text: string) => steerRun(id, text),
+			seen: (id: string) => { const l = find(id); if (l?.lastRun?.unread && !readOnly) { l.lastRun.unread = false; save(); refreshStatus(); } },
+			title: path.basename(ctx!.cwd),
+		}, done, watch), { overlay: true });
+		if (!action) return;
+		switch (action.action) {
+			case "take": { const err = await takeOver(action.id, false, cctx); if (err) notify(err, "warning"); return; }
+			case "run": { const l = find(action.id); if (l) { const err = fire(l, "manual"); notify(err ?? `fired ${l.id}`); } return; }
+			case "pause": notify(setPaused(action.id, true)); return;
+			case "resume": notify(setPaused(action.id, false)); return;
+			case "stop": notify(await cancelRun(action.id)); return;
+		}
+	}
+
+	/** The run's transcript as text: live from a running one, from its file otherwise. */
+	function runLines(l: Loop): string[] {
+		const run = shared.runs.get(l.id);
+		if (run) return run.lines;
+		const file = l.lastRun?.session;
+		if (!file) return [];
+		// The view redraws every second: read a finished run's file again only when it changed.
+		let mtime = 0;
+		try { mtime = fs.statSync(file).mtimeMs; } catch { return []; }
+		if (linesCache?.file !== file || linesCache.mtime !== mtime) linesCache = { file, mtime, lines: transcriptOf(file) };
+		return linesCache.lines;
+	}
+	let linesCache: { file: string; mtime: number; lines: string[] } | undefined;
 
 	/** What a loop with a folder adds after its header: the folder, and its context files. */
 	function loopContext(l: Loop): string {
@@ -515,6 +1069,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const out: string[] = [];
 		const at = (dir: string) => { const f = path.join(dir, ".pi", "loop.json"); if (fs.existsSync(f)) out.push(f); };
 		at(cwd);
+		// A host (a scheduler that embeds this extension for one folder) serves only that folder's loops.
+		if (ctx!.mode === "host") return out;
 		let entries: fs.Dirent[] = [];
 		try { entries = fs.readdirSync(cwd, { withFileTypes: true }); } catch { /* unreadable */ }
 		for (const e of entries) if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules") at(path.join(cwd, e.name));
@@ -583,17 +1139,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 				if (!l) {
 					const now = Date.now();
 					const loop: Loop = { ...def, source, paused: declaredPaused, declaredPaused, rev: 1, createdAt: now, fires: 0, nextAt: 0,
-						catchUp: def.schedule.kind === "at" || def.schedule.ms >= CATCH_UP_MIN_MS ? "latest" : "none" };
+						catchUp: catchUpOf(def.schedule) };
 					loop.nextAt = nextFor(loop, now);
 					loops.push(loop); changed = true;
 					continue;
 				}
-				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context]);
+				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context, x.run, x.expiresAt]);
 				const before = defOf(l);
 				const reschedule = JSON.stringify(l.schedule) !== JSON.stringify(def.schedule) || l.tz !== def.tz;
 				Object.assign(l, def);
-				for (const k of ["tz", "gate", "priority", "dir", "context"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
-				l.catchUp = l.schedule.kind === "at" || l.schedule.ms >= CATCH_UP_MIN_MS ? "latest" : "none";
+				for (const k of ["tz", "gate", "priority", "dir", "context", "run", "expiresAt"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
+				l.catchUp = catchUpOf(l.schedule);
 				// Only a change to the declared `paused` pauses or resumes; /loop pause and resume hold otherwise.
 				if (l.declaredPaused !== declaredPaused) {
 					l.declaredPaused = declaredPaused; changed = true;
@@ -609,7 +1165,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (changed) { save(); refreshStatus(); }
 	}
 
-	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context"> {
+	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context" | "run" | "expiresAt"> {
 		if (!d || typeof d !== "object") throw new Error("not an object");
 		if (typeof d.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(d.id)) throw new Error("id: letters, digits, . _ -");
 		if (typeof d.prompt !== "string" || !d.prompt.trim()) throw new Error("prompt is required");
@@ -617,11 +1173,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		let schedule: Schedule;
 		if (d.at) { const a = parseAt(d.at); if (!a) throw new Error("at must be HH:MM"); schedule = { kind: "at", ...a }; }
 		else {
-			const ms = d.every ? parseInterval(d.every) : DEFAULT_INTERVAL_MS;
-			if (ms === undefined) throw new Error("every must look like 5m, 2h or 1d");
-			if (ms < MIN_INTERVAL_MS) throw new Error("minimum interval is 1m");
-			schedule = { kind: "every", ms };
+			if (d.every?.trim().toLowerCase() === "auto") schedule = { kind: "auto" };
+			else {
+				const ms = d.every ? parseInterval(d.every) : DEFAULT_INTERVAL_MS;
+				if (ms === undefined) throw new Error("every must look like 5m, 2h or 1d, or be auto");
+				if (ms < MIN_INTERVAL_MS) throw new Error("minimum interval is 1m");
+				schedule = { kind: "every", ms };
+			}
 		}
+		if (d.run !== undefined && !RUN_MODES.includes(d.run as RunMode)) throw new Error("run must be fork, thread or fresh (or omitted)");
 		const tz = d.timezone ? validZone(d.timezone) : undefined;
 		if (d.timezone && !tz) throw new Error(`unknown time zone "${d.timezone}"`);
 		if (tz && !zoned(schedule)) throw new Error("a time zone applies only to at loops and whole-day intervals");
@@ -629,8 +1189,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const gate = d.gate ? gateConfig({ gate: d.gate, maxSleep: d.maxSleep, gateTimeout: d.gateTimeout, gateOnError: d.gateOnError }, dir) : undefined;
 		if (d.priority !== undefined && !Number.isFinite(d.priority)) throw new Error("priority must be a number");
 		const context = contextFiles(d.context);
+		// A declared loop lives until its file stops declaring it, unless it says until when (until, an absolute time).
+		if (d.for) throw new Error("for is for loops made in a session; a declared loop can say until (an ISO time)");
+		const ends = d.until ? parseLifetime({ until: d.until }, 0) : undefined;
+		if (typeof ends === "string") throw new Error(ends);
 		return { id: d.id, prompt: d.prompt.trim(), schedule, ...(tz ? { tz } : {}), ...(gate ? { gate } : {}),
-			...(d.priority ? { priority: d.priority } : {}), ...(dir ? { dir } : {}), ...(context ? { context } : {}) };
+			...(d.priority ? { priority: d.priority } : {}), ...(dir ? { dir } : {}), ...(context ? { context } : {}),
+			...(d.run ? { run: d.run as RunMode } : {}), ...(ends ? { expiresAt: ends } : {}) };
 	}
 
 	function contextFiles(v: unknown): string[] | undefined {
@@ -645,29 +1210,62 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function tick() {
 		if (!ctx) return;
 		if (readOnly) {
-			if (!claimLock()) return;
-			readOnly = false;
-			loops = load();
-			declaredSeen = undefined;
-			syncDeclared();
-			reconcile();
+			claimLock(() => { loops = load(); declaredSeen = undefined; syncDeclared(); reconcile(); refreshStatus(); });
+			return;
 		}
 		const now = Date.now();
 		// One loop per tick: a burst after sleep should not queue five turns at once.
 		// A fired prompt that never reached the transcript (dropped queue) must not read "queued" forever.
 		if (phase?.state === "queued" && now - phaseAt > 2 * TICK_MS && ctx.isIdle?.() && !ctx.hasPendingMessages?.()) phase = undefined;
 		syncDeclared();
+		expire(now);
 		for (const id of waited.keys()) if (!loops.some(l => l.id === id && !l.paused)) waited.delete(id);
-		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && l.nextAt <= now);
-		if (!dueNow.length) { refreshStatus(); return; }
+		for (const id of slotWait) if (!loops.some(l => l.id === id && !l.paused)) slotWait.delete(id);
+		// A kept wake whose loop was redefined since is about the old definition: drop it.
+		for (const l of loops) if (l.pendingWake && l.pendingWake.rev !== (l.rev ?? 0)) { delete l.pendingWake; save(); }
+		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && shared.away?.id !== l.id && (l.nextAt <= now || l.pendingWake));
+		// Background loops need only a run slot: each due one starts now, or runs once more after its current run.
+		for (const l of dueNow.filter(x => x.run)) {
+			if (shared.runs.has(l.id)) {
+				// Due again while it runs: once more after it (a self-paced loop's run chooses its own next time instead).
+				if (l.schedule.kind !== "auto" && !shared.again.has(l.id)) shared.again.add(l.id);
+				if (l.nextAt <= now) { l.nextAt = nextFor(l, now); save(); }
+				continue;
+			}
+			if (overLimit()) { if (!waited.has(l.id)) waited.set(l.id, now); slotWait.add(l.id); continue; }
+			consider(l, now);
+		}
+		// A loop changed from background to in-conversation while a run of it is going waits for that run.
+		const fg = dueNow.filter(l => !l.run && !shared.runs.has(l.id));
+		if (!fg.length) { refreshStatus(); return; }
 		// Busy: due loops wait, once each, for the session to be free; nothing is queued behind the turn.
-		if (busy() || gating.size) {
-			for (const l of dueNow) if (!waited.has(l.id)) waited.set(l.id, now);
+		if (busy() || [...gating].some(id => !find(id)?.run)) {
+			for (const l of fg) if (!waited.has(l.id)) waited.set(l.id, now);
 			refreshStatus();
 			return;
 		}
 		// Free: the highest priority goes first, then the longest overdue.
-		const due = dueNow.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || a.nextAt - b.nextAt)[0];
+		consider(fg.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || a.nextAt - b.nextAt)[0], now);
+	}
+
+	/** Ad hoc loops past their end are removed (not while a run of theirs is going or you are in one). */
+	function expire(now: number) {
+		const over = (l: Loop) => l.expiresAt !== undefined && l.expiresAt <= now && !shared.runs.has(l.id) && shared.away?.id !== l.id && !gating.has(l.id);
+		// A declared loop past its `until` is paused: its file is yours to edit.
+		for (const l of loops) if (l.source && over(l) && !l.paused) { l.paused = true; notify(`loop ${l.id} reached its until and is paused (${l.source})`, "info"); save(); }
+		const gone = loops.filter(l => !l.source && over(l));
+		if (!gone.length) return;
+		loops = loops.filter(l => !gone.includes(l));
+		for (const l of gone) {
+			waited.delete(l.id);
+			logDecision(gateLog, { ts: new Date(now).toISOString(), id: l.id, action: "expired", reason: `ended ${fmtTime(l.expiresAt!, zoneOf(l))}`, ms: 0 });
+			notify(`loop ${l.id} ended (its time was up)`, "info");
+		}
+		save(); refreshStatus();
+	}
+
+	/** One due loop: skip it if its folder is gone, send a kept wake, realign a missed short loop, or run its gate (or fire). */
+	function consider(due: Loop, now: number) {
 		try { home(due); } catch (e) {
 			// Its folder is gone or outside the project: skip this occurrence, say so, keep the others running.
 			notify(`loop ${due.id}: ${(e as Error).message}; skipped`, "warning");
@@ -675,7 +1273,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			waited.delete(due.id); due.nextAt = nextFor(due, now); save(); refreshStatus();
 			return;
 		}
-		const since = waited.get(due.id);
+		const since = waited.get(due.id) ?? due.pendingWake?.at;
+		if (due.pendingWake) {
+			const w = due.pendingWake;
+			fire(due, `waited ${countdown(Math.max(0, now - w.at))}`, { action: "wake", reason: w.reason, ...(w.context ? { context: w.context } : {}) });
+			return;
+		}
 		if (since === undefined && now - due.nextAt > TICK_MS * 4 && due.catchUp === "none") {
 			// Missed by more than a minute with no session to run it (sleep, restart): short loops just realign.
 			due.nextAt = nextFor(due, now);
@@ -706,16 +1309,60 @@ export default function loopExtension(pi: ExtensionAPI) {
 		zone = configuredZone(c.cwd);
 		if (zone.warning) notify(zone.warning, "warning");
 		loops = load();
+		maxBackground = configuredMaxBackground(c.cwd);
 		waited.clear(); declaredSeen = undefined; declaredErrors.clear();
-		readOnly = !claimLock();
-		if (!readOnly) { syncDeclared(); reconcile(); }
+		const self: Instance = { finishRun, afterLeave, runStarted, runFailed };
+		// Run events go to this instance only once it holds the folder's lock (until then they wait in shared.pending).
+		if (shared.current?.finishRun !== finishRun) shared.current = undefined;
+		// The same process switching sessions (/new, /resume, going into a loop's run) keeps the folder's lock:
+		// releasing it for a moment would let another session here take the loops.
+		// You were in a run's conversation and went somewhere else than with /loop leave or /loop done (/new, /resume,
+		// the session picker): that is leaving it, and the run carries on in the background.
+		const now = c.sessionManager.getSessionFile?.();
+		if (shared.away && now !== shared.away.file) {
+			const a = shared.away;
+			shared.away = undefined;
+			// A run that was going carries on; one you only opened to read stays finished.
+			shared.pending.push(cur => cur.afterLeave(a, !a.live));
+		}
+		const kept = shared.lock && shared.lockPath === lock && shared.lock.mine() ? shared.lock : undefined;
+		if (kept) {
+			folderLock = kept;
+			readOnly = false;
+			syncDeclared(); reconcile();
+			shared.current = self;
+			drain();
+		} else {
+			// A claim the previous instance still had going would otherwise hold the lock for nobody.
+			shared.lock?.release();
+			folderLock = new FolderLock(lock, {}, () => lostLock());
+			shared.lock = folderLock; shared.lockPath = lock;
+			readOnly = true;
+			claimLock(() => { loops = load(); syncDeclared(); reconcile(); interrupted(); refreshStatus(); shared.current = self; drain(); });
+		}
 		if (timer) clearInterval(timer);
 		timer = setInterval(tick, TICK_MS);
-		// Headless modes have no pane to decorate (same gate as Herdr's Pi integration).
-		herdrPane = c.mode === "tui" && herdr.enabled;
 		phase = undefined;
 		refreshStatus();
 	});
+
+	/** Run events that came while no instance was live. */
+	function drain() {
+		for (const fn of shared.pending.splice(0)) { try { void fn(shared.current!); } catch { /* one event's problem */ } }
+	}
+
+	/** Runs recorded as going under a Pi that is gone (a crash, a restart) were interrupted: say so, never resume them by themselves. */
+	function interrupted() {
+		let changed = false;
+		for (const l of loops) {
+			const r = l.lastRun;
+			if (!r || !["starting", "running", "away"].includes(r.status) || shared.runs.has(l.id)) continue;
+			if (r.host === process.pid && shared.away?.id === l.id) continue;
+			l.lastRun = { ...r, status: "interrupted", endedAt: Date.now(), findings: true, unread: true, result: r.result ?? "the Pi running it stopped before it finished" };
+			changed = true;
+		}
+		if (changed) save();
+	}
 
 	// queued -> running when the loop's own message enters the transcript; done when Pi settles.
 	pi.on("message_start", (event) => {
@@ -737,25 +1384,74 @@ export default function loopExtension(pi: ExtensionAPI) {
 	pi.on("agent_settled", () => {
 		if (phase?.state !== "running") return;
 		phase = undefined;
+		// An in-conversation loop's report: its next time, or that it is done.
+		const ic = inConversation;
+		inConversation = undefined;
+		const l = ic && loops.find(x => x.id === ic.id);
+		const r = ic && readReport(ic.report);
+		if (l && r && !readOnly) { applyReport(l, r); save(); }
 		refreshStatus();
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async (event: { reason?: string }) => {
 		if (timer) clearInterval(timer);
 		timer = undefined;
-		if (herdrPane && !readOnly) herdr.clear();
-		if (!readOnly) releaseLock();
+		// Let running gates finish (up to their own timeout), so a wake they return is kept for the
+		// next owner instead of lost; a gate may already have recorded that it reported it.
+		closing = true;
+		if (inflight.size && !readOnly) {
+			// Each gate is bounded by its own timeout from when it started (runGate kills it then).
+			const until = Math.max(...inflight.values()) + 2000;
+			await Promise.race([Promise.allSettled([...inflight.keys()]), new Promise(r => setTimeout(r, Math.max(0, until - Date.now())))]);
+		}
+		closing = false;
+		if (shared.current?.finishRun === finishRun) shared.current = undefined;
+		// Only quitting Pi gives up the folder and its background runs; a session switch keeps both.
+		if (!event?.reason || event.reason === "quit") {
+			const stopping = [...shared.runs].map(([id, run]) => {
+				run.handedOver = true;
+				const l = loops.find(x => x.id === id);
+				if (l?.lastRun && !readOnly) l.lastRun = { ...l.lastRun, status: "interrupted", endedAt: Date.now(), findings: true, unread: true, result: "Pi quit before the run finished" };
+				return run.stop(2_000);
+			});
+			await Promise.all(stopping);
+			shared.pending.length = 0;
+			shared.runs.clear();
+			if (!readOnly) save();
+			releaseLock();
+			shared.lock = undefined; shared.lockPath = undefined;
+		}
+		folderLock = undefined;
 		ctx = undefined;
 	});
+
+	// In-conversation loops report through loop_report too: their next time, or that they are done.
+	registerReportTool(pi, () => inConversation?.report ?? shared.away?.report);
 
 	// -------------------------------------------------------------- command --
 
 	pi.registerCommand("loop", {
-		description: "Recurring prompt in this session: /loop [10m|2h|1d|at HH:MM [Area/City]] <prompt> · /loop · /loop rm|pause|resume|run|test <id> · /loop clear",
+		description: "Recurring prompts: /loop [10m|2h|1d|at HH:MM [Area/City]] <prompt> · /loop (the loops view) · /loop rm|pause|resume|run|test|watch|take|open|cancel <id> · /loop steer <id> <text> · /loop leave|done · /loop clear",
 		handler: async (args: string, commandCtx?: ExtensionContext) => {
 			refreshZone();
 			const trimmed = args.trim();
+			const ui = commandCtx as any;
+			if (!trimmed && ui?.ui?.custom && (ui.mode ?? ctx?.mode) === "tui") { await openView(ui); return; }
 			if (!trimmed || trimmed === "list") { notify(listText()); return; }
+			// Background runs: go in, come back, steer, stop.
+			if (trimmed === "leave" || trimmed === "done") { const err = await leave(trimmed === "done", commandCtx); if (err) notify(err, "warning"); return; }
+			{
+				const [verb, target, ...more] = trimmed.split(/\s+/);
+				if ((verb === "take" || verb === "open") && target && find(target) && (more.length === 0 || (more.length === 1 && more[0] === "now"))) {
+					const err = await takeOver(target, more[0] === "now", commandCtx); if (err) notify(err, "warning"); return;
+				}
+				if (verb === "steer" && target && find(target) && more.length) { notify(await steerRun(target, trimmed.slice(trimmed.indexOf(target) + target.length).trim())); return; }
+				if (verb === "cancel" && target && find(target) && !more.length) { notify(await cancelRun(target)); return; }
+				if (verb === "watch" && target && find(target) && !more.length) {
+					if (ui?.ui?.custom && (ui.mode ?? ctx?.mode) === "tui") { await openView(ui, find(target)!.id); return; }
+					notify(runLines(find(target)!).slice(-30).join("\n") || "(nothing yet)"); return;
+				}
+			}
 			if (trimmed === "clear") {
 				if (readOnly) { notify(`loops are owned by pid ${ownerPid()}`, "warning"); return; }
 				const keep = loops.filter(l => l.source);
@@ -773,15 +1469,37 @@ export default function loopExtension(pi: ExtensionAPI) {
 					case "test": notify(await testGate(target, commandCtx)); return;
 					case "run": case "now": {
 						if (readOnly) { notify(`loops are owned by pid ${ownerPid()}`, "warning"); return; }
-						const l = find(target)!; const err = fire(l, "manual"); if (!err) notify(`fired ${l.id}`); return;
+						const l = find(target)!; const err = fire(l, "manual"); notify(err ?? `fired ${l.id}`); return;
 					}
 				}
 			}
-			const parsed = parseAdd(trimmed);
+			// --fork / --thread / --fresh (run in the background) and --for <duration> / --until <time>, among the schedule
+			// words before the prompt; from the prompt's first word on, everything is the prompt.
+			const words = trimmed.split(/\s+/);
+			let run: RunMode | undefined; const life: { for?: string; until?: string } = {};
+			const kept: string[] = [];
+			let i = 0;
+			for (; i < words.length; i++) {
+				const w = words[i];
+				if (/^--(fork|thread|fresh)$/.test(w)) { run = w.slice(2) as RunMode; continue; }
+				if ((w === "--for" || w === "--until") && words[i + 1]) { life[w.slice(2) as "for" | "until"] = words[++i]; continue; }
+				const first = !kept.length;
+				if (first && (parseInterval(w) !== undefined || w.toLowerCase() === "auto")) { kept.push(w); continue; }
+				if (first && w.toLowerCase() === "at" && words[i + 1]) {
+					kept.push(w, words[++i]);
+					if (words[i + 1] && (/\//.test(words[i + 1]) || /^utc$/i.test(words[i + 1]))) kept.push(words[++i]);
+					continue;
+				}
+				break;
+			}
+			kept.push(...words.slice(i));
+			const parsed = parseAdd(kept.join(" "));
 			if ("error" in parsed) { notify(parsed.error, "warning"); return; }
-			const r = add(parsed.schedule, parsed.prompt, undefined, parsed.tz);
+			const ends = parseLifetime(life, Date.now());
+			if (typeof ends === "string") { notify(ends, "warning"); return; }
+			const r = add(parsed.schedule, parsed.prompt, undefined, parsed.tz, undefined, { run, expiresAt: ends });
 			if (typeof r === "string") { notify(r, "warning"); return; }
-			notify(`loop ${r.id}: ${desc(r)}, next ${when(r)}. /loop rm ${r.id} to stop.`);
+			notify(`loop ${r.id}: ${desc(r)}${r.run ? `, in the background (${r.run})` : ""}, next ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}. /loop rm ${r.id} to stop.`);
 		},
 	});
 
@@ -811,8 +1529,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 		label: "Manage loops",
 		description:
 			"Recurring prompts (loops) in this session: create, list, delete, pause, resume, run (fire now), gate (set or remove a gate) " +
-			"or test (run the gate once without waking). A loop re-sends its prompt to this same session on a schedule, and each fire is " +
-			"a full model turn with this conversation as context. `every` is a fixed interval (default 10m); `at` is a daily HH:MM wall-clock " +
+			"or test (run the gate once without waking). A loop's turn runs in this conversation, or (run) in the background as a fork of it, " +
+			"its own thread or a fresh conversation, which the owner can watch, steer or go into with /loop. Every loop run ends with loop_report " +
+			"(findings or not; optionally when to run next, or stop), so a self-paced loop (every: auto) chooses its own next time. Loops made here " +
+			"end after 7 days unless for/until says otherwise. " +
+			"`every` is a fixed interval (default 10m) or auto; `at` is a daily HH:MM wall-clock " +
 			"time that follows daylight saving in the loop's zone. A gate is a script in the project that runs when the loop is due and " +
 			"prints JSON deciding skip, wake or defer, so a frequent check wakes the model only when needed. A due loop waits while the " +
 			"session is busy and fires once when it is free (highest priority first), never stacking. A loop can have its own folder " +
@@ -842,6 +1563,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			priority: Type.Optional(Type.Number({ description: "create: when several loops wait for the session to be free, higher goes first (default 0)." })),
 			dir: Type.Optional(Type.String({ description: "create: the loop's own folder inside the project (e.g. services/api). Its gate, prompt template (/name from <dir>/.pi/prompts) and state are found there." })),
 			context: Type.Optional(Type.Array(Type.String(), { description: "create: files in the loop's folder attached to each of its turns, e.g. [\"AGENTS.md\"]." })),
+			run: Type.Optional(Type.String({ description: "create: where each turn runs. Omit to run in this conversation. In the background: fork (a copy of this conversation as it is then), thread (the loop's own conversation, continued each run) or fresh (a new conversation each run). Background runs report through loop_report and stay quiet unless they find something." })),
+			for: Type.Optional(Type.String({ description: "create: how long the loop lives, e.g. 2h, 3d (default 7d; loops that must last belong in .pi/loop.json)." })),
+			until: Type.Optional(Type.String({ description: "create: when the loop ends, an ISO time with offset. Use either for or until." })),
 		}),
 		async execute(_toolCallId, p, _signal, _onUpdate, toolCtx) {
 			refreshZone();
@@ -871,21 +1595,27 @@ export default function loopExtension(pi: ExtensionAPI) {
 						let schedule: Schedule;
 						if (p.at) { const a = parseAt(p.at); if (!a) throw new Error("at must be HH:MM"); schedule = { kind: "at", ...a }; }
 						else {
-							const ms = p.every ? parseInterval(p.every) : DEFAULT_INTERVAL_MS;
-							if (ms === undefined) throw new Error("every must look like 5m, 2h or 1d");
-							if (ms < MIN_INTERVAL_MS) throw new Error("minimum interval is 1m");
-							schedule = { kind: "every", ms };
+							if (p.every?.trim().toLowerCase() === "auto") schedule = { kind: "auto" };
+							else {
+								const ms = p.every ? parseInterval(p.every) : DEFAULT_INTERVAL_MS;
+								if (ms === undefined) throw new Error("every must look like 5m, 2h or 1d, or be auto");
+								if (ms < MIN_INTERVAL_MS) throw new Error("minimum interval is 1m");
+								schedule = { kind: "every", ms };
+							}
 						}
+						if (p.run !== undefined && !RUN_MODES.includes(p.run as RunMode)) throw new Error("run must be fork, thread or fresh (or omitted, to run in this conversation)");
+						const ends = parseLifetime({ for: p.for, until: p.until }, Date.now());
+						if (typeof ends === "string") throw new Error(ends);
 						const dir = insideDir(ctx!.cwd, p.dir?.trim());
 						if (p.priority !== undefined && !Number.isFinite(p.priority)) throw new Error("priority must be a number");
-						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p, dir) : undefined, { priority: p.priority, dir, context: contextFiles(p.context) });
+						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p, dir) : undefined, { priority: p.priority, dir, context: contextFiles(p.context), run: p.run as RunMode | undefined, expiresAt: ends });
 						if (typeof r === "string") throw new Error(r);
 						const hints: string[] = [];
 						const twins = loops.filter(l => l !== r && l.prompt === r.prompt);
 						if (twins.length) hints.push(`loop ${twins.map(l => l.id).join(", ")} already sends this prompt; delete one unless both are intended`);
 						if (!r.gate && r.schedule.kind === "every" && r.schedule.ms < 3_600_000) hints.push("no gate: every fire is a full model turn; for a frequent check, add one with action gate (see the pi-loop skill)");
 						if (!r.prompt.startsWith("/")) hints.push("tip: a prompt template (.pi/prompts/<name>.md, prompt /<name>) keeps the instructions editable between fires");
-						return `created loop ${r.id}: ${desc(r)}, next fire ${when(r)}, catch-up ${r.catchUp}${r.gate ? `; ${gateText(r)}` : ""}${hints.map(h => `\n- ${h}`).join("")}`;
+						return `created loop ${r.id}: ${desc(r)}${r.run ? `, runs in the background (${r.run})` : ""}, next fire ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}, catch-up ${r.catchUp}${r.gate ? `; ${gateText(r)}` : ""}${hints.map(h => `\n- ${h}`).join("")}`;
 					}
 				}
 			})();

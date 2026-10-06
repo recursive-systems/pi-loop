@@ -8,16 +8,14 @@
 // gate context, expanded template: what this extension controls) and the model call after it
 // fails without anything answering in its place.
 //
-// The waiting test needs a session that is really busy: a real model (Fireworks) runs a real
-// `sleep` in bash. Without a key it is skipped, and says so.
-//
-// One test goes all the way to a real model: set FIREWORKS_API_KEY (or FIREWORKS_API_KEY_FILE,
-// a file holding it) and it runs a woken loop through Fireworks (PI_LOOP_E2E_MODEL to pick the
-// model). Without a key it is skipped, and says so.
+// Live-model tests are opt-in: PI_E2E_PROVIDER and PI_E2E_MODEL select the route.
+// For a gateway, PI_E2E_MODELS_FILE and PI_E2E_AUTH_FILE point at existing Pi files.
+// Only synthetic test data is sent. No automatic paid-provider fallback; without explicit
+// selection the model cases skip. The waiting case runs a real model and real bash sleep.
 //
 // Needs `pi` on PATH (PI_BIN to override). Run: npm test
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -28,13 +26,20 @@ import { fileURLToPath } from "node:url";
 const PACKAGE = fileURLToPath(new URL("..", import.meta.url));
 const PI = process.env.PI_BIN || "pi";
 const TICK = 15_000;
-const MODEL = process.env.PI_LOOP_E2E_MODEL || "accounts/fireworks/models/deepseek-v4p1-flash";
+const PROVIDER = process.env.PI_E2E_PROVIDER;
+const MODEL = process.env.PI_E2E_MODEL;
+const real = PROVIDER && MODEL ? false : "set PI_E2E_PROVIDER and PI_E2E_MODEL to opt in to live-model tests";
 
-function fireworksKey(): string | undefined {
-	if (process.env.FIREWORKS_API_KEY) return process.env.FIREWORKS_API_KEY;
-	const file = process.env.FIREWORKS_API_KEY_FILE;
-	if (!file) return undefined;
-	try { return fs.readFileSync(file.replace(/^~(?=\/)/, process.env.HOME ?? "~"), "utf8").trim() || undefined; } catch { return undefined; }
+function configureLiveModel(agent: string) {
+	if (real) throw new Error(real);
+	if (process.env.PI_E2E_MODELS_FILE) {
+		const config = JSON.parse(fs.readFileSync(process.env.PI_E2E_MODELS_FILE, "utf8"));
+		const provider = config.providers?.[PROVIDER!];
+		if (!provider) throw new Error("Selected provider is absent from PI_E2E_MODELS_FILE");
+		fs.writeFileSync(path.join(agent, "models.json"), JSON.stringify({ providers: { [PROVIDER!]: provider } }), { mode: 0o600 });
+	}
+	// Existing API-key auth is read by Pi, not copied into logs or command arguments.
+	if (process.env.PI_E2E_AUTH_FILE) fs.symlinkSync(path.resolve(process.env.PI_E2E_AUTH_FILE), path.join(agent, "auth.json"));
 }
 
 for (const k of ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_PANE_ID", "PI_SESSION_ID", "PI_SESSION_FILE"]) delete process.env[k];
@@ -54,8 +59,9 @@ function project(t: any, opts: { tz?: string; loops?: any[]; gates?: Record<stri
 		fs.mkdirSync(path.dirname(path.join(cwd, rel)), { recursive: true });
 		fs.writeFileSync(path.join(cwd, rel), body, { mode: rel.includes("/gates/") ? 0o755 : 0o644 });
 	}
-	const model = opts.fireworks ? { defaultProvider: "fireworks", defaultModel: MODEL, defaultThinkingLevel: "off" } : { defaultProvider: "closed", defaultModel: "none" };
-	fs.writeFileSync(path.join(agent, "settings.json"), JSON.stringify({ ...model, ...(opts.tz ? { loop: { timezone: opts.tz } } : {}) }));
+	if (opts.fireworks) configureLiveModel(agent);
+	const model = opts.fireworks ? { defaultProvider: PROVIDER, defaultModel: MODEL, defaultThinkingLevel: "off" } : { defaultProvider: "closed", defaultModel: "none" };
+	fs.writeFileSync(path.join(agent, "settings.json"), JSON.stringify({ ...model, retry: { enabled: false }, ...(opts.tz ? { loop: { timezone: opts.tz } } : {}) }));
 	if (opts.loops) fs.writeFileSync(path.join(cwd, ".pi/loops.json"), JSON.stringify(opts.loops));
 	for (const [name, body] of Object.entries(opts.gates ?? {})) {
 		fs.mkdirSync(path.join(cwd, ".pi/gates"), { recursive: true });
@@ -75,8 +81,8 @@ class Pi {
 	private buf = "";
 	private seq = 0;
 
-	constructor(t: any, p: { cwd: string; agent: string }, env: Record<string, string> = {}) {
-		this.proc = spawn(PI, ["--mode", "rpc", "--no-session", "-e", PACKAGE], {
+	constructor(t: any, p: { cwd: string; agent: string }, env: Record<string, string> = {}, opts: { sessionDir?: string; args?: string[] } = {}) {
+		this.proc = spawn(PI, ["--mode", "rpc", ...(opts.sessionDir ? ["--session-dir", opts.sessionDir] : ["--no-session"]), "-e", PACKAGE, ...(opts.args ?? [])], {
 			cwd: p.cwd, env: { ...process.env, PI_CODING_AGENT_DIR: p.agent, ...env },
 		});
 		this.proc.stdout.setEncoding("utf8");
@@ -151,7 +157,10 @@ class Pi {
 	}
 
 	stop() {
-		if (this.proc.exitCode === null) this.proc.kill("SIGTERM");
+		if (this.proc.exitCode !== null) return;
+		this.proc.kill("SIGTERM");
+		// A Pi still starting up when asked to stop may not exit: don't let it hold the suite.
+		setTimeout(() => { if (this.proc.exitCode === null) this.proc.kill("SIGKILL"); }, 10_000).unref();
 	}
 
 	async ready() {
@@ -282,9 +291,9 @@ test("a prompt template is read from disk when the loop fires, header and gate c
 	assert.match(msg, /Look at the queue and reply ok unless something is stuck\./);
 });
 
-test("a woken loop runs a real model turn to the end", { skip: fireworksKey() ? false : "set FIREWORKS_API_KEY or FIREWORKS_API_KEY_FILE to run against a real model" }, async t => {
+test("a woken loop runs a real model turn to the end", { skip: real }, async t => {
 	const p = project(t, { fireworks: true, loops: [{ ...due("ping"), prompt: "Reply with exactly the word pong and nothing else." }] });
-	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	const pi = new Pi(t, p);
 	await pi.ready();
 	await pi.waitForUser(/^\[loop ping · every 1h · fire #1/);
 	const end = await pi.waitFor(l => l.type === "agent_end", 120_000);
@@ -301,11 +310,10 @@ test("the package ships the pi-loop skill", async t => {
 });
 
 // The next two check that an agent, given only what this package puts in its context, uses it correctly.
-const real = fireworksKey() ? false : "set FIREWORKS_API_KEY or FIREWORKS_API_KEY_FILE to run against a real model";
 
 test("asked for a daily job in a stated time zone, the agent makes one `at` loop in that zone", { skip: real }, async t => {
 	const p = project(t, { fireworks: true });
-	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	const pi = new Pi(t, p);
 	await pi.ready();
 	await pi.ask("Every day at 08:00 Tokyo time, write today's date to dates.txt in this folder.");
 	const loops = p.loops();
@@ -316,7 +324,7 @@ test("asked for a daily job in a stated time zone, the agent makes one `at` loop
 test("asked for a frequent check, the agent gates the loop so quiet fires cost no turn", { skip: real }, async t => {
 	const p = project(t, { fireworks: true });
 	fs.writeFileSync(path.join(p.cwd, "status.txt"), "OK\n");
-	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	const pi = new Pi(t, p);
 	await pi.ready();
 	await pi.ask("Every 5 minutes, check status.txt in this folder. Only bother the model when it says FAILED; then append a line to incidents.txt.");
 	const [l] = p.loops();
@@ -348,7 +356,7 @@ test("due loops wait while the session is busy, then fire once each, highest pri
 		],
 		gates: { stamp: '#!/bin/sh\ndate +%s >> "$LOOP_STATE_DIR/ran"\necho \'{"action":"wake","reason":"checked"}\'\n' },
 	});
-	const pi = new Pi(t, p, { FIREWORKS_API_KEY: fireworksKey()! });
+	const pi = new Pi(t, p);
 	await pi.ready();
 	const r = await pi.send({ type: "prompt", message: "Run this exact bash command and nothing else: sleep 90. Then reply with the single word done." });
 	assert.equal(r.success, true);
@@ -376,22 +384,172 @@ test("due loops wait while the session is busy, then fire once each, highest pri
 	assert.equal(byId.urgent.fires, 1);
 });
 
-test("a gate's wake isn't used if the session worked while the gate ran; the gate runs again", { timeout: 120_000 }, async t => {
-	const p = project(t, {
-		loops: [due("slow", { gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })],
-		gates: { slow: '#!/bin/sh\ndate +%s >> "$LOOP_STATE_DIR/ran"\nsleep 6\necho \'{"action":"wake","reason":"looked"}\'\n' },
-	});
+const slowGate = '#!/bin/sh\ndate +%s >> "$LOOP_STATE_DIR/ran"\nsleep 6\nif [ -f "$LOOP_STATE_DIR/told" ]; then echo \'{"action":"skip","reason":"already told"}\'; else touch "$LOOP_STATE_DIR/told"; echo \'{"action":"wake","reason":"queue grew","context":"42 waiting"}\'; fi\n';
+// Like real gates, slowGate records what it reported: run again, it has nothing to say.
+const gateRan = (cwd: string, id: string) => { try { return fs.readFileSync(path.join(cwd, ".pi/loop-state", id, "ran"), "utf8").trim().split("\n").length; } catch { return 0; } };
+async function untilRan(cwd: string, id: string) {
+	const end = Date.now() + TICK * 2 + 5_000;
+	while (!gateRan(cwd, id) && Date.now() < end) await new Promise(r => setTimeout(r, 200));
+}
+
+test("a gate's wake that comes back after the session worked is kept and sent once it's free; the gate isn't run again", { timeout: 120_000 }, async t => {
+	const p = project(t, { loops: [due("slow", { gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })], gates: { slow: slowGate } });
 	const pi = new Pi(t, p);
 	await pi.ready();
-	const ran = path.join(p.cwd, ".pi/loop-state/slow/ran");
-	const end = Date.now() + TICK * 2 + 5_000;
-	while (!fs.existsSync(ran) && Date.now() < end) await new Promise(r => setTimeout(r, 200));
-	// A prompt arrives while the gate runs; its run starts and (no model here) ends at once.
-	await pi.send({ type: "prompt", message: "something else" });
+	await untilRan(p.cwd, "slow");
+	await pi.send({ type: "prompt", message: "something else" }); // a run starts (and, with no model here, ends) while the gate runs
 	const msg = await pi.waitForUser(/^\[loop slow /, TICK * 3 + 15_000);
-	assert.match(msg, /gate: looked\]/);
-	assert.equal(fs.readFileSync(ran, "utf8").trim().split("\n").length, 2, "the first answer was discarded and the gate ran again");
+	assert.match(msg, /· waited [^·\]]+ · gate: queue grew\]/);
+	assert.match(msg, /<gate-context>\n42 waiting\n<\/gate-context>/);
+	assert.equal(gateRan(p.cwd, "slow"), 1, "the gate ran once");
 	assert.equal(p.loops()[0].fires, 1);
+	assert.equal(p.loops()[0].pendingWake, undefined);
+});
+
+test("a kept wake is dropped if its loop is redefined before it's sent", { timeout: 120_000 }, async t => {
+	const decl = (prompt: string) => JSON.stringify([{ id: "slow", prompt, every: "1h", gate: ".pi/gates/slow", gateTimeout: "30s" }]);
+	const p = project(t, { files: { ".pi/loop.json": decl("first"), ".pi/gates/slow": slowGate }, loops: [due("slow", { prompt: "first", source: ".pi/loop.json", rev: 1, gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })] });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	await untilRan(p.cwd, "slow");
+	await pi.send({ type: "prompt", message: "something else" });
+	fs.writeFileSync(path.join(p.cwd, ".pi/loop.json"), decl("second")); // redefined while the gate runs
+	await new Promise(r => setTimeout(r, TICK * 2 + 8_000));
+	assert.ok(!pi.userMessages().some(m => m.startsWith("[loop slow")), "the old evidence wasn't sent with the new prompt");
+	const [l] = p.loops();
+	assert.equal(l.prompt, "second");
+	assert.equal(l.pendingWake, undefined);
+	assert.ok(l.nextAt > Date.now(), "it waits for its next time");
+});
+
+test("a session stopped while a gate runs keeps the gate's wake; the next session sends it without running the gate again", { timeout: 120_000 }, async t => {
+	const p = project(t, { loops: [due("slow", { gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })], gates: { slow: slowGate } });
+	const first = new Pi(t, p);
+	await first.ready();
+	await untilRan(p.cwd, "slow");
+	first.proc.kill("SIGTERM");
+	await new Promise<void>(r => first.proc.on("exit", () => r()));
+	const kept = p.loops()[0].pendingWake;
+	assert.equal(kept?.reason, "queue grew", JSON.stringify(p.loops()[0]));
+	assert.equal(fs.readFileSync(path.join(p.cwd, ".pi/loops.lock"), "utf8").trim(), "", "the lock was released after the gate finished");
+	const second = new Pi(t, p);
+	await second.ready();
+	const msg = await second.waitForUser(/^\[loop slow /, TICK * 2 + 5_000);
+	assert.match(msg, /· gate: queue grew\]/);
+	assert.equal(gateRan(p.cwd, "slow"), 1);
+});
+
+test("a lock left by a process that is gone, even with its pid reused, is taken over; a live owner's is not", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	// This test's own pid is alive, but started at another time than the lock says: a reused pid.
+	// This test's own pid is alive, but nothing holds the lock: the record is from an owner that is gone.
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), `${process.pid}\n`);
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock.owner"), JSON.stringify({ pid: process.pid, token: "earlier" }));
+	const a = new Pi(t, p);
+	await a.ready();
+	assert.match(await a.command("/loop 1h mine"), /loop mine:/);
+	assert.equal(Number(fs.readFileSync(path.join(p.cwd, ".pi/loops.lock"), "utf8").trim()), a.proc.pid);
+	const b = new Pi(t, p);
+	await b.ready();
+	assert.match(await b.command("/loop 1h theirs"), /owned by pid/);
+});
+
+test("an owner in another time zone is still recognised as alive", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	const a = new Pi(t, p, { TZ: "Asia/Tokyo", LC_ALL: "C" });
+	await a.ready();
+	assert.match(await a.command("/loop 1h mine"), /loop mine:/);
+	const b = new Pi(t, p, { TZ: "America/Los_Angeles" });
+	await b.ready();
+	assert.match(await b.command("/loop 1h theirs"), /owned by pid/);
+});
+
+test("several sessions starting at once against a dead owner's lock: exactly one takes it over", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), JSON.stringify({ pid: process.pid, started: "not this process", token: "dead" }));
+	const all = [0, 1, 2, 3].map(() => new Pi(t, p));
+	await Promise.all(all.map(x => x.ready()));
+	const notes = [];
+	for (const [i, x] of all.entries()) notes.push(await x.command(`/loop 1h from-${i}`));
+	assert.equal(notes.filter(n => !/owned by pid/.test(n)).length, 1, notes.join(" | "));
+	assert.equal(p.loops().length, 1);
+
+});
+
+test("at shutdown a running gate is waited for even if its loop was removed meanwhile", { timeout: 120_000 }, async t => {
+	const gate = '#!/bin/sh\ndate +%s > "$LOOP_STATE_DIR/began"\nsleep 30\ndate +%s > "$LOOP_STATE_DIR/ended"\necho \'{"action":"skip","reason":"done"}\'\n';
+	const p = project(t, { files: { ".pi/loop.json": JSON.stringify([{ id: "slow", prompt: "x", every: "1h", gate: ".pi/gates/slow", gateTimeout: "60s" }]), ".pi/gates/slow": gate },
+		loops: [due("slow", { prompt: "x", source: ".pi/loop.json", rev: 1, gate: { command: ".pi/gates/slow", timeoutMs: 60_000, onError: "wake" } })] });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	const state = path.join(p.cwd, ".pi/loop-state/slow");
+	const end = Date.now() + TICK * 2 + 5_000;
+	while (!fs.existsSync(path.join(state, "began")) && Date.now() < end) await new Promise(r => setTimeout(r, 200));
+	fs.writeFileSync(path.join(p.cwd, ".pi/loop.json"), "[]"); // the loop goes away while its gate runs
+	await new Promise(r => setTimeout(r, TICK + 1_000));
+	assert.ok(!fs.existsSync(path.join(state, "ended")), "the gate is still running");
+	pi.proc.kill("SIGTERM");
+	const lock = path.join(p.cwd, ".pi/loops.lock");
+	const held = () => { try { return fs.readFileSync(lock, "utf8").trim() !== ""; } catch { return false; } };
+	while (held()) await new Promise(r => setTimeout(r, 100));
+	assert.ok(fs.existsSync(path.join(state, "ended")), "the lock was released only after the gate finished");
+});
+
+test("a live owner's lock from an older pi-loop is never taken over", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.lock"), `${process.pid} Mon Jan  1 00:00:00 2001`); // older plain format; this test is alive
+	const a = new Pi(t, p);
+	await a.ready();
+	assert.match(await a.command("/loop 1h mine"), /owned by pid/);
+});
+
+test("an owner that crashes frees the lock at once: the next session owns the loops", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	const a = new Pi(t, p);
+	await a.ready();
+	assert.match(await a.command("/loop 1h mine"), /loop mine:/);
+	a.proc.kill("SIGKILL");
+	await new Promise<void>(r => a.proc.on("exit", () => r()));
+	const b = new Pi(t, p);
+	await b.ready();
+	const end = Date.now() + 10_000;
+	let note = "";
+	while (Date.now() < end) { note = await b.command("/loop 1h theirs"); if (!/owned by pid/.test(note)) break; await new Promise(r => setTimeout(r, 500)); }
+	assert.match(note, /loop theirs:/);
+});
+
+test("a session whose lock helper dies stops writing at once, and takes the loops back when the lock is free", { timeout: 90_000 }, async t => {
+	const p = project(t);
+	const a = new Pi(t, p);
+	await a.ready();
+	assert.match(await a.command("/loop 1h first"), /loop first:/);
+	const lock = path.join(p.cwd, ".pi/loops.lock");
+	const helper = execFileSync("pgrep", ["-f", lock], { encoding: "utf8" }).trim().split("\n").map(Number);
+	assert.equal(helper.length, 1, "one lock helper: A's");
+	// Another process takes the real lock the moment A's helper is gone, as a second session would.
+	process.kill(helper[0], "SIGKILL");
+	const other = spawn("perl", ["-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or exit 2; until (flock($f, LOCK_EX | LOCK_NB)) { select(undef, undef, undef, 0.02) } $| = 1; print "ok\\n"; 1 while <STDIN>;', lock]);
+	t.after(() => other.kill());
+	await new Promise<void>(r => other.stdout.once("data", () => r()));
+	assert.match(await a.command("/loop 1h second"), /owned by pid/, "A refuses to change the loops");
+	assert.match(a.notes(), /lost its lock/);
+	assert.deepEqual(p.loops().map((l: any) => l.prompt), ["first"], "nothing written after the lock was lost");
+	// The other holder lets go: A takes the lock back on its next tick and can change the loops again.
+	other.stdin.end();
+	const end = Date.now() + 40_000;
+	let note = "";
+	while (Date.now() < end) { note = await a.command("/loop 1h third"); if (!/owned by pid/.test(note)) break; await new Promise(r => setTimeout(r, 1_000)); }
+	assert.match(note, /loop third:/);
+	assert.deepEqual(p.loops().map((l: any) => l.prompt).sort(), ["first", "third"]);
+});
+
+test("two sessions starting at once in a folder: exactly one owns its loops", { timeout: 60_000 }, async t => {
+	const p = project(t);
+	const [a, b] = [new Pi(t, p), new Pi(t, p)];
+	await Promise.all([a.ready(), b.ready()]);
+	const notes = [await a.command("/loop 1h from-a"), await b.command("/loop 1h from-b")];
+	assert.equal(notes.filter(n => /owned by pid/.test(n)).length, 1, notes.join(" | "));
+	assert.equal(p.loops().length, 1);
 });
 
 test("/loop run on a loop that is due is that occurrence: it doesn't fire again", { timeout: 90_000 }, async t => {
@@ -528,4 +686,376 @@ test("a loop moved from one folder's .pi/loop.json to another's changes hands an
 	const [after] = p.loops();
 	assert.deepEqual([after?.id, after?.source, after?.dir, after?.createdAt, after?.nextAt], ["moving", "web/.pi/loop.json", "web", before.createdAt, before.nextAt]);
 	assert.doesNotMatch(pi.notes(), /already declared/);
+});
+
+
+// ------------------------------------------------------------ background runs (rs-2w9f) --
+// A loop can run in the background: a child Pi on a fork of the conversation, the loop's own thread, or a fresh one.
+// Each run reports through loop_report; only findings come back, as a quiet note in the main conversation.
+
+/** A Pi with a saved session (a fork needs one), live model, and the folder's loops. */
+async function bgSession(t: any, opts: Parameters<typeof project>[1] = {}, settings: object = {}) {
+	const p = project(t, { fireworks: true, ...opts });
+	if (Object.keys(settings).length) {
+		const f = path.join(p.agent, "settings.json");
+		fs.writeFileSync(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, "utf8")), ...settings }));
+	}
+	const sessions = tmp(t, "pi-loop-e2e-sessions-");
+	const pi = new Pi(t, p, {}, { sessionDir: sessions });
+	await pi.ready();
+	return { p, pi, sessions };
+}
+const loopOf = (p: { loops: () => any[] }, id: string) => p.loops().find((l: any) => l.id === id);
+let debugState: (() => string) | undefined;
+async function until<T>(what: string, check: () => T | undefined | false, ms = 240_000): Promise<T> {
+	const end = Date.now() + ms;
+	for (;;) {
+		let v: any; try { v = check(); } catch { v = undefined; }
+		if (v) return v;
+		if (Date.now() > end) throw new Error(`timed out waiting for ${what}${debugState ? `\n${debugState()}` : ""}`);
+		await new Promise(r => setTimeout(r, 500));
+	}
+}
+async function untilAsync(what: string, check: () => Promise<boolean>, ms = 120_000) {
+	const end = Date.now() + ms;
+	while (!(await check().catch(() => false))) {
+		if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+		await new Promise(r => setTimeout(r, 500));
+	}
+}
+async function mainFile(pi: Pi) { return (await pi.send({ type: "get_state" })).data.sessionFile as string; }
+/** The loop notes in the session's conversation (Pi writes the file only after its first exchange, so ask Pi). */
+async function notesOf(pi: Pi): Promise<string[]> {
+	const r = await pi.send({ type: "get_messages" });
+	return (r.data?.messages ?? []).filter((m: any) => m.role === "custom" && m.customType === "loop-result").map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+}
+async function untilNote(pi: Pi, what: string, ms = 240_000) {
+	const end = Date.now() + ms;
+	for (;;) {
+		const n = await notesOf(pi);
+		if (n.length) return n.join("\n");
+		if (Date.now() > end) throw new Error(`timed out waiting for ${what}${debugState ? `\n${debugState()}` : ""}`);
+		await new Promise(r => setTimeout(r, 1000));
+	}
+}
+const lockPid = (cwd: string) => Number(fs.readFileSync(path.join(cwd, ".pi/loops.lock"), "utf8").trim().split(/\s+/)[0]);
+const REPORT = (findings: boolean, summary: string, extra = "") => `Then call loop_report with findings ${findings} and summary "${summary}"${extra}. Do nothing else.`;
+
+test("a fork loop runs beside the conversation, sees it, and its findings come back as a quiet note", { skip: real, timeout: 420_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.ask("Remember this code word: KUMQUAT. Reply with just ok.");
+	const main = await mainFile(pi);
+	const before = pi.userMessages().length;
+	await pi.command(`/loop 1h --fork Say the code word you were told earlier in this conversation, in capitals. ${REPORT(true, "the code word")} Put the word itself in the summary.`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const run = await until("the run started", () => loopOf(p, id)?.lastRun?.status === "running" && loopOf(p, id).lastRun);
+	assert.equal(lockPid(p.cwd), pi.proc.pid, "the run's Pi takes no lock; the session keeps the loops");
+	assert.match(await untilNote(pi, "its note"), /KUMQUAT/, "the fork saw the conversation, and its finding came back");
+	const done = loopOf(p, id).lastRun;
+	assert.equal(done.status, "done"); assert.equal(done.findings, true);
+	assert.match(path.basename(path.dirname(done.session)), /-loop-.*--$/, "the run's conversation is kept apart");
+	const header = JSON.parse(fs.readFileSync(done.session, "utf8").split("\n")[0]);
+	assert.equal(header.parentSession, main, "a fork of the main conversation");
+	assert.equal(pi.userMessages().slice(before).filter(m => m.startsWith("[loop")).length, 0, "nothing ran in the main conversation");
+	assert.equal(run.mode, "fork");
+});
+
+test("a fresh run doesn't see the conversation, and a run with nothing to report stays quiet", { skip: real, timeout: 420_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.ask("Remember this code word: KUMQUAT. Reply with just ok.");
+	const main = await mainFile(pi);
+	await pi.command(`/loop 1h --fresh If this conversation told you a code word, call loop_report with findings true and the word as summary; if not, call loop_report with findings false and summary "none". Do nothing else.`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const r = await until("the run done", () => ["done", "failed"].includes(loopOf(p, id)?.lastRun?.status) && loopOf(p, id).lastRun);
+	assert.equal(r.status, "done");
+	assert.equal(r.findings, false, `a fresh run doesn't know the word: ${r.result}`);
+	assert.doesNotMatch(fs.readFileSync(r.session, "utf8"), /KUMQUAT/);
+	await new Promise(res => setTimeout(res, 3000));
+	assert.equal((await notesOf(pi)).length, 0, "no findings, no note");
+});
+
+test("a thread loop continues its own conversation each run", { skip: real, timeout: 420_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.command(`/loop 1h --thread Reply with the word tick. ${REPORT(false, "tick")}`);
+	const id = p.loops()[0].id;
+	for (const n of [1, 2]) {
+		await pi.command(`/loop run ${id}`);
+		await until(`run ${n} done`, () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun.fire === n);
+	}
+	const file = loopOf(p, id).lastRun.session;
+	const asked = fs.readFileSync(file, "utf8").split("\n").filter(l => l.includes('"role":"user"') && l.includes(`[loop ${id}`));
+	assert.equal(asked.length, 2, "both runs in one conversation");
+});
+
+test("a self-paced run chooses when it runs next, and stop ends it", { skip: real, timeout: 420_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.command(`/loop auto --fresh Call loop_report with findings false, summary "paced" and next "45m". Do nothing else.`);
+	const id = p.loops()[0].id;
+	assert.equal(loopOf(p, id).schedule.kind, "auto");
+	await pi.command(`/loop run ${id}`);
+	const l = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id));
+	const inMin = (l.nextAt - Date.now()) / 60_000;
+	assert.ok(inMin > 40 && inMin <= 45.5, `next in ${inMin.toFixed(1)}m`);
+	await pi.command(`/loop auto --fresh Call loop_report with findings false, summary "finished" and stop true. Do nothing else.`);
+	const id2 = p.loops().find((x: any) => x.id !== id).id;
+	await pi.command(`/loop run ${id2}`);
+	await until("the loop gone", () => !loopOf(p, id2));
+});
+
+test("steer a running background run: your words reach it at its next step", { skip: real, timeout: 420_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	const main = await mainFile(pi);
+	debugState = () => JSON.stringify(p.loops().map((l: any) => l.lastRun)) + "\nnotes: " + pi.notes().slice(-600);
+	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 20. Then reply with the word ORANGE. ${REPORT(true, "the word you replied with")}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run working", () => loopOf(p, id)?.lastRun?.status === "running");
+	await new Promise(r => setTimeout(r, 4000));
+	const note = await pi.command(`/loop steer ${id} Change of plan from the owner: when the sleep finishes, reply with the word PEAR instead, and report PEAR.`);
+	assert.match(note, /sent to/);
+	assert.match(await untilNote(pi, "its note"), /PEAR/);
+});
+
+test("go into a run, leave it to carry on in the background, go in again and finish it", { skip: real, timeout: 600_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	debugState = () => JSON.stringify(p.loops().map((l: any) => l.lastRun)) + "\nnotes: " + pi.notes().slice(-800);
+	await pi.ask("Reply with just ok."); // a conversation with something saved to come back to
+	const main = await mainFile(pi);
+	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 30. Then reply with the word DONE. ${REPORT(true, "done")}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run working", () => loopOf(p, id)?.lastRun?.status === "running");
+	const runFile = loopOf(p, id).lastRun.session;
+	await pi.command(`/loop take ${id} now`);
+	await untilAsync("in the run's conversation", async () => (await mainFile(pi)) === runFile);
+	assert.equal(loopOf(p, id).lastRun.status, "away");
+	assert.equal(lockPid(p.cwd), pi.proc.pid, "going in keeps the folder's lock");
+	await pi.command("/loop leave");
+	await untilAsync("back in the main conversation", async () => (await mainFile(pi)) === main);
+	await until("carrying on in the background", () => loopOf(p, id)?.lastRun?.status === "running");
+	await until("done", () => loopOf(p, id)?.lastRun?.status === "done", 300_000);
+	await pi.command(`/loop open ${id}`);
+	await untilAsync("in the finished run's conversation", async () => (await mainFile(pi)) === runFile);
+	await pi.command("/loop done");
+	await untilAsync("back again", async () => (await mainFile(pi)) === main);
+	assert.equal(loopOf(p, id).lastRun.status, "done");
+});
+
+test("a /new keeps the folder's lock and the runs going; their findings land in the new conversation", { skip: real, timeout: 420_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 15. ${REPORT(true, "slept")}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run working", () => loopOf(p, id)?.lastRun?.status === "running");
+	const r = await pi.send({ type: "new_session" });
+	assert.equal(r.success, true);
+	assert.equal(lockPid(p.cwd), pi.proc.pid);
+	await untilNote(pi, "its note in the new conversation");
+});
+
+test("background runs wait for a slot when loop.maxBackground is reached", { skip: real, timeout: 420_000 }, async t => {
+	const sleeper = (id: string) => ({ ...due(id), run: "fresh", prompt: `Run this exact bash command: sleep 12. ${REPORT(false, id)}` });
+	const { p } = await bgSession(t, { loops: [sleeper("one"), sleeper("two")] }, { loop: { maxBackground: 1 } });
+	await until("both done", () => p.loops().every((l: any) => l.lastRun?.status === "done"), 360_000);
+	const [a, b] = ["one", "two"].map(id => loopOf(p, id).lastRun).sort((x: any, y: any) => x.startedAt - y.startedAt);
+	assert.ok(b.startedAt >= a.endedAt, "the second started only after the first finished");
+});
+
+test("/loop cancel stops a running run; it is recorded as cancelled", { skip: real, timeout: 300_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 60. ${REPORT(true, "slept")}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run working", () => loopOf(p, id)?.lastRun?.status === "running");
+	assert.match(await pi.command(`/loop cancel ${id}`), /stopped/);
+	await until("cancelled", () => loopOf(p, id)?.lastRun?.status === "cancelled", 30_000);
+	assert.doesNotMatch(await pi.command("/loop list"), /running in background/);
+});
+
+test("a crashed Pi's runs are marked interrupted by the next session and not resumed", { skip: real, timeout: 300_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 60. ${REPORT(true, "slept")}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run working", () => loopOf(p, id)?.lastRun?.status === "running");
+	pi.proc.kill("SIGKILL");
+	await until("Pi gone", () => pi.proc.exitCode !== null || pi.proc.signalCode !== null, 30_000);
+	const next = new Pi(t, p, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
+	await next.ready();
+	const r = await until("interrupted", () => loopOf(p, id)?.lastRun?.status === "interrupted" && loopOf(p, id).lastRun, 60_000);
+	assert.equal(r.unread, true);
+	await new Promise(res => setTimeout(res, 5000));
+	assert.equal(loopOf(p, id).lastRun.status, "interrupted", "not resumed by itself");
+});
+
+test("quitting Pi interrupts its runs; the next session says so and doesn't resume them", { skip: real, timeout: 420_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 60. ${REPORT(true, "slept")}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run working", () => loopOf(p, id)?.lastRun?.status === "running");
+	pi.stop();
+	await until("Pi gone", () => pi.proc.exitCode !== null || pi.proc.signalCode !== null, 30_000);
+	const next = new Pi(t, p, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
+	await next.ready();
+	const r = await until("interrupted", () => loopOf(p, id)?.lastRun?.status === "interrupted" && loopOf(p, id).lastRun, 60_000);
+	assert.equal(r.unread, true);
+});
+
+test("ad hoc loops end after 7 days by default, or when they say", { timeout: 150_000 }, async t => {
+	const p = project(t);
+	const pi = new Pi(t, p);
+	await pi.ready();
+	await pi.command("/loop 1h week-long");
+	const week = p.loops()[0];
+	const days = (week.expiresAt - week.createdAt) / 86_400_000;
+	assert.ok(Math.abs(days - 7) < 0.01, `ends in ${days} days`);
+	await pi.command("/loop 1h --for 1m short-lived");
+	assert.ok(p.loops().some((l: any) => l.prompt === "short-lived"));
+	await until("the short one ended", () => !p.loops().some((l: any) => l.prompt === "short-lived"), 120_000);
+	assert.ok(p.loops().some((l: any) => l.prompt === "week-long"), "the other stays");
+	assert.match(fs.readFileSync(path.join(p.cwd, ".pi/loops.log.jsonl"), "utf8"), /"action":"expired"/);
+});
+
+
+test("the loops view in Pi's terminal UI: cards for each loop, a run's transcript, back and closed with Esc", { timeout: 120_000 }, async t => {
+	const p = project(t);
+	// A finished background run and its conversation, as a real run leaves them.
+	const sessions = tmp(t, "pi-loop-e2e-tui-");
+	const runFile = path.join(sessions, "2026-10-06T00-00-00-000Z_01a00000-0000-7000-8000-00000000abcd.jsonl");
+	fs.writeFileSync(runFile, [
+		{ type: "session", version: 3, id: "01a00000-0000-7000-8000-00000000abcd", timestamp: "2026-10-06T00:00:00.000Z", cwd: p.cwd },
+		{ type: "message", id: "a1", parentId: null, timestamp: "2026-10-06T00:00:01.000Z", message: { role: "user", content: [{ type: "text", text: "[loop deploy-watch · every 1h · fire #3 · background fresh] check the deploy" }], timestamp: 1 } },
+		{ type: "message", id: "a2", parentId: "a1", timestamp: "2026-10-06T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "Deploy 812 is healthy; nothing new." }], timestamp: 2 } },
+	].map(e => JSON.stringify(e)).join("\n") + "\n");
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.json"), JSON.stringify([
+		{ ...due("deploy-watch"), nextAt: Date.now() + 3_600_000, run: "fresh", fires: 3,
+			lastRun: { fire: 3, mode: "fresh", status: "done", startedAt: Date.now() - 60_000, endedAt: Date.now() - 30_000, session: runFile, result: "Deploy 812 is healthy; nothing new.", findings: false } },
+		{ ...due("nightly"), nextAt: Date.now() + 7_200_000, paused: true },
+	]));
+	const term = spawn("python3", [path.join(PACKAGE, "tests/terminal.py"), PI, "--no-session", "-e", PACKAGE], { cwd: p.cwd, env: { ...process.env, PI_CODING_AGENT_DIR: p.agent, TERM: "xterm-256color" } });
+	let screen = "";
+	term.stdout.setEncoding("utf8");
+	term.stdout.on("data", (d: string) => { screen += d; });
+	t.after(() => term.kill("SIGTERM"));
+	const plain = () => screen.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]/g, "");
+	const seen = async (re: RegExp, what: string, ms = 30_000) => {
+		const end = Date.now() + ms;
+		while (!re.test(plain())) { if (Date.now() > end) throw new Error(`no ${what} on screen; last: ${plain().slice(-1500)}`); await new Promise(r => setTimeout(r, 200)); }
+	};
+	const type = async (s: string) => { term.stdin.write(s); await new Promise(r => setTimeout(r, 400)); };
+	await seen(/loops: /, "the status line", 60_000);
+	await type("/loop");
+	await type("\r");
+	await seen(/loops · /, "the loops view");
+	await seen(/deploy-watch/, "the deploy-watch card");
+	await seen(/nightly\s+paused/, "the paused card");
+	await seen(/last #3 done: Deploy 812 is healthy/, "its last run");
+	const before = screen.length;
+	await type("\r");
+	await seen(/loop deploy-watch/, "the watch view");
+	assert.match(plain().slice(-4000), /Deploy 812 is healthy; nothing new\./, "the run's conversation");
+	assert.ok(screen.length > before);
+	await type("\x1b");
+	await seen(/Enter watch · t go in · r run now/, "the list again");
+	await type("\x1b");
+	await new Promise(r => setTimeout(r, 800));
+	await type("hello");
+	await seen(/hello/, "the editor taking text again");
+});
+
+
+// The switch and lock mechanics need no model: on the closed provider a run's turn fails at once and the run settles.
+async function closedSession(t: any, args: string[] = []) {
+	const p = project(t);
+	const sessions = tmp(t, "pi-loop-e2e-sessions-");
+	const pi = new Pi(t, p, {}, { sessionDir: sessions, args });
+	await pi.ready();
+	await new Promise(r => setTimeout(r, 1500)); // the folder's lock is claimed
+	return { p, pi };
+}
+const listOf = async (pi: Pi) => pi.command("/loop list");
+
+test("leaving a run with Pi's own /new counts as /loop leave: the run carries on, and in-conversation loops run again", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	await pi.ask("hello", 60_000); // the conversation has something saved to come back to
+	await pi.command("/loop 1h --fresh say hi");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const run = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	await pi.command(`/loop open ${id}`);
+	await untilAsync("in the run", async () => (await mainFile(pi)) === run.session);
+	assert.equal(loopOf(p, id).lastRun.status, "away");
+	assert.equal((await pi.send({ type: "new_session" })).success, true);
+	await until("the run carried on and settled", () => loopOf(p, id)?.lastRun?.status === "done", 60_000);
+	assert.doesNotMatch(await listOf(pi), /you are in/, "not in the run any more");
+	await pi.command("/loop 1h ping");
+	const ping = p.loops().find((l: any) => l.prompt === "ping").id;
+	await pi.command(`/loop run ${ping}`);
+	await pi.waitForUser(new RegExp(`^\\[loop ${ping} ·`), 30_000);
+});
+
+test("a run that finishes during a session switch is recorded, not lost", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	await pi.command("/loop 1h --fresh say hi");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await pi.send({ type: "new_session" }); // Pi rebuilds the extension while the run starts and ends
+	const r = await until("the run recorded", () => ["done", "failed"].includes(loopOf(p, id)?.lastRun?.status) && loopOf(p, id).lastRun, 60_000);
+	assert.ok(r.endedAt);
+	await until("no run left going", async () => !/running in background/.test(await listOf(pi)) || undefined, 20_000).catch(async () => assert.fail(await listOf(pi)));
+	await pi.command(`/loop run ${id}`);
+	await until("it runs again", () => loopOf(p, id)?.lastRun?.fire === r.fire + 1 && loopOf(p, id).lastRun.status === "done", 60_000);
+});
+
+test("a run that asks for a dialog: declined, and it says it needs you; a command prompt doesn't hold its slot", { timeout: 120_000 }, async t => {
+	const ext = path.join(tmp(t, "pi-loop-e2e-ext-"), "dialog.ts");
+	fs.writeFileSync(ext, `export default function (pi: any) {
+	pi.registerCommand("ask-dialog", { description: "asks", handler: async (_a: string, ctx: any) => { const ok = await ctx.ui.confirm("Deploy now?", "e2e"); ctx.ui.notify("answered " + ok); } });
+}\n`);
+	const { p, pi } = await closedSession(t, ["-e", ext]);
+	await pi.command("/loop 1h --fresh /ask-dialog");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const r = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	assert.match(r.needsYou ?? "", /confirm/, JSON.stringify(r));
+	assert.equal(r.unread, true);
+	assert.match(await untilNote(pi, "its note", 30_000), /needs you/);
+});
+
+
+test("opening a finished run to read it and leaving with /new starts nothing in it", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	await pi.ask("hello", 60_000);
+	await pi.command("/loop 1h --fresh say hi");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const run = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	const asked = () => fs.readFileSync(run.session, "utf8").split("\n").filter(l => l.includes('"role":"user"')).length;
+	const before = asked();
+	await pi.command(`/loop open ${id}`);
+	await untilAsync("in the run", async () => (await mainFile(pi)) === run.session);
+	assert.equal((await pi.send({ type: "new_session" })).success, true);
+	await until("recorded as done again", () => loopOf(p, id)?.lastRun?.status === "done", 30_000);
+	await new Promise(r => setTimeout(r, 4000));
+	assert.equal(asked(), before, "no new turn in the run you only read");
+	assert.doesNotMatch(await listOf(pi), /running in background/);
+});
+
+test("a skill as a background loop's prompt keeps the loop's header (and the run inherits -a, trusting the project's skills)", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t, ["-a"]);
+	fs.mkdirSync(path.join(p.cwd, ".pi/skills/echo"), { recursive: true });
+	fs.writeFileSync(path.join(p.cwd, ".pi/skills/echo/SKILL.md"), "---\nname: echo\ndescription: Say what you are asked to say. Use for e2e tests.\n---\n\nSay the words you are given.\n");
+	await pi.send({ type: "prompt", message: "/reload" });
+	await new Promise(r => setTimeout(r, 2000));
+	await pi.command("/loop 1h --fresh /skill:echo hello");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const run = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	const user = fs.readFileSync(run.session, "utf8").split("\n").find(l => l.includes('"role":"user"')) ?? "";
+	assert.match(user, /Say the words you are given/, "the skill was expanded");
+	assert.match(user, new RegExp(`\\[loop ${id} ·`), "with the loop's header");
+	assert.match(user, /loop_report/, "and the report hint");
 });
