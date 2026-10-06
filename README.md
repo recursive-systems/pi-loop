@@ -29,7 +29,7 @@ The prompt comes back to *the same session*, so the agent remembers what it did 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.4.1
+pi install git:github.com/recursive-systems/pi-loop@v0.5.0
 ```
 
 Add `-l` to install it for one project only.
@@ -54,6 +54,14 @@ A loop with `run` set does its work in a separate Pi beside your conversation:
 - `fork`: a copy of your conversation as it is when the loop fires, so it knows what you've been doing.
 - `thread`: the loop's own conversation, continued every run.
 - `fresh`: a new conversation each run.
+
+A run starts in the loop's own folder (the project, or its `dir`), so Pi gives it that folder's settings,
+tools (`.pi/mcp.json`), prompt templates, data class and `AGENTS.md` files, as if you had started Pi
+there. `model` (`provider/id` or `provider/id:thinking`) picks its model; otherwise it uses yours. A `fork` copies your conversation but acts from the
+loop's folder too. You can't step into a run that works in another folder (Pi would move your session
+there); watch and steer it instead. Trust each folder a run works in (a background run can't answer Pi's
+trust question), and keep the machine's own pi-loop at 0.5 or later: an older one would run the folder's
+loops itself, so such a run doesn't start.
 
 Each run ends with `loop_report`: whether it found something, one line, and optionally when to run
 next or to stop. Findings land in your conversation as a short note; everything else stays out of it.
@@ -107,7 +115,10 @@ Log each decision to `$LOOP_STATE_DIR` so you can tune the thresholds later.
 - **Each job can have its own folder** with its gate, its prompt template and its instructions
   (`dir`, and `context: ["AGENTS.md"]` to attach them to that job's turns only).
 - **Declare loops in files.** A `.pi/loop.json` in the project, or in any folder directly under it,
-  defines loops; edit the file to change them. Adding a folder adds a job:
+  defines loops; edit the file to change them. Adding a folder adds a job. `loop.folders` in the
+  project's `.pi/settings.json` (`["../business"]`) adopts folders beside it (each with a `.pi` of its
+  own): their loops run here too, in the background. The session holds each declaring folder's lock, so
+  a session opened in one of those folders is read-only instead of running its loops twice:
 
 ```json
 {"loops": [{"id": "api-check", "prompt": "/check", "every": "5m", "gate": ".pi/gates/check", "context": ["AGENTS.md"]}]}

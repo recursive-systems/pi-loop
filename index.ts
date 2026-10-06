@@ -41,7 +41,8 @@ import {
 	AD_HOC_LIFETIME_MS, DEFAULT_INTERVAL_MS, MIN_INTERVAL_MS, countdown, describe, fmtTime, nextAtFor, parseAt, parseInterval, validZone, systemZone,
 	type Schedule,
 } from "./schedule.ts";
-import { Run, RUN_MODES, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord } from "./background.ts";
+import { fileURLToPath } from "node:url";
+import { Run, RUN_MODES, extensionFlags, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord } from "./background.ts";
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
@@ -65,6 +66,8 @@ interface Note { content: string; details: Record<string, unknown> }
 interface Outcome { status: RunRecord["status"]; summary: string; findings: boolean; rep?: Report }
 interface Shared {
 	lock?: FolderLock; lockPath?: string;
+	/** Locks on the folders whose declared loops this session runs (role folders, adopted ones), by folder. */
+	folderLocks?: Map<string, FolderLock>;
 	runs: Map<string, Run>;
 	/** Loops that came due while their previous run was still going: they run once more after it. */
 	again: Set<string>;
@@ -141,6 +144,8 @@ interface Loop {
 	pendingWake?: { reason: string; context?: string; at: number; rev: number };
 	/** Where its turn runs: in this conversation (absent), or in the background as a fork of it, its own thread, or fresh. */
 	run?: RunMode;
+	/** A background run's model, provider/id[:thinking]; absent = this session's. */
+	model?: string;
 	/** It ends then: ad hoc loops after 7 days unless they say otherwise; absent = never. */
 	expiresAt?: number;
 	/** Its latest background run. */
@@ -156,10 +161,58 @@ interface Declared {
 	id: string; prompt: string; every?: string; at?: string; timezone?: string;
 	gate?: string; maxSleep?: string; gateTimeout?: string; gateOnError?: string;
 	priority?: number; context?: string[]; paused?: boolean;
-	run?: string; for?: string; until?: string;
+	run?: string; for?: string; until?: string; model?: string;
 }
 
 // ------------------------------------------------------------ settings --
+
+/** The cwd in a session file's header (its first line). */
+function headerCwd(file: string): string | undefined {
+	try {
+		const fd = fs.openSync(file, "r");
+		try { const b = Buffer.alloc(4096); const n = fs.readSync(fd, b, 0, b.length, 0); return JSON.parse(b.subarray(0, n).toString("utf8").split("\n")[0]).cwd; }
+		finally { fs.closeSync(fd); }
+	} catch { return undefined; }
+}
+
+/** The pi-loop package source a settings file lists, if any (exactly pi-loop, not pi-loop-something). */
+function piLoopIn(file: string): string | undefined {
+	let pkgs: unknown;
+	try { pkgs = JSON.parse(fs.readFileSync(file, "utf8")).packages; } catch { return undefined; }
+	if (!Array.isArray(pkgs)) return undefined;
+	for (const p of pkgs) {
+		const src = typeof p === "string" ? p : (p as any)?.source;
+		if (typeof src === "string" && /(^|[/:])pi-loop(\.git)?(@[^/@]+)?$/.test(src.replace(/\/+$/, ""))) return src;
+	}
+	return undefined;
+}
+
+/**
+ * The version of an installed package source, from its package.json: git sources (git:host/path, https://host/path,
+ * git@host:path) under <base>/git/<host>/<path>, npm under <base>/npm/node_modules, a local path as is. <base> is the
+ * agent dir for the machine's own packages, a project's .pi for its pinned ones.
+ */
+function installedVersion(src: string, base: string): string | undefined {
+	let dir: string | undefined;
+	const bare = (x: string) => x.replace(/@[^/@:]+$/, "").replace(/\.git$/, "").replace(/\/+$/, "");
+	const m = /^(?:git:|git\+)?(?:https?:\/\/|ssh:\/\/(?:[^@/]+@)?)?(?:[^@/:]+@)?([^/:]+)[/:](.+)$/.exec(src);
+	if (src.startsWith("npm:")) dir = path.join(base, "npm", "node_modules", src.slice(4).replace(/(.)@[^/@]+$/, "$1"));
+	else if (/^(git:|git\+|https?:\/\/|ssh:\/\/|[^/@]+@[^:/]+:)/.test(src) && m) dir = path.join(base, "git", m[1], bare(m[2]));
+	else if (!/^[a-z]+:/.test(src)) dir = path.resolve(base, src.replace(/^~(?=\/)/, os.homedir()));
+	try { return JSON.parse(fs.readFileSync(path.join(dir!, "package.json"), "utf8")).version; } catch { return undefined; }
+}
+
+function newerOrSame(v: string, than: string): boolean {
+	const a = v.split(".").map(Number), b = than.split(".").map(Number);
+	for (let i = 0; i < 3; i++) { if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0); }
+	return true;
+}
+
+/** This file, for a run that has to be given pi-loop on its command line. */
+function selfPath(): string | undefined {
+	try { return fileURLToPath(import.meta.url); } catch { return typeof __filename === "string" ? __filename : undefined; }
+}
+declare const __filename: string | undefined;
 
 /** Pi's agent dir (PI_CODING_AGENT_DIR, default ~/.pi/agent), without a runtime import of Pi. */
 function agentDir(): string {
@@ -185,6 +238,32 @@ export function configuredZone(cwd: string): { tz: string; source: string; warni
 	return { tz: systemZone(), source: "system" };
 }
 
+/**
+ * loop.folders in the project's .pi/settings.json: folders beside the project (e.g. "../business") whose loops
+ * this session runs too, as if they were inside it: their .pi/loop.json and their direct subfolders'. Only a true
+ * sibling with a .pi folder of its own counts. `unsure` says why the setting couldn't be read in full (its loops
+ * are then kept as they were rather than dropped).
+ */
+export function adoption(cwd: string): { folders: string[]; unsure: string[] } {
+	let raw: unknown;
+	try { raw = (JSON.parse(fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8")) as { loop?: { folders?: unknown } }).loop?.folders; }
+	catch (e) { return { folders: [], unsure: (e as NodeJS.ErrnoException).code === "ENOENT" ? [] : [".pi/settings.json could not be read"] }; }
+	if (raw === undefined) return { folders: [], unsure: [] };
+	if (!Array.isArray(raw)) return { folders: [], unsure: ["loop.folders must be a list of folders like \"../business\""] };
+	const root = fs.realpathSync(cwd);
+	const folders: string[] = [], unsure: string[] = [];
+	for (const f of raw) {
+		let abs: string | undefined;
+		try { if (typeof f === "string" && f.trim() && !path.isAbsolute(f)) abs = fs.realpathSync(path.resolve(root, f)); } catch { /* missing */ }
+		const ok = abs && abs !== root && path.dirname(abs) === path.dirname(root) && !path.basename(abs).startsWith(".")
+			&& fs.existsSync(path.join(abs, ".pi")) && fs.statSync(abs).isDirectory();
+		if (ok) { if (!folders.includes(abs!)) folders.push(abs!); }
+		else unsure.push(`loop.folders: ${JSON.stringify(f)} is not a folder beside this project with a .pi folder of its own`);
+	}
+	return { folders, unsure };
+}
+export function configuredFolders(cwd: string): string[] { return adoption(cwd).folders; }
+
 /** loop.maxBackground in the project's or agent's settings.json: background runs at once (absent or 0 = no limit). */
 export function configuredMaxBackground(cwd: string): number {
 	for (const file of [path.join(cwd, ".pi", "settings.json"), path.join(agentDir(), "settings.json")]) {
@@ -204,12 +283,14 @@ export function parseLifetime(p: { for?: string; until?: string }, now: number):
 }
 
 /** loop_report: how a loop's run says what it found and when to run again. Writes to `file()`; in a background run that is PI_LOOP_REPORT. */
-function registerReportTool(pi: ExtensionAPI, file: () => string | undefined) {
+function registerReportTool(pi: ExtensionAPI, file: () => string | undefined, run?: string) {
 	pi.registerTool({
 		name: "loop_report",
 		label: "Loop report",
-		description: "Only in a loop's turn (its message starts with [loop <id> ...]): say whether this run found something the owner should see, " +
-			"in one line, and optionally when the loop should run next or that it should stop. Call it once, at the end of the run.",
+		description: (run
+			? `This whole conversation is loop ${run}'s background run, including the owner's later words to it: call this once at the end of each run of it (again after his later words), saying whether it found something the owner should see, `
+			: "Only in a loop's turn (its message starts with [loop <id> ...]): say whether this run found something the owner should see, ") +
+			"in one line, and optionally when the loop should run next or that it should stop." + (run ? "" : " Call it once, at the end of the run."),
 		promptSnippet: "End a loop's run: findings or not, a one-line summary, optional next time or stop",
 		parameters: Type.Object({
 			findings: Type.Boolean({ description: "true only if there is something the owner should see; false when everything is as expected (the run then stays quiet)." }),
@@ -287,7 +368,13 @@ function sessionOf(c: ExtensionContext | undefined): GateSession {
 	} catch { return {}; }
 }
 
-/** A folder inside the project, normalized relative to it; undefined for the project itself. Throws if outside. */
+/** Inside the project, or one of the folders it adopts (loop.folders): those folders count as part of it. */
+function within(cwd: string, abs: string): boolean {
+	const root = fs.realpathSync(cwd);
+	return abs.startsWith(root + path.sep) || configuredFolders(cwd).some(f => abs === f || abs.startsWith(f + path.sep));
+}
+
+/** A folder inside the project (or a folder it adopts), normalized relative to it; undefined for the project itself. Throws if outside. */
 function insideDir(cwd: string, dir: string | undefined): string | undefined {
 	if (!dir || dir === "." || dir === "./") return undefined;
 	if (path.isAbsolute(dir)) throw new Error("dir must be a folder relative to the project");
@@ -295,7 +382,7 @@ function insideDir(cwd: string, dir: string | undefined): string | undefined {
 	let abs: string;
 	try { abs = fs.realpathSync(path.resolve(root, dir)); } catch { throw new Error(`dir ${dir} does not exist`); }
 	if (abs === root) return undefined;
-	if (!abs.startsWith(root + path.sep)) throw new Error("dir must be inside the project");
+	if (!within(cwd, abs)) throw new Error("dir must be inside the project (or a folder its loop.folders setting adopts)");
 	if (!fs.statSync(abs).isDirectory()) throw new Error(`dir ${dir} is not a folder`);
 	return path.relative(root, abs);
 }
@@ -304,7 +391,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	let ctx: ExtensionContext | undefined;
 	// A loop's background run: no loops of its own here (they belong to the session that started it), only loop_report.
 	if (process.env.PI_LOOP_CHILD === "1") {
-		registerReportTool(pi, () => process.env.PI_LOOP_REPORT || undefined);
+		registerReportTool(pi, () => process.env.PI_LOOP_REPORT || undefined, process.env.PI_LOOP_ID || "this");
 		pi.on("session_start", (_e, c) => { ctx = c; });
 		pi.registerCommand("loop", {
 			description: "This is a loop's background run; its loops belong to the session that started it",
@@ -331,6 +418,20 @@ export default function loopExtension(pi: ExtensionAPI) {
 	let activity = 0;
 	/** The declaring files as last read (path -> mtime), so unchanged ones aren't re-read every tick. */
 	let declaredSeen: string | undefined;
+	/** Declaring files (.pi/loop.json, relative to the project) whose folder another session holds: their loops wait. */
+	let foreign = new Set<string>();
+	/** This session holds the folder whose .pi/loop.json declares `l` (always, for its own folder and loops made here). */
+	function heldFor(l: Loop): boolean {
+		if (!l.source) return true;
+		if (foreign.has(l.source)) return false;
+		let folder: string;
+		try { folder = fs.realpathSync(path.dirname(path.dirname(path.resolve(ctx!.cwd, l.source)))); } catch { return false; }
+		if (folder === fs.realpathSync(ctx!.cwd)) return true;
+		if (shared.folderLocks?.get(folder)?.mine()) return true;
+		declaredSeen = undefined; // lost since the last look: look again (and take it back if it is free)
+		return false;
+	}
+	let ticks = 0;
 	const declaredErrors = new Map<string, string>();
 	let gateLog = "";
 
@@ -422,8 +523,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		lostLock();
 		return false;
 	}
+	/** Let go of the folders this session ran (role and adopted folders), so their next owner can take them. */
+	function releaseFolderLocks() {
+		for (const lk of shared.folderLocks?.values() ?? []) lk.release();
+		shared.folderLocks = undefined;
+		declaredSeen = undefined;
+	}
 	function lostLock() {
 		if (readOnly) return;
+		releaseFolderLocks();
 		readOnly = true;
 		notify("pi-loop lost its lock on this folder's loops; this session is read-only until it can take it back", "warning");
 		refreshStatus();
@@ -485,6 +593,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Pick<Loop, "priority" | "dir" | "context" | "run" | "expiresAt"> = {}): Loop | string {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}; manage them from that session`;
+		if (more.dir && !more.run) {
+			const root = fs.realpathSync(ctx!.cwd), abs = path.join(root, more.dir);
+			if (!abs.startsWith(root + path.sep)) return "a loop in an adopted folder runs in the background (run: fork, thread or fresh), where that folder's tools, model and data class apply";
+		}
 		if (tz && !zoned(schedule)) return "a time zone applies only to `at` loops and whole-day intervals (1d, 7d)";
 		const base = id?.trim() || slug(prompt);
 		let unique = base;
@@ -632,6 +744,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	function fire(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
 		if (!holding()) return `loops are owned by pid ${ownerPid()}`;
+		if (!heldFor(l)) return `${l.id}'s folder is held by another session (its .pi/loops.lock), or this one is still taking it`;
 		try { home(l); } catch (e) { const msg = `loop ${l.id}: ${(e as Error).message}; not fired`; notify(msg, "warning"); return msg; }
 		if (l.run) return fireBackground(l, reason, gate);
 		// You are in a run's conversation: an in-conversation loop waits for you to be back.
@@ -708,7 +821,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		moveLegacyFolder(l, sessionFolder(root, fs.realpathSync(ctx!.cwd), `-loop-${l.id}`), dir);
 		if (mode === "fork" && !main) return { args: ["--session-dir", dir], mode: "fresh", note: "this session isn't saved, so it ran fresh" };
 		if (mode === "fork") return { args: ["--fork", main!, "--session-dir", dir], mode };
-		if (mode === "thread") return { args: ["--session-dir", dir, "--continue"], mode };
+		if (mode === "thread") {
+			// Pi continues only a conversation made in the run's folder; one made elsewhere (before 0.5, runs worked in
+			// the project) carries on as a copy made here.
+			const where = fs.realpathSync(home(l));
+			let files: string[] = [];
+			try { files = fs.readdirSync(dir).filter(f => f.endsWith(".jsonl")).map(f => path.join(dir, f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs); } catch { /* none yet */ }
+			if (files.length && !files.some(f => headerCwd(f) === where)) return { args: ["--fork", files[0], "--session-dir", dir], mode, note: "its thread carries on from a copy made in its folder" };
+			return { args: ["--session-dir", dir, "--continue"], mode };
+		}
 		return { args: ["--session-dir", dir], mode };
 	}
 
@@ -723,6 +844,39 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (s && s.startsWith(legacy + path.sep)) { l.lastRun!.session = dir + s.slice(legacy.length); save(); }
 	}
 
+	/**
+	 * How a run in `folder` gets pi-loop (for loop_report), exactly once and never an older copy that would run
+	 * that folder's loops itself: the folder's own pinned pi-loop, else this machine's own (personal) one if it is
+	 * 0.5 or later, else this file with -e. Throws when the machine's own pi-loop is older.
+	 */
+	function runExtra(folder: string): string[] {
+		if (folder === fs.realpathSync(ctx!.cwd)) return []; // this project: it loads pi-loop as this session does
+		const me = selfPath();
+		const dir = me ? path.dirname(me) : undefined;
+		const inherited = extensionFlags(process.argv.slice(2));
+		for (let i = 0; i < inherited.length; i++) {
+			const v = inherited[i + 1];
+			if ((inherited[i] === "-e" || inherited[i] === "--extension") && v && dir && (v === me || v === dir || v.startsWith(dir + path.sep))) return [];
+		}
+		const check = (src: string, base: string, where: string): string[] => {
+			const v = installedVersion(src, base);
+			if (v && newerOrSame(v, "0.5.0")) return [];
+			throw new Error(v ? `the pi-loop ${where} (${v}) is older than 0.5: in ${folder} it would run that folder's loops itself. Update it to 0.5 or later`
+				: `couldn't read the version of the pi-loop ${where} (${src}); a run in ${folder} needs 0.5 or later`);
+		};
+		const pinned = piLoopIn(path.join(folder, ".pi", "settings.json"));
+		if (pinned) return check(pinned, path.join(folder, ".pi"), `${folder}/.pi/settings.json pins`);
+		const own = piLoopIn(path.join(agentDir(), "settings.json"));
+		if (own) return check(own, agentDir(), "this machine loads (~/.pi/agent/settings.json)");
+		return me ? ["-e", me] : [];
+	}
+
+	/** Where a run of `l` works and what it is given there: its folder, pi-loop for loop_report, its model. */
+	function runPlace(l: Loop): { cwd: string; extra: string[]; model?: string; thinking?: string } {
+		const where = home(l);
+		return { cwd: where, extra: runExtra(where), ...modelArgs(l) };
+	}
+
 	function childEnv(l: Loop, report: string): NodeJS.ProcessEnv {
 		const sm = ctx!.sessionManager;
 		// The parent's session id (as subagents pass it), so tools that group sessions can file the run under it.
@@ -732,7 +886,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return { ...process.env, PI_LOOP_CHILD: "1", PI_LOOP_ID: l.id, PI_LOOP_REPORT: report, PI_LOOP_PARENT_SESSION: id, PI_LOOP_PARENT_FILE: file };
 	}
 
-	function modelArgs(): { model?: string; thinking?: string } {
+	function modelArgs(l?: Loop): { model?: string; thinking?: string } {
+		if (l?.model) {
+			const i = l.model.lastIndexOf(":");
+			const lvl = i > 0 ? l.model.slice(i + 1) : "";
+			return /^(off|minimal|low|medium|high|xhigh|max)$/.test(lvl) ? { model: l.model.slice(0, i), thinking: lvl } : { model: l.model };
+		}
 		const m = ctx?.model;
 		let thinking: string | undefined;
 		try { thinking = (pi as any).getThinkingLevel?.(); } catch { /* older Pi */ }
@@ -757,6 +916,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		slotWait.delete(l.id);
 		const fireNo = l.fires + 1;
+		// In the loop's own folder, so Pi gives the run that folder's settings, tools (.pi/mcp.json), prompts, data class
+		// and AGENTS.md; pi-loop itself comes along for loop_report when that folder isn't this project.
+		let place: ReturnType<typeof runPlace>;
+		try { place = runPlace(l); } catch (e) {
+			const msg = (e as Error).message;
+			l.nextAt = nextFor(l, now);
+			l.lastRun = { fire: fireNo, mode: l.run!, status: "failed", startedAt: now, endedAt: now, host: process.pid, result: msg.slice(0, 2000), findings: true, unread: true };
+			save(); refreshStatus();
+			deliver({ content: `[loop ${l.id} · background ${l.run} · couldn't start] ${msg}`, details: { id: l.id, status: "failed" } });
+			return `${l.id}: ${msg}`;
+		}
 		const s = sessionArgsFor(l, l.run!);
 		const report = reportFileOf(l, fireNo);
 		try { fs.rmSync(report, { force: true }); } catch { /* none */ }
@@ -768,7 +938,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
 		const text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
 			: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
-		const run = new Run(l.id, fireNo, s.mode, { cwd: ctx!.cwd, sessionArgs: s.args, ...modelArgs(), env: childEnv(l, report) });
+		const run = new Run(l.id, fireNo, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, report) });
 		shared.runs.set(l.id, run);
 		if (reason !== "manual" || l.nextAt <= now) l.nextAt = nextFor(l, now);
 		waited.delete(l.id);
@@ -903,6 +1073,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const run = shared.runs.get(l.id);
 		const file = run?.sessionFile ?? l.lastRun?.session;
 		if (!file) return `${l.id} has no run to go into`;
+		// Pi opens a conversation in the folder it was started in: going into a run from another folder would move this
+		// session there (another project's lock, settings and data class). Watch and steer it from here instead.
+		const here = fs.realpathSync(ctx!.cwd);
+		let there: string | undefined = l.run ? fs.realpathSync(home(l)) : here;
+		if (there === here) there = headerCwd(file) ?? here;
+		if (there !== here) {
+			return `${l.id}'s run works in ${there}, not this folder, so you can't step into it from here: watch it (/loop watch ${l.id}) and steer it (/loop steer ${l.id} <words>), or once it has finished open it there: cd ${there} && pi --session ${file}`;
+		}
 		const homeFile = ctx!.sessionManager.getSessionFile?.();
 		if (!homeFile) return "this session isn't saved, so pi-loop couldn't bring you back to it";
 		// Pi writes a conversation to disk after its first exchange; before that there is nothing to come back to.
@@ -976,7 +1154,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			return;
 		}
 		try { fs.rmSync(a.report, { force: true }); } catch { /* none */ }
-		const run = new Run(l.id, a.fire, a.mode, { cwd: ctx!.cwd, sessionArgs: ["--session", a.file], ...modelArgs(), env: childEnv(l, a.report) });
+		let place: ReturnType<typeof runPlace>;
+		try { place = runPlace(l); } catch (e) { notify(`${l.id}: ${(e as Error).message}`, "warning"); return; }
+		const run = new Run(l.id, a.fire, a.mode, { ...place, sessionArgs: ["--session", a.file], env: childEnv(l, a.report) });
 		shared.runs.set(l.id, run);
 		l.lastRun = { ...(l.lastRun ?? { fire: a.fire, mode: a.mode, startedAt: Date.now() }), status: "running", session: a.file, host: process.pid };
 		save(); refreshStatus(); flushNotes();
@@ -1026,11 +1206,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const r = l.lastRun!;
 		const report = reportFileOf(l, r.fire);
 		try { fs.rmSync(report, { force: true }); } catch { /* none */ }
-		const run = new Run(l.id, r.fire, r.mode, { cwd: ctx!.cwd, sessionArgs: ["--session", r.session!], ...modelArgs(), env: childEnv(l, report) });
+		let place: ReturnType<typeof runPlace>;
+		try { place = runPlace(l); } catch (e) { return `${l.id}: ${(e as Error).message}`; }
+		const run = new Run(l.id, r.fire, r.mode, { ...place, sessionArgs: ["--session", r.session!], env: childEnv(l, report) });
 		shared.runs.set(l.id, run);
 		l.lastRun = { ...r, status: "running", unread: false, host: process.pid };
 		save(); refreshStatus();
-		try { await run.start(); if (!run.handedOver) await run.prompt(`${text}\n\n${REPORT_HINT}`); }
+		try { await run.start(); if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · the owner's words]\n${text}\n\n${REPORT_HINT}`); }
 		catch (e) {
 			if (run.handedOver) return `${l.id}'s run is yours now`;
 			await run.stop(); if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
@@ -1097,8 +1279,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			let body: string;
 			try {
 				const abs = fs.realpathSync(path.join(home(l), f));
-				const root = fs.realpathSync(ctx!.cwd);
-				if (!abs.startsWith(root + path.sep)) throw new Error("outside");
+				if (!within(ctx!.cwd, abs)) throw new Error("outside");
 				body = fs.readFileSync(abs, "utf8").trim();
 			} catch { out += `\n<loop-context file="${rel}">(could not be read)</loop-context>`; continue; }
 			if (body.length > left) body = `${body.slice(0, Math.max(0, left))}\n…[truncated]`;
@@ -1118,10 +1299,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 		at(cwd);
 		// A host (a scheduler that embeds this extension for one folder) serves only that folder's loops.
 		if (ctx!.mode === "host") return out;
-		let entries: fs.Dirent[] = [];
-		try { entries = fs.readdirSync(cwd, { withFileTypes: true }); } catch { /* unreadable */ }
-		for (const e of entries) if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules") at(path.join(cwd, e.name));
-		return out.sort();
+		const under = (dir: string) => {
+			let entries: fs.Dirent[] = [];
+			try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { /* unreadable */ }
+			for (const e of entries) if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules") at(path.join(dir, e.name));
+		};
+		under(cwd);
+		const own = out.sort();
+		// Folders the project adopts (loop.folders): theirs too, after its own.
+		const more: string[] = [];
+		for (const f of configuredFolders(cwd)) { const n = out.length; at(f); under(f); more.push(...out.splice(n).sort()); }
+		return [...own, ...more];
 	}
 
 	/** Bring loops in line with the .pi/loop.json files: add, update and remove declared loops; keep run state. */
@@ -1134,6 +1322,32 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const cwd = ctx.cwd;
 		const seen = new Set<string>();
 		const broken = new Set<string>();
+		const root = fs.realpathSync(cwd);
+		const heldBack = new Set<string>();
+		// loop.folders not fully readable: the adopted folders' loops stay as they were rather than vanish.
+		const adopt = adoption(cwd);
+		for (const m of adopt.unsure) if (declaredErrors.get(`settings#${m}`) !== m) { declaredErrors.set(`settings#${m}`, m); notify(m, "warning"); }
+		if (adopt.unsure.length) for (const l of loops) if (l.source?.startsWith("..")) broken.add(l.source);
+		// One session runs a folder's declared loops: this one holds each declaring folder's lock (the lock a session
+		// started in that folder would take), so a session opened there is read-only rather than running them twice.
+		foreign = new Set();
+		const locks = shared.folderLocks ??= new Map();
+		// A folder that no longer declares loops here is let go (unless the setting couldn't be read).
+		if (!adopt.unsure.length) {
+			const declaring = new Set(files.map(f => { try { return fs.realpathSync(path.dirname(path.dirname(f))); } catch { return f; } }));
+			for (const [folder, lk] of locks) if (!declaring.has(folder)) { lk.release(); locks.delete(folder); }
+		}
+		for (const file of files) {
+			let folder: string;
+			try { folder = fs.realpathSync(path.dirname(path.dirname(file))); } catch { continue; }
+			if (folder === root) continue;
+			let lk = locks.get(folder);
+			if (!lk) { lk = new FolderLock(path.join(folder, ".pi", "loops.lock"), {}, () => { declaredSeen = undefined; }); locks.set(folder, lk); }
+			if (lk.mine()) continue;
+			foreign.add(path.relative(cwd, file));
+			const claim = lk;
+			void claim.claim().then(ok => { if (ok && ctx && !readOnly && locks.get(folder) === claim) { declaredSeen = undefined; syncDeclared(); } });
+		}
 		let changed = false;
 		// Which ids each file declares right now, so a loop moved from one file to another changes hands.
 		const declaresNow = new Map<string, Set<string>>();
@@ -1148,6 +1362,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		for (const file of files) {
 			const source = path.relative(cwd, file);
 			const folder = path.dirname(path.dirname(file));
+			// Another session holds its folder (or this one is still taking it): its loops wait as they were, including
+			// one that has just moved to it from another file (it changes hands once the folder is held).
+			if (foreign.has(source)) { broken.add(source); for (const id of declaresNow.get(source) ?? []) heldBack.add(id); continue; }
 			let decls: Declared[];
 			try {
 				const raw = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -1191,11 +1408,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 					loops.push(loop); changed = true;
 					continue;
 				}
-				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context, x.run, x.expiresAt]);
+				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context, x.run, x.model, x.expiresAt]);
 				const before = defOf(l);
 				const reschedule = JSON.stringify(l.schedule) !== JSON.stringify(def.schedule) || l.tz !== def.tz;
 				Object.assign(l, def);
-				for (const k of ["tz", "gate", "priority", "dir", "context", "run", "expiresAt"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
+				for (const k of ["tz", "gate", "priority", "dir", "context", "run", "model", "expiresAt"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
 				l.catchUp = catchUpOf(l.schedule);
 				// Only a change to the declared `paused` pauses or resumes; /loop pause and resume hold otherwise.
 				if (l.declaredPaused !== declaredPaused) {
@@ -1207,12 +1424,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 		}
 		// A declared loop whose file no longer declares it is gone; one in a broken file is kept as it was.
-		const kept = loops.filter(l => !l.source || seen.has(l.id) || broken.has(l.source));
+		const kept = loops.filter(l => !l.source || seen.has(l.id) || broken.has(l.source) || heldBack.has(l.id));
 		if (kept.length !== loops.length) { loops = kept; changed = true; }
 		if (changed) { save(); refreshStatus(); }
 	}
 
-	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context" | "run" | "expiresAt"> {
+	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context" | "run" | "model" | "expiresAt"> {
 		if (!d || typeof d !== "object") throw new Error("not an object");
 		if (typeof d.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(d.id)) throw new Error("id: letters, digits, . _ -");
 		if (typeof d.prompt !== "string" || !d.prompt.trim()) throw new Error("prompt is required");
@@ -1229,10 +1446,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 		}
 		if (d.run !== undefined && !RUN_MODES.includes(d.run as RunMode)) throw new Error("run must be fork, thread or fresh (or omitted)");
+		if (d.model !== undefined && (typeof d.model !== "string" || !/^[^\s/]+\/[^\s]+$/.test(d.model))) throw new Error("model must look like provider/id or provider/id:thinking");
+		if (d.model && !d.run) throw new Error("model applies to a background loop (run: fork, thread or fresh); a loop in this conversation uses its model");
 		const tz = d.timezone ? validZone(d.timezone) : undefined;
 		if (d.timezone && !tz) throw new Error(`unknown time zone "${d.timezone}"`);
 		if (tz && !zoned(schedule)) throw new Error("a time zone applies only to at loops and whole-day intervals");
-		const dir = insideDir(ctx!.cwd, path.relative(ctx!.cwd, folder) || undefined);
+		const realFolder = fs.realpathSync(folder), realRoot = fs.realpathSync(ctx!.cwd);
+		if (realFolder !== realRoot && !realFolder.startsWith(realRoot + path.sep) && !d.run)
+			throw new Error("a loop in an adopted folder runs in the background (run: fork, thread or fresh), where that folder's tools, model and data class apply");
+		const dir = insideDir(ctx!.cwd, path.relative(realRoot, folder) || undefined);
 		const gate = d.gate ? gateConfig({ gate: d.gate, maxSleep: d.maxSleep, gateTimeout: d.gateTimeout, gateOnError: d.gateOnError }, dir) : undefined;
 		if (d.priority !== undefined && !Number.isFinite(d.priority)) throw new Error("priority must be a number");
 		const context = contextFiles(d.context);
@@ -1242,7 +1464,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (typeof ends === "string") throw new Error(ends);
 		return { id: d.id, prompt: d.prompt.trim(), schedule, ...(tz ? { tz } : {}), ...(gate ? { gate } : {}),
 			...(d.priority ? { priority: d.priority } : {}), ...(dir ? { dir } : {}), ...(context ? { context } : {}),
-			...(d.run ? { run: d.run as RunMode } : {}), ...(ends ? { expiresAt: ends } : {}) };
+			...(d.run ? { run: d.run as RunMode } : {}), ...(d.model ? { model: d.model } : {}), ...(ends ? { expiresAt: ends } : {}) };
 	}
 
 	function contextFiles(v: unknown): string[] | undefined {
@@ -1270,7 +1492,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		for (const id of slotWait) if (!loops.some(l => l.id === id && !l.paused)) slotWait.delete(id);
 		// A kept wake whose loop was redefined since is about the old definition: drop it.
 		for (const l of loops) if (l.pendingWake && l.pendingWake.rev !== (l.rev ?? 0)) { delete l.pendingWake; save(); }
-		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && (shared.away ?? shared.leaving)?.id !== l.id && (l.nextAt <= now || l.pendingWake));
+		// A held folder is asked again now and then (its owner may have quit).
+		if (foreign.size && ++ticks % 4 === 0) { declaredSeen = undefined; syncDeclared(); }
+		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && heldFor(l) && (shared.away ?? shared.leaving)?.id !== l.id && (l.nextAt <= now || l.pendingWake));
 		// Background loops need only a run slot: each due one starts now, or runs once more after its current run.
 		for (const l of dueNow.filter(x => x.run)) {
 			if (shared.runs.has(l.id)) {
@@ -1381,6 +1605,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			drain();
 		} else {
 			// A claim the previous instance still had going would otherwise hold the lock for nobody.
+			releaseFolderLocks();
 			shared.lock?.release();
 			folderLock = new FolderLock(lock, {}, () => lostLock());
 			shared.lock = folderLock; shared.lockPath = lock;
@@ -1467,6 +1692,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (!readOnly) save();
 			releaseLock();
 			shared.lock = undefined; shared.lockPath = undefined;
+			releaseFolderLocks();
 		}
 		folderLock = undefined;
 		ctx = undefined;

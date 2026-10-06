@@ -155,7 +155,7 @@ export class Run {
 		readonly loopId: string,
 		readonly fire: number,
 		readonly mode: RunMode,
-		private readonly opts: { cwd: string; sessionArgs: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv },
+		private readonly opts: { cwd: string; sessionArgs: string[]; extra?: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv },
 	) {}
 
 	onChange(fn: () => void) { this.changes.add(fn); return () => this.changes.delete(fn); }
@@ -170,7 +170,7 @@ export class Run {
 	async start(): Promise<void> {
 		const { cmd, args } = piCommand();
 		const model = this.opts.model ? ["--model", this.opts.model, ...(this.opts.thinking ? ["--thinking", this.opts.thinking] : [])] : [];
-		const proc = spawn(cmd, [...args, "--mode", "rpc", ...this.opts.sessionArgs, ...model], { cwd: this.opts.cwd, env: this.opts.env });
+		const proc = spawn(cmd, [...args, ...(this.opts.extra ?? []), "--mode", "rpc", ...this.opts.sessionArgs, ...model], { cwd: this.opts.cwd, env: this.opts.env });
 		this.proc = proc;
 		proc.stdout.setEncoding("utf8");
 		proc.stdout.on("data", (d: string) => {

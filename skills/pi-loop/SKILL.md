@@ -88,7 +88,7 @@ One session can carry several responsibilities, each a loop:
   ```
 
   Fields are those of `loop_manage create` (`every` or `at`, `timezone`, `gate`, `maxSleep`,
-  `gateTimeout`, `gateOnError`, `priority`, `context`, `run`), plus `paused` and `until`. One file
+  `gateTimeout`, `gateOnError`, `priority`, `context`, `run`, `model`), plus `paused` and `until`. One file
   per project is the way forward; folders under the project still work for setups that use them. The folder holding the file is
   the loop's folder. Edits apply within a tick; deleting the entry deletes the loop. An id already
   used by a `loop_manage` loop is refused. Change a declared loop in its file: `loop_manage`
@@ -101,6 +101,17 @@ One session can carry several responsibilities, each a loop:
   conversation, continued each run: for jobs that build on their last run) or `fresh` (a new
   conversation each run: for self-contained checks; the cheapest). Leave it out to run in the
   conversation as before. The owner watches, steers and steps into runs from `/loop`.
+- **A background run works in its loop's own folder**, so that folder's `.pi/mcp.json`, settings,
+  prompts, data class and AGENTS.md apply (no need for `context` then); a `fork` copies your
+  conversation but acts from there too. `"model": "provider/id:thinking"` gives it its own model.
+  Stepping into a run from another folder isn't possible from here (Pi would move your session
+  there): watch and steer it instead.
+- **One agent for several folders:** `loop.folders` in the project's settings adopts sibling folders
+  (`["../business"]`, each with a `.pi` of its own) whose loops this session also runs, in the
+  background only. The session holds each declaring folder's lock, so a session opened in a role
+  folder can't run its loops a second time. Trust each folder (Pi's `/trust`, or a saved decision on
+  a parent): a background run can't answer Pi's trust question and would start without the
+  folder's settings, tools and prompts. The machine's own pi-loop must be 0.5 or later.
 - **Watching something for a while** (a deploy, a PR, a migration): an ad hoc loop with `every: auto`
   and `for` (how long at most). Each run picks the next time with `loop_report` `next` (short while it
   changes, long when quiet) and ends the loop with `stop: true` when it's done. Ad hoc loops end after
