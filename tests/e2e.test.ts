@@ -820,8 +820,9 @@ test("steer a running background run: your words reach it at its next step", { s
 
 test("go into a run, leave it to carry on in the background, go in again and finish it", { skip: real, timeout: 600_000 }, async t => {
 	const { p, pi } = await bgSession(t);
-	const main = await mainFile(pi);
 	debugState = () => JSON.stringify(p.loops().map((l: any) => l.lastRun)) + "\nnotes: " + pi.notes().slice(-800);
+	await pi.ask("Reply with just ok."); // a conversation with something saved to come back to
+	const main = await mainFile(pi);
 	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 30. Then reply with the word DONE. ${REPORT(true, "done")}`);
 	const id = p.loops()[0].id;
 	await pi.command(`/loop run ${id}`);
