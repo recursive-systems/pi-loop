@@ -41,7 +41,8 @@ import {
 	AD_HOC_LIFETIME_MS, DEFAULT_INTERVAL_MS, MIN_INTERVAL_MS, countdown, describe, fmtTime, nextAtFor, parseAt, parseInterval, validZone, systemZone,
 	type Schedule,
 } from "./schedule.ts";
-import { Run, RUN_MODES, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord } from "./background.ts";
+import { fileURLToPath } from "node:url";
+import { Run, RUN_MODES, extensionFlags, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord } from "./background.ts";
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
@@ -141,6 +142,8 @@ interface Loop {
 	pendingWake?: { reason: string; context?: string; at: number; rev: number };
 	/** Where its turn runs: in this conversation (absent), or in the background as a fork of it, its own thread, or fresh. */
 	run?: RunMode;
+	/** A background run's model, provider/id[:thinking]; absent = this session's. */
+	model?: string;
 	/** It ends then: ad hoc loops after 7 days unless they say otherwise; absent = never. */
 	expiresAt?: number;
 	/** Its latest background run. */
@@ -156,10 +159,16 @@ interface Declared {
 	id: string; prompt: string; every?: string; at?: string; timezone?: string;
 	gate?: string; maxSleep?: string; gateTimeout?: string; gateOnError?: string;
 	priority?: number; context?: string[]; paused?: boolean;
-	run?: string; for?: string; until?: string;
+	run?: string; for?: string; until?: string; model?: string;
 }
 
 // ------------------------------------------------------------ settings --
+
+/** This file, for a run that has to be given pi-loop on its command line. */
+function selfPath(): string | undefined {
+	try { return fileURLToPath(import.meta.url); } catch { return typeof __filename === "string" ? __filename : undefined; }
+}
+declare const __filename: string | undefined;
 
 /** Pi's agent dir (PI_CODING_AGENT_DIR, default ~/.pi/agent), without a runtime import of Pi. */
 function agentDir(): string {
@@ -183,6 +192,23 @@ export function configuredZone(cwd: string): { tz: string; source: string; warni
 		return { tz: systemZone(), source: "system", warning: `loop.timezone ${JSON.stringify(raw)} in ${file} is not an IANA zone; using ${systemZone()}` };
 	}
 	return { tz: systemZone(), source: "system" };
+}
+
+/**
+ * loop.folders in the project's .pi/settings.json: folders beside the project (e.g. "../business") whose loops
+ * this session runs too, as if they were inside it: their .pi/loop.json and their direct subfolders'.
+ */
+export function configuredFolders(cwd: string): string[] {
+	let raw: unknown;
+	try { raw = (JSON.parse(fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf8")) as { loop?: { folders?: unknown } }).loop?.folders; } catch { return []; }
+	if (!Array.isArray(raw)) return [];
+	const root = fs.realpathSync(cwd);
+	const out: string[] = [];
+	for (const f of raw) {
+		if (typeof f !== "string" || !f.trim() || path.isAbsolute(f)) continue;
+		try { const abs = fs.realpathSync(path.resolve(root, f)); if (fs.statSync(abs).isDirectory() && abs !== root && !out.includes(abs)) out.push(abs); } catch { /* missing */ }
+	}
+	return out;
 }
 
 /** loop.maxBackground in the project's or agent's settings.json: background runs at once (absent or 0 = no limit). */
@@ -287,7 +313,13 @@ function sessionOf(c: ExtensionContext | undefined): GateSession {
 	} catch { return {}; }
 }
 
-/** A folder inside the project, normalized relative to it; undefined for the project itself. Throws if outside. */
+/** Inside the project, or one of the folders it adopts (loop.folders): those folders count as part of it. */
+function within(cwd: string, abs: string): boolean {
+	const root = fs.realpathSync(cwd);
+	return abs.startsWith(root + path.sep) || configuredFolders(cwd).some(f => abs === f || abs.startsWith(f + path.sep));
+}
+
+/** A folder inside the project (or a folder it adopts), normalized relative to it; undefined for the project itself. Throws if outside. */
 function insideDir(cwd: string, dir: string | undefined): string | undefined {
 	if (!dir || dir === "." || dir === "./") return undefined;
 	if (path.isAbsolute(dir)) throw new Error("dir must be a folder relative to the project");
@@ -295,7 +327,7 @@ function insideDir(cwd: string, dir: string | undefined): string | undefined {
 	let abs: string;
 	try { abs = fs.realpathSync(path.resolve(root, dir)); } catch { throw new Error(`dir ${dir} does not exist`); }
 	if (abs === root) return undefined;
-	if (!abs.startsWith(root + path.sep)) throw new Error("dir must be inside the project");
+	if (!within(cwd, abs)) throw new Error("dir must be inside the project (or a folder its loop.folders setting adopts)");
 	if (!fs.statSync(abs).isDirectory()) throw new Error(`dir ${dir} is not a folder`);
 	return path.relative(root, abs);
 }
@@ -723,6 +755,20 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (s && s.startsWith(legacy + path.sep)) { l.lastRun!.session = dir + s.slice(legacy.length); save(); }
 	}
 
+	/** -e this extension, for a run in a folder whose own settings don't load pi-loop (and unless it is already on the command line). */
+	function selfFlags(folder: string): string[] {
+		const me = selfPath();
+		if (!me) return [];
+		try { if (/pi-loop/.test(JSON.stringify(JSON.parse(fs.readFileSync(path.join(folder, ".pi", "settings.json"), "utf8")).packages ?? []))) return []; } catch { /* none */ }
+		const inherited = extensionFlags(process.argv.slice(2));
+		const dir = path.dirname(me);
+		for (let i = 0; i < inherited.length; i++) {
+			const v = inherited[i + 1];
+			if ((inherited[i] === "-e" || inherited[i] === "--extension") && v && (v === me || v === dir || v.startsWith(dir + path.sep))) return [];
+		}
+		return ["-e", me];
+	}
+
 	function childEnv(l: Loop, report: string): NodeJS.ProcessEnv {
 		const sm = ctx!.sessionManager;
 		// The parent's session id (as subagents pass it), so tools that group sessions can file the run under it.
@@ -732,7 +778,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return { ...process.env, PI_LOOP_CHILD: "1", PI_LOOP_ID: l.id, PI_LOOP_REPORT: report, PI_LOOP_PARENT_SESSION: id, PI_LOOP_PARENT_FILE: file };
 	}
 
-	function modelArgs(): { model?: string; thinking?: string } {
+	function modelArgs(l?: Loop): { model?: string; thinking?: string } {
+		if (l?.model) {
+			const i = l.model.lastIndexOf(":");
+			const lvl = i > 0 ? l.model.slice(i + 1) : "";
+			return /^(off|minimal|low|medium|high|xhigh|max)$/.test(lvl) ? { model: l.model.slice(0, i), thinking: lvl } : { model: l.model };
+		}
 		const m = ctx?.model;
 		let thinking: string | undefined;
 		try { thinking = (pi as any).getThinkingLevel?.(); } catch { /* older Pi */ }
@@ -768,7 +819,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
 		const text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
 			: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
-		const run = new Run(l.id, fireNo, s.mode, { cwd: ctx!.cwd, sessionArgs: s.args, ...modelArgs(), env: childEnv(l, report) });
+		// In the loop's own folder, so Pi gives the run that folder's settings, tools (.pi/mcp.json), prompts, data class
+		// and AGENTS.md; pi-loop itself comes along for loop_report when that folder isn't this project.
+		const where = home(l);
+		const run = new Run(l.id, fireNo, s.mode, { cwd: where, sessionArgs: s.args, extra: where === fs.realpathSync(ctx!.cwd) ? [] : selfFlags(where), ...modelArgs(l), env: childEnv(l, report) });
 		shared.runs.set(l.id, run);
 		if (reason !== "manual" || l.nextAt <= now) l.nextAt = nextFor(l, now);
 		waited.delete(l.id);
@@ -1097,8 +1151,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			let body: string;
 			try {
 				const abs = fs.realpathSync(path.join(home(l), f));
-				const root = fs.realpathSync(ctx!.cwd);
-				if (!abs.startsWith(root + path.sep)) throw new Error("outside");
+				if (!within(ctx!.cwd, abs)) throw new Error("outside");
 				body = fs.readFileSync(abs, "utf8").trim();
 			} catch { out += `\n<loop-context file="${rel}">(could not be read)</loop-context>`; continue; }
 			if (body.length > left) body = `${body.slice(0, Math.max(0, left))}\n…[truncated]`;
@@ -1118,10 +1171,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 		at(cwd);
 		// A host (a scheduler that embeds this extension for one folder) serves only that folder's loops.
 		if (ctx!.mode === "host") return out;
-		let entries: fs.Dirent[] = [];
-		try { entries = fs.readdirSync(cwd, { withFileTypes: true }); } catch { /* unreadable */ }
-		for (const e of entries) if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules") at(path.join(cwd, e.name));
-		return out.sort();
+		const under = (dir: string) => {
+			let entries: fs.Dirent[] = [];
+			try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { /* unreadable */ }
+			for (const e of entries) if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules") at(path.join(dir, e.name));
+		};
+		under(cwd);
+		const own = out.sort();
+		// Folders the project adopts (loop.folders): theirs too, after its own.
+		const more: string[] = [];
+		for (const f of configuredFolders(cwd)) { const n = out.length; at(f); under(f); more.push(...out.splice(n).sort()); }
+		return [...own, ...more];
 	}
 
 	/** Bring loops in line with the .pi/loop.json files: add, update and remove declared loops; keep run state. */
@@ -1191,11 +1251,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 					loops.push(loop); changed = true;
 					continue;
 				}
-				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context, x.run, x.expiresAt]);
+				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context, x.run, x.model, x.expiresAt]);
 				const before = defOf(l);
 				const reschedule = JSON.stringify(l.schedule) !== JSON.stringify(def.schedule) || l.tz !== def.tz;
 				Object.assign(l, def);
-				for (const k of ["tz", "gate", "priority", "dir", "context", "run", "expiresAt"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
+				for (const k of ["tz", "gate", "priority", "dir", "context", "run", "model", "expiresAt"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
 				l.catchUp = catchUpOf(l.schedule);
 				// Only a change to the declared `paused` pauses or resumes; /loop pause and resume hold otherwise.
 				if (l.declaredPaused !== declaredPaused) {
@@ -1212,7 +1272,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (changed) { save(); refreshStatus(); }
 	}
 
-	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context" | "run" | "expiresAt"> {
+	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context" | "run" | "model" | "expiresAt"> {
 		if (!d || typeof d !== "object") throw new Error("not an object");
 		if (typeof d.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(d.id)) throw new Error("id: letters, digits, . _ -");
 		if (typeof d.prompt !== "string" || !d.prompt.trim()) throw new Error("prompt is required");
@@ -1229,10 +1289,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 		}
 		if (d.run !== undefined && !RUN_MODES.includes(d.run as RunMode)) throw new Error("run must be fork, thread or fresh (or omitted)");
+		if (d.model !== undefined && (typeof d.model !== "string" || !/^[^\s/]+\/[^\s]+$/.test(d.model))) throw new Error("model must look like provider/id or provider/id:thinking");
+		if (d.model && !d.run) throw new Error("model applies to a background loop (run: fork, thread or fresh); a loop in this conversation uses its model");
 		const tz = d.timezone ? validZone(d.timezone) : undefined;
 		if (d.timezone && !tz) throw new Error(`unknown time zone "${d.timezone}"`);
 		if (tz && !zoned(schedule)) throw new Error("a time zone applies only to at loops and whole-day intervals");
-		const dir = insideDir(ctx!.cwd, path.relative(ctx!.cwd, folder) || undefined);
+		const dir = insideDir(ctx!.cwd, path.relative(fs.realpathSync(ctx!.cwd), folder) || undefined);
 		const gate = d.gate ? gateConfig({ gate: d.gate, maxSleep: d.maxSleep, gateTimeout: d.gateTimeout, gateOnError: d.gateOnError }, dir) : undefined;
 		if (d.priority !== undefined && !Number.isFinite(d.priority)) throw new Error("priority must be a number");
 		const context = contextFiles(d.context);
@@ -1242,7 +1304,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (typeof ends === "string") throw new Error(ends);
 		return { id: d.id, prompt: d.prompt.trim(), schedule, ...(tz ? { tz } : {}), ...(gate ? { gate } : {}),
 			...(d.priority ? { priority: d.priority } : {}), ...(dir ? { dir } : {}), ...(context ? { context } : {}),
-			...(d.run ? { run: d.run as RunMode } : {}), ...(ends ? { expiresAt: ends } : {}) };
+			...(d.run ? { run: d.run as RunMode } : {}), ...(d.model ? { model: d.model } : {}), ...(ends ? { expiresAt: ends } : {}) };
 	}
 
 	function contextFiles(v: unknown): string[] | undefined {

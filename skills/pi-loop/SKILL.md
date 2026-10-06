@@ -88,7 +88,7 @@ One session can carry several responsibilities, each a loop:
   ```
 
   Fields are those of `loop_manage create` (`every` or `at`, `timezone`, `gate`, `maxSleep`,
-  `gateTimeout`, `gateOnError`, `priority`, `context`, `run`), plus `paused` and `until`. One file
+  `gateTimeout`, `gateOnError`, `priority`, `context`, `run`, `model`), plus `paused` and `until`. One file
   per project is the way forward; folders under the project still work for setups that use them. The folder holding the file is
   the loop's folder. Edits apply within a tick; deleting the entry deletes the loop. An id already
   used by a `loop_manage` loop is refused. Change a declared loop in its file: `loop_manage`
@@ -99,7 +99,10 @@ One session can carry several responsibilities, each a loop:
 - **`run`** puts a loop's turn beside the conversation instead of in it: `fork` (a copy of the
   conversation as it is then: use it when the job needs what was said), `thread` (the loop's own
   conversation, continued each run: for jobs that build on their last run) or `fresh` (a new
-  conversation each run: for self-contained checks; the cheapest). Leave it out to run in the
+  conversation each run: for self-contained checks; the cheapest). Leave it out to run in the A background run starts in the loop's own folder,
+  so that folder's `.pi/mcp.json`, settings, prompts and AGENTS.md apply (no need for `context`
+  then); `"model": "provider/id:thinking"` gives it its own model. `loop.folders` in the project's
+  settings adopts sibling folders (`["../business"]`) whose loops this session also runs.
   conversation as before. The owner watches, steers and steps into runs from `/loop`.
 - **Watching something for a while** (a deploy, a PR, a migration): an ad hoc loop with `every: auto`
   and `for` (how long at most). Each run picks the next time with `loop_report` `next` (short while it
