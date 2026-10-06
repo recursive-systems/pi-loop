@@ -1110,6 +1110,7 @@ test("a background run of an adopted sibling folder's loop runs there: its promp
 	const p = project(t, { fireworks: true });
 	const sib = tmp(t, "pi-loop-e2e-sib-");
 	const role = path.join(sib, "role");
+	fs.mkdirSync(path.join(sib, ".pi"), { recursive: true });
 	fs.mkdirSync(path.join(role, ".pi/prompts"), { recursive: true });
 	fs.writeFileSync(path.join(role, "AGENTS.md"), "# Role\n\nThe password of this folder is MANGO-17.\n");
 	fs.writeFileSync(path.join(role, ".pi/prompts/hello.md"), "---\ndescription: say the password\n---\nSay this folder's password (from your AGENTS.md instructions). Then call loop_report once with findings false and the password as the summary.\n");
@@ -1117,7 +1118,9 @@ test("a background run of an adopted sibling folder's loop runs there: its promp
 	// As on a box: pi-loop is the project's package, and the project adopts the sibling folder.
 	fs.writeFileSync(path.join(p.cwd, ".pi/settings.json"), JSON.stringify({ packages: [PACKAGE], loop: { folders: [path.relative(p.cwd, sib)] } }));
 	const sessions = tmp(t, "pi-loop-e2e-sessions-");
-	const pi = new Pi(t, p, {}, { sessionDir: sessions, args: ["-a"], asPackage: true });
+	// As on a box: trust saved for the folders (a run can't answer Pi's trust question), no -a.
+	fs.writeFileSync(path.join(p.agent, "trust.json"), JSON.stringify({ [fs.realpathSync(p.cwd)]: true, [fs.realpathSync(sib)]: true }));
+	const pi = new Pi(t, p, {}, { sessionDir: sessions, asPackage: true });
 	await pi.ready();
 	await until("the sibling's loop", () => fs.existsSync(path.join(p.cwd, ".pi/loops.json")) && loopOf(p, "sib-check"), 30_000);
 	assert.equal(loopOf(p, "sib-check").model, `${PROVIDER}/${MODEL}:low`);
@@ -1131,13 +1134,22 @@ test("a background run of an adopted sibling folder's loop runs there: its promp
 	assert.match(path.basename(path.dirname(r.session)), /-role-loop-sib-check--$/);
 	assert.ok(lines.some(e => e.type === "thinking_level_change" && e.thinkingLevel === "low"), "the loop's thinking level, not the session's (off)");
 	assert.ok(lines.some(e => e.type === "message" && e.message?.role === "assistant" && e.message.model === MODEL), "the loop's model");
+	// Your words to the finished run start it again there: same folder, its model and thinking, loop_report.
+	await pi.command("/loop steer sib-check Say the password once more, then call loop_report once with findings false and the password as the summary.");
+	const again = await until("the resumed run done", () => { const x = loopOf(p, "sib-check")?.lastRun; return x && x.status === "done" && x.endedAt > r.endedAt && x; }, 240_000);
+	assert.equal(again.findings, false, `loop_report reached the resumed run: ${JSON.stringify(again)}`);
+	const after = fs.readFileSync(again.session, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l));
+	assert.ok(!after.some(e => e.type === "thinking_level_change" && e.thinkingLevel !== "low"), "still the loop's thinking level");
+	assert.equal(after.filter(e => e.type === "message" && e.message?.role === "assistant").at(-1)?.message.model, MODEL);
 });
 
 test("a sibling folder's loops are run only when the project adopts it (loop.folders)", { timeout: 60_000 }, async t => {
 	const { p, pi } = await closedSession(t);
 	const sib = tmp(t, "pi-loop-e2e-sib-");
+	fs.mkdirSync(path.join(sib, ".pi"), { recursive: true });
 	fs.mkdirSync(path.join(sib, "role/.pi"), { recursive: true });
-	fs.writeFileSync(path.join(sib, "role/.pi/loop.json"), JSON.stringify({ loops: [{ id: "sib-only", prompt: "hi", every: "1h", run: "fresh" }] }));
+	fs.writeFileSync(path.join(sib, "role/.pi/loop.json"), JSON.stringify({ loops: [{ id: "sib-only", prompt: "hi", every: "1h", run: "fresh" },
+		{ id: "sib-here", prompt: "hi", every: "1h" }] }));
 	await pi.command("/reload");
 	await new Promise(r => setTimeout(r, 2000));
 	assert.equal(fs.existsSync(path.join(p.cwd, ".pi/loops.json")) ? loopOf(p, "sib-only") : undefined, undefined, "not adopted: not run");
@@ -1145,10 +1157,21 @@ test("a sibling folder's loops are run only when the project adopts it (loop.fol
 	await pi.command("/reload");
 	const l = await until("adopted: its loop", () => fs.existsSync(path.join(p.cwd, ".pi/loops.json")) && loopOf(p, "sib-only"), 30_000);
 	assert.equal(l.dir, path.relative(fs.realpathSync(p.cwd), fs.realpathSync(path.join(sib, "role"))));
+	assert.equal(loopOf(p, "sib-here"), undefined, "a loop in an adopted folder runs only in the background");
+	// A settings file that can't be read keeps the adopted loops (and their state) rather than dropping them.
+	fs.writeFileSync(path.join(p.cwd, ".pi/settings.json"), "{ not json");
+	await pi.command("/reload");
+	await new Promise(r => setTimeout(r, 2000));
+	assert.ok(loopOf(p, "sib-only"), "kept while the setting can't be read");
+	// Only a folder beside the project counts: its role folder named directly (one level down) doesn't.
+	fs.writeFileSync(path.join(p.cwd, ".pi/settings.json"), JSON.stringify({ loop: { folders: [path.join(path.relative(p.cwd, sib), "role")] } }));
+	const from = pi.lines.length;
+	await pi.command("/reload");
+	await until("the refusal", () => /not a folder beside this project/.test(pi.notes(from)) || undefined, 20_000);
 });
 
 
-test("going into a run that ran in its loop's own folder, and back", { timeout: 120_000 }, async t => {
+test("going into a run that works in another folder is refused, with how to watch and steer it", { timeout: 120_000 }, async t => {
 	const { p, pi } = await closedSession(t);
 	await pi.ask("hello", 60_000);
 	const home = await mainFile(pi);
@@ -1158,9 +1181,44 @@ test("going into a run that ran in its loop's own folder, and back", { timeout: 
 	await pi.command("/loop run op-run");
 	const run = await until("the run done", () => loopOf(p, "op-run")?.lastRun?.status === "done" && loopOf(p, "op-run").lastRun, 60_000);
 	assert.equal(JSON.parse(fs.readFileSync(run.session, "utf8").split("\n")[0]).cwd, fs.realpathSync(path.join(p.cwd, "op")));
-	await pi.command("/loop open op-run");
-	await untilAsync("in the run", async () => (await mainFile(pi)) === run.session);
-	await pi.command("/loop done");
-	await untilAsync("back home", async () => (await mainFile(pi)) === home);
-	await until("recorded as done", () => loopOf(p, "op-run")?.lastRun?.status === "done", 30_000);
+	// Pi would open it in its folder, moving this session (lock, settings, data class) there: refused, with the way.
+	assert.match(await pi.command("/loop open op-run"), /works in .*op, not this folder.*\/loop steer op-run/s);
+	assert.equal(await mainFile(pi), home, "still here");
+	assert.ok(!fs.existsSync(path.join(p.cwd, "op/.pi/loops.json")), "nothing of this session's written in the run's folder");
+});
+
+
+test("a thread whose conversation was made in another folder carries on from a copy made in its own", { timeout: 180_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	fs.mkdirSync(path.join(p.cwd, "op/.pi"), { recursive: true });
+	fs.writeFileSync(path.join(p.cwd, "op/.pi/loop.json"), JSON.stringify({ loops: [{ id: "op-thread", prompt: "say hi", every: "1h", run: "thread" }] }));
+	await until("the declared loop", () => loopOf(p, "op-thread"), 30_000);
+	await pi.command("/loop run op-thread");
+	const first = await until("the first run done", () => loopOf(p, "op-thread")?.lastRun?.status === "done" && loopOf(p, "op-thread").lastRun, 60_000);
+	// As 0.4 left it: the thread's conversation made in the project's folder.
+	const lines = fs.readFileSync(first.session, "utf8").split("\n");
+	lines[0] = JSON.stringify({ ...JSON.parse(lines[0]), cwd: fs.realpathSync(p.cwd) });
+	fs.writeFileSync(first.session, lines.join("\n"));
+	await pi.command("/loop run op-thread");
+	const second = await until("the second run done", () => { const x = loopOf(p, "op-thread")?.lastRun; return x?.fire === first.fire + 1 && x.status === "done" && x; }, 60_000);
+	assert.notEqual(second.session, first.session, "a copy");
+	const copy = fs.readFileSync(second.session, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l));
+	assert.equal(copy[0].cwd, fs.realpathSync(path.join(p.cwd, "op")), "made in its folder");
+	assert.equal(copy.filter(e => e.type === "message" && e.message?.role === "user").length, 2, "with the earlier run's conversation");
+	await pi.command("/loop run op-thread");
+	const third = await until("the third run done", () => { const x = loopOf(p, "op-thread")?.lastRun; return x?.fire === first.fire + 2 && x.status === "done" && x; }, 60_000);
+	assert.equal(third.session, second.session, "and continues the copy from then on");
+});
+
+test("a folder whose loops this session runs is held: a session opened in it is read-only", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	fs.mkdirSync(path.join(p.cwd, "op/.pi"), { recursive: true });
+	fs.writeFileSync(path.join(p.cwd, "op/.pi/loop.json"), JSON.stringify({ loops: [{ id: "op-held", prompt: "say hi", every: "1h", run: "fresh" }] }));
+	await until("the declared loop", () => loopOf(p, "op-held"), 30_000);
+	const there = new Pi(t, { cwd: path.join(p.cwd, "op"), agent: p.agent }, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
+	await there.ready();
+	assert.match(await there.command("/loop run op-held"), /owned by pid \d+/);
+	assert.ok(!fs.existsSync(path.join(p.cwd, "op/.pi/loops.json")), "it doesn't run the folder's loops itself");
+	await pi.command("/loop run op-held");
+	await until("run by the session that holds it", () => loopOf(p, "op-held")?.lastRun?.status === "done", 60_000);
 });
