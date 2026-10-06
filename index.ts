@@ -393,10 +393,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 	/** One owner per project: an OS-held lock (lock.ts). Taking it is asynchronous; until then this session is read-only. */
 	let folderLock: FolderLock | undefined;
+	/** The claim in flight, if any: settles after it has been applied. */
+	let claiming: Promise<unknown> | undefined;
 	function claimLock(then: () => void) {
 		const l = folderLock;
 		if (!l) return;
-		void l.claim().then(ok => {
+		const c: Promise<unknown> = claiming = l.claim().then(ok => {
+			if (claiming === c) claiming = undefined;
 			if (!ok || l !== folderLock || !ctx) {
 				if (!lockAvailable() && !lockWarned) { lockWarned = true; notify("pi-loop needs perl (in the base system on macOS and most Linux) for its lock; without it this session can't run loops", "warning"); }
 				return;
@@ -404,6 +407,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 			readOnly = false;
 			then();
 		});
+	}
+	/** A session that has just started is still taking its lock: wait a little for it rather than say it isn't the owner. */
+	async function settledClaim() {
+		const c = claiming;
+		if (readOnly && c) await Promise.race([c, new Promise(r => setTimeout(r, 5_000).unref?.())]);
 	}
 	let lockWarned = false;
 	function releaseLock() { folderLock?.release(); }
@@ -1472,6 +1480,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	pi.registerCommand("loop", {
 		description: "Recurring prompts: /loop [10m|2h|1d|at HH:MM [Area/City]] <prompt> · /loop (the loops view) · /loop rm|pause|resume|run|test|watch|take|open|cancel <id> · /loop steer <id> <text> · /loop leave|done · /loop clear",
 		handler: async (args: string, commandCtx?: ExtensionContext) => {
+			await settledClaim();
 			refreshZone();
 			const trimmed = args.trim();
 			const ui = commandCtx as any;
@@ -1607,6 +1616,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			until: Type.Optional(Type.String({ description: "create: when the loop ends, an ISO time with offset. Use either for or until." })),
 		}),
 		async execute(_toolCallId, p, _signal, _onUpdate, toolCtx) {
+			await settledClaim();
 			refreshZone();
 			if (p.action === "test") return { content: [{ type: "text", text: await testGate(p.id ?? "", toolCtx) }], details: { loops } };
 			const text = (() => {
