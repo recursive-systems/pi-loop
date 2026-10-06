@@ -81,8 +81,8 @@ class Pi {
 	private buf = "";
 	private seq = 0;
 
-	constructor(t: any, p: { cwd: string; agent: string }, env: Record<string, string> = {}, opts: { sessionDir?: string } = {}) {
-		this.proc = spawn(PI, ["--mode", "rpc", ...(opts.sessionDir ? ["--session-dir", opts.sessionDir] : ["--no-session"]), "-e", PACKAGE], {
+	constructor(t: any, p: { cwd: string; agent: string }, env: Record<string, string> = {}, opts: { sessionDir?: string; args?: string[] } = {}) {
+		this.proc = spawn(PI, ["--mode", "rpc", ...(opts.sessionDir ? ["--session-dir", opts.sessionDir] : ["--no-session"]), "-e", PACKAGE, ...(opts.args ?? [])], {
 			cwd: p.cwd, env: { ...process.env, PI_CODING_AGENT_DIR: p.agent, ...env },
 		});
 		this.proc.stdout.setEncoding("utf8");
@@ -862,6 +862,33 @@ test("background runs wait for a slot when loop.maxBackground is reached", { ski
 	assert.ok(b.startedAt >= a.endedAt, "the second started only after the first finished");
 });
 
+test("/loop cancel stops a running run; it is recorded as cancelled", { skip: real, timeout: 300_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 60. ${REPORT(true, "slept")}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run working", () => loopOf(p, id)?.lastRun?.status === "running");
+	assert.match(await pi.command(`/loop cancel ${id}`), /stopped/);
+	await until("cancelled", () => loopOf(p, id)?.lastRun?.status === "cancelled", 30_000);
+	assert.doesNotMatch(await pi.command("/loop list"), /running in background/);
+});
+
+test("a crashed Pi's runs are marked interrupted by the next session and not resumed", { skip: real, timeout: 300_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 60. ${REPORT(true, "slept")}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run working", () => loopOf(p, id)?.lastRun?.status === "running");
+	pi.proc.kill("SIGKILL");
+	await until("Pi gone", () => pi.proc.exitCode !== null || pi.proc.signalCode !== null, 30_000);
+	const next = new Pi(t, p, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
+	await next.ready();
+	const r = await until("interrupted", () => loopOf(p, id)?.lastRun?.status === "interrupted" && loopOf(p, id).lastRun, 60_000);
+	assert.equal(r.unread, true);
+	await new Promise(res => setTimeout(res, 5000));
+	assert.equal(loopOf(p, id).lastRun.status, "interrupted", "not resumed by itself");
+});
+
 test("quitting Pi interrupts its runs; the next session says so and doesn't resume them", { skip: real, timeout: 420_000 }, async t => {
 	const { p, pi } = await bgSession(t);
 	await pi.command(`/loop 1h --fresh Run this exact bash command: sleep 60. ${REPORT(true, "slept")}`);
@@ -936,4 +963,63 @@ test("the loops view in Pi's terminal UI: cards for each loop, a run's transcrip
 	await new Promise(r => setTimeout(r, 800));
 	await type("hello");
 	await seen(/hello/, "the editor taking text again");
+});
+
+
+// The switch and lock mechanics need no model: on the closed provider a run's turn fails at once and the run settles.
+async function closedSession(t: any, args: string[] = []) {
+	const p = project(t);
+	const sessions = tmp(t, "pi-loop-e2e-sessions-");
+	const pi = new Pi(t, p, {}, { sessionDir: sessions, args });
+	await pi.ready();
+	await new Promise(r => setTimeout(r, 1500)); // the folder's lock is claimed
+	return { p, pi };
+}
+const listOf = async (pi: Pi) => pi.command("/loop list");
+
+test("leaving a run with Pi's own /new counts as /loop leave: the run carries on, and in-conversation loops run again", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	await pi.ask("hello", 60_000); // the conversation has something saved to come back to
+	await pi.command("/loop 1h --fresh say hi");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const run = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	await pi.command(`/loop open ${id}`);
+	await untilAsync("in the run", async () => (await mainFile(pi)) === run.session);
+	assert.equal(loopOf(p, id).lastRun.status, "away");
+	assert.equal((await pi.send({ type: "new_session" })).success, true);
+	await until("the run carried on and settled", () => loopOf(p, id)?.lastRun?.status === "done", 60_000);
+	assert.doesNotMatch(await listOf(pi), /you are in/, "not in the run any more");
+	await pi.command("/loop 1h ping");
+	const ping = p.loops().find((l: any) => l.prompt === "ping").id;
+	await pi.command(`/loop run ${ping}`);
+	await pi.waitForUser(new RegExp(`^\\[loop ${ping} ·`), 30_000);
+});
+
+test("a run that finishes during a session switch is recorded, not lost", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	await pi.command("/loop 1h --fresh say hi");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await pi.send({ type: "new_session" }); // Pi rebuilds the extension while the run starts and ends
+	const r = await until("the run recorded", () => ["done", "failed"].includes(loopOf(p, id)?.lastRun?.status) && loopOf(p, id).lastRun, 60_000);
+	assert.ok(r.endedAt);
+	await until("no run left going", async () => !/running in background/.test(await listOf(pi)) || undefined, 20_000).catch(async () => assert.fail(await listOf(pi)));
+	await pi.command(`/loop run ${id}`);
+	await until("it runs again", () => loopOf(p, id)?.lastRun?.fire === r.fire + 1 && loopOf(p, id).lastRun.status === "done", 60_000);
+});
+
+test("a run that asks for a dialog: declined, and it says it needs you; a command prompt doesn't hold its slot", { timeout: 120_000 }, async t => {
+	const ext = path.join(tmp(t, "pi-loop-e2e-ext-"), "dialog.ts");
+	fs.writeFileSync(ext, `export default function (pi: any) {
+	pi.registerCommand("ask-dialog", { description: "asks", handler: async (_a: string, ctx: any) => { const ok = await ctx.ui.confirm("Deploy now?", "e2e"); ctx.ui.notify("answered " + ok); } });
+}\n`);
+	const { p, pi } = await closedSession(t, ["-e", ext]);
+	await pi.command("/loop 1h --fresh /ask-dialog");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const r = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	assert.match(r.needsYou ?? "", /confirm/, JSON.stringify(r));
+	assert.equal(r.unread, true);
+	assert.match(await untilNote(pi, "its note", 30_000), /needs you/);
 });

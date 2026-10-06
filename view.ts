@@ -1,7 +1,7 @@
 /**
  * The loops view (/loop in the terminal UI): every loop with its state, and a live view of a run you can steer.
  *
- *   list    ↑/↓ or j/k move · Enter watch its run · t go into its run · r run now · p pause/resume · x stop its run · Esc close
+ *   list    ↑/↓ or j/k move · Enter watch its run · t go into its run · r run now · p pause/resume · x cancel its run · Esc close
  *   watch   type to steer, Enter sends · Tab go into the run · Esc back to the list
  */
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
@@ -36,6 +36,9 @@ export class LoopsView {
 
 	invalidate() {}
 
+	/** Pi disposes the component when the interaction ends, however it ends. */
+	dispose() { clearInterval(this.timer); }
+
 	handleInput(data: string): void {
 		const rows = this.deps.rows();
 		if (this.watching) {
@@ -68,7 +71,7 @@ export class LoopsView {
 
 	render(width: number): string[] {
 		const out: string[] = [];
-		const w = Math.max(20, width);
+		const w = Math.max(1, width);
 		const put = (s: string) => out.push(truncateToWidth(s, w));
 		if (this.watching) {
 			const id = this.watching;
@@ -93,7 +96,7 @@ export class LoopsView {
 			if (r.detail) put(`      ${this.fg("muted", r.detail)}`);
 		});
 		put("");
-		put(this.fg("muted", this.note || "Enter watch · t go in · r run now · p pause/resume · x stop · Esc close"));
+		put(this.fg("muted", this.note || "Enter watch · t go in · r run now · p pause/resume · x cancel run · Esc close"));
 		return out;
 	}
 }

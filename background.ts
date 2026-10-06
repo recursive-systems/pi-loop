@@ -55,7 +55,7 @@ export function piCommand(): { cmd: string; args: string[] } {
 	return { cmd: "pi", args: inherited };
 }
 
-/** The session's own extension flags (-e/--extension, -ne/--no-extensions), so a run loads the same extensions. */
+/** The session's own extension and trust flags (-e, -ne, -a, -na, --offline, --api-key), so a run loads what it loads. */
 export function extensionFlags(argv: string[]): string[] {
 	const out: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
@@ -63,7 +63,8 @@ export function extensionFlags(argv: string[]): string[] {
 		const where = (v: string) => (/^[a-z]+:/.test(v) ? v : path.resolve(v)); // builtin:, npm:, git: stay as they are
 		if ((a === "-e" || a === "--extension") && argv[i + 1]) out.push(a, where(argv[++i]));
 		else if (a.startsWith("--extension=")) out.push("--extension", where(a.slice(12)));
-		else if (a === "-ne" || a === "--no-extensions") out.push(a);
+		else if (["-ne", "--no-extensions", "-a", "--approve", "-na", "--no-approve", "--offline"].includes(a)) out.push(a);
+		else if (a === "--api-key" && argv[i + 1]) out.push(a, argv[++i]);
 	}
 	return out;
 }
@@ -136,6 +137,8 @@ export class Run {
 	needsYou?: string;
 	/** Set when the run is being handed to you, so its exit is not a failure. */
 	handedOver = false;
+	/** Set while its result is being collected; your words then wait and start it again. */
+	finishing = false;
 	cancelled = false;
 	private buf = "";
 	private seq = 0;
@@ -207,12 +210,7 @@ export class Run {
 			return;
 		}
 		if (msg.type === "agent_start") { this.working = true; this.changed(); return; }
-		if (msg.type === "agent_settled") {
-			this.working = false;
-			for (const w of this.idleWaiters.splice(0)) w();
-			this.changed();
-			return;
-		}
+		if (msg.type === "agent_settled") { this.settle(); return; }
 		if (msg.type === "message_end" && msg.message) this.push(messageLines(msg.message));
 	}
 
@@ -237,14 +235,24 @@ export class Run {
 		const r = await this.send({ type: "prompt", message: text });
 		if (!r?.success) { this.working = false; throw new Error(r?.error ?? "the run's Pi refused the prompt"); }
 		this.push([`› ${text.split("\n")[0].slice(0, 200)}`]);
+		// An extension command is handled without a turn: there will be no agent_settled.
+		if (r.data?.disposition === "handled") this.settle();
+	}
+
+	private settle() {
+		this.working = false;
+		for (const w of this.idleWaiters.splice(0)) w();
+		this.changed();
 	}
 
 	/** Your words to the run: steered into the work if it is running, otherwise a new turn. */
 	async steer(text: string): Promise<string | undefined> {
-		const r = await this.send(this.working ? { type: "steer", message: text } : { type: "prompt", message: text });
-		if (!r?.success) return r?.error ?? "not delivered";
-		if (!this.working) this.working = true;
+		const steering = this.working;
+		if (!steering) this.working = true;
+		const r = await this.send(steering ? { type: "steer", message: text } : { type: "prompt", message: text });
+		if (!r?.success) { if (!steering) this.settle(); return r?.error ?? "not delivered"; }
 		this.push([`› (you) ${text.slice(0, 200)}`]);
+		if (!steering && r.data?.disposition === "handled") this.settle();
 		return undefined;
 	}
 

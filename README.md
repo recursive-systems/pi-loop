@@ -44,7 +44,7 @@ Add `-l` to install it for one project only.
 /loop                         the loops view: every loop, its runs, watch and steer them
 /loop run|pause|resume|rm <id>
 /loop test <id>               run the gate once, without waking the model
-/loop watch|steer|take|cancel <id>, /loop leave|done   background runs, below
+/loop watch|steer|take|open|cancel <id>, /loop leave|done   background runs, below
 ```
 
 ## Background runs
@@ -60,8 +60,9 @@ next or to stop. Findings land in your conversation as a short note; everything 
 
 From the loops view (`/loop`) you can watch a run live and type to steer it, or go into it (`t`, or
 `/loop take <id>`): the run stops at its next step and your Pi switches into its conversation, a regular
-session. `/loop leave` brings you back and lets it carry on in the background; `/loop done` brings you
-back and ends it. `loop.maxBackground` in settings limits how many run at once (default: no limit).
+session (`/loop open <id>` does the same for a finished run). `/loop leave` brings you back and lets it
+carry on in the background; `/loop done` brings you back and ends it; leaving it any other way (`/new`,
+`/resume`) counts as `/loop leave`. `loop.maxBackground` in settings limits how many run at once (default: no limit).
 
 ## Gates
 
