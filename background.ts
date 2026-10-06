@@ -14,6 +14,16 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { LIVENESS_STATUS_KEY } from "./liveness.ts";
+
+declare const __filename: string | undefined;
+function livenessExtension(): string {
+	let source: string | undefined;
+	try { source = fileURLToPath(import.meta.url); } catch { source = typeof __filename === "string" ? __filename : undefined; }
+	if (!source) throw new Error("Couldn't locate the background-work liveness companion");
+	return path.join(path.dirname(source), "liveness.ts");
+}
 
 export type RunMode = "fork" | "thread" | "fresh";
 export const RUN_MODES: readonly RunMode[] = ["fork", "thread", "fresh"];
@@ -133,6 +143,10 @@ export class Run {
 	sessionFile?: string;
 	lines: string[] = [];
 	working = false;
+	/** Detached work or its queued completion still needs this exact session alive. */
+	backgroundWork = false;
+	livenessError?: string;
+	private livenessReady = false;
 	exited = false;
 	needsYou?: string;
 	/** Set when the run is being handed to you, so its exit is not a failure. */
@@ -170,7 +184,7 @@ export class Run {
 	async start(): Promise<void> {
 		const { cmd, args } = piCommand();
 		const model = this.opts.model ? ["--model", this.opts.model, ...(this.opts.thinking ? ["--thinking", this.opts.thinking] : [])] : [];
-		const proc = spawn(cmd, [...args, ...(this.opts.extra ?? []), "--mode", "rpc", ...this.opts.sessionArgs, ...model], { cwd: this.opts.cwd, env: this.opts.env });
+		const proc = spawn(cmd, [...args, ...(this.opts.extra ?? []), "-e", livenessExtension(), "--mode", "rpc", ...this.opts.sessionArgs, ...model], { cwd: this.opts.cwd, env: this.opts.env });
 		this.proc = proc;
 		proc.stdout.setEncoding("utf8");
 		proc.stdout.on("data", (d: string) => {
@@ -197,6 +211,8 @@ export class Run {
 		const state = await this.send({ type: "get_state" }, 60_000);
 		if (!state?.success) throw new Error(state?.error ?? "the run's Pi did not start");
 		this.sessionFile = state.data?.sessionFile;
+		if (!this.livenessReady) throw new Error("The run did not load its background-work liveness companion");
+		if (this.livenessError) throw new Error(this.livenessError);
 	}
 
 	private handle(msg: any) {
@@ -204,6 +220,13 @@ export class Run {
 			const w = this.waiting.get(msg.id)!;
 			this.waiting.delete(msg.id);
 			w(msg);
+			return;
+		}
+		if (msg.type === "extension_ui_request" && msg.method === "setStatus" && msg.statusKey === LIVENESS_STATUS_KEY) {
+			this.livenessReady = true;
+			this.backgroundWork = msg.statusText === "busy";
+			if (msg.statusText !== "busy" && msg.statusText !== "idle") this.livenessError = "Couldn't establish whether the run still owns background work";
+			this.changed();
 			return;
 		}
 		if (msg.type === "extension_ui_request" && DIALOGS.has(msg.method)) {

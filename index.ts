@@ -999,7 +999,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (run.handedOver) return;
 			if (run.exited) break;
 			await new Promise(r => setTimeout(r, 1500));
-			if (!run.working || run.exited) break;
+			if (run.exited || run.livenessError || (!run.working && !run.backgroundWork)) break;
 		}
 		if (run.handedOver) return;
 		live(cur => cur.finishRun(run.loopId, run, report));
@@ -1011,13 +1011,19 @@ export default function loopExtension(pi: ExtensionAPI) {
 		run.finishing = true;
 		const text = run.exited ? (run.sessionFile ? lastAssistantText(run.sessionFile) : undefined) : await run.lastText();
 		if (run.handedOver) return; // taken over while its answer was being read
-		const crashed = run.exited && !run.cancelled;
+		// A completion can start the next turn while get_last_assistant_text is in flight.
+		if (!run.exited && !run.cancelled && !run.livenessError && (run.working || run.backgroundWork)) {
+			run.finishing = false;
+			void watchRun(run, report);
+			return;
+		}
+		const crashed = (run.exited || !!run.livenessError) && !run.cancelled;
 		await run.stop();
 		if (run.handedOver) return;
 		const rep = readReport(report);
 		const status = run.cancelled ? "cancelled" : crashed ? "failed" : "done";
 		const findings = status === "failed" || !!run.needsYou || (rep ? rep.findings : true);
-		const summary = (crashed ? "its Pi exited before the run finished" : rep?.summary) ?? text?.split("\n").find(x => x.trim())?.trim() ?? "(no answer)";
+		const summary = (crashed ? (run.livenessError ?? "its Pi exited before the run finished") : rep?.summary) ?? text?.split("\n").find(x => x.trim())?.trim() ?? "(no answer)";
 		live(cur => cur.recordRun(id, run, { status, summary, findings, rep }));
 	}
 
@@ -1071,6 +1077,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
 		const run = shared.runs.get(l.id);
+		if (run?.backgroundWork && !now) return `${l.id}'s run is waiting for background work it started, which reports back only to that run; watch or steer it, or /loop take ${l.id} now to stop it anyway (that work may not report back)`;
 		const file = run?.sessionFile ?? l.lastRun?.session;
 		if (!file) return `${l.id} has no run to go into`;
 		// Pi opens a conversation in the folder it was started in: going into a run from another folder would move this
@@ -1085,6 +1092,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!homeFile) return "this session isn't saved, so pi-loop couldn't bring you back to it";
 		// Pi writes a conversation to disk after its first exchange; before that there is nothing to come back to.
 		if (!fs.existsSync(homeFile)) return "this conversation has nothing saved yet (Pi saves it after its first exchange), so pi-loop couldn't bring you back to it; say something here first";
+		if (run?.backgroundWork) notify(`${l.id}'s background work may not report back after you take over`, "warning");
 		if (run?.working) notify(`waiting for ${l.id}'s run to stop at its next step${now ? "" : " (up to a minute)"}…`, "info");
 		await cctx.waitForIdle?.();
 		const fireNo = run?.fire ?? l.lastRun?.fire ?? l.fires;
@@ -1229,7 +1237,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return loops.map(l => {
 			const live = shared.runs.get(l.id);
 			const r = l.lastRun;
-			const state = live ? `running in background (${live.mode}${live.working ? "" : ", idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
+			const state = live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
 			const detail = [desc(l), l.run ? `background ${l.run}` : "in conversation", l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
 				r && !live ? `last #${r.fire} ${r.status}${r.result ? `: ${r.result.split("\n")[0]}` : ""}${r.needsYou ? ` · needs you` : ""}` : ""].filter(Boolean).join(" · ");
 			return { id: l.id, state, detail, running: !!live, hasRun: !!r?.session, unread: !!r?.unread, paused: l.paused };

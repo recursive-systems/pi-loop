@@ -125,3 +125,9 @@ true only if there is something the owner should see (a background run with no f
 quiet), a one-line summary, and `next` or `stop` when the timing should change. To stop or change the loop,
 use `loop_manage` (`pause`, `delete`, `gate`), or edit its `.pi/loop.json` if it is declared there.
 Don't just ignore the loop.
+
+When the job delegates authorized async work, a compatible pi-subagents version keeps this run
+alive for the native completion. You can end the launch turn and let that notice wake the same
+conversation. Process the answer before calling `loop_report`; launching a reader is not finishing
+the job. This protects normal completion delivery, not recovery after a crash or exactly-once side
+effects. Check durable job records before any manual recovery or retry.
