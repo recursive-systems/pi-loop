@@ -1,7 +1,7 @@
 {
   "name": "pi-loop",
-  "version": "0.3.1",
-  "description": "Recurring prompts for the Pi coding agent: /loop and loop_manage, with DST-aware daily times, script gates that decide whether to wake the model, and a Herdr sidebar countdown.",
+  "version": "0.4.0",
+  "description": "Recurring prompts for the Pi coding agent: /loop and loop_manage, with DST-aware daily times, script gates that decide whether to wake the model, and background runs (a fork of the conversation, its own thread, or fresh) you can watch, steer and step into.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -11,8 +11,7 @@
     "pi-extension",
     "loop",
     "schedule",
-    "cron",
-    "herdr"
+    "cron"
   ],
   "repository": {
     "type": "git",
@@ -28,7 +27,8 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
+    "typebox": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "scripts": {
     "test": "node --experimental-strip-types --test --test-concurrency=4 tests/*.test.ts"
@@ -38,6 +38,9 @@
       "optional": true
     },
     "typebox": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
       "optional": true
     }
   }

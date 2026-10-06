@@ -7,19 +7,29 @@
 /loop at 07:30 summarize what changed overnight
 ```
 
-The prompt comes back to *the same session*, so the agent remembers what it did last time.
+The prompt comes back to *the same session*, so the agent remembers what it did last time. Or it runs
+**in the background** beside your conversation, so neither waits for the other:
+
+```
+/loop 15m --fork check the deploy and tell me if anything changed
+```
 
 - **Gates keep it cheap.** A small script runs first and decides whether there's anything worth
   waking the model for. No news, no tokens spent.
 - **Daily times follow daylight saving** in whatever time zone you set, or your machine's.
 - **Loops survive restarts.** They're saved in `.pi/loops.json`.
+- **Quiet unless there's news.** A background run says what it found with `loop_report`; a run with
+  nothing to report leaves no trace in your conversation.
+- **The agent can watch something for you.** A loop can pick its own next time (`auto`: every 2 minutes
+  while a deploy runs, an hour when it's quiet) and end itself when it's done. Loops made on the fly end
+  after 7 days unless they say otherwise.
 - **You can ask in plain words**: "every morning at 9, triage new issues" works too. The package
   ships a skill that teaches the agent to gate frequent loops and keep instructions in a template.
 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.3.1
+pi install git:github.com/recursive-systems/pi-loop@v0.4.0
 ```
 
 Add `-l` to install it for one project only.
@@ -27,12 +37,31 @@ Add `-l` to install it for one project only.
 ## Commands
 
 ```
-/loop [5m|2h|1d] <prompt>     repeat every interval (default 10m)
+/loop [5m|2h|1d|auto] <prompt>        repeat every interval (default 10m), or when each run says
 /loop at 07:30 [Area/City] <prompt>   daily, in that zone or your default
-/loop                         list
+      --fork | --thread | --fresh     run in the background (see below)
+      --for 2d | --until <time>       how long it lives (default 7 days)
+/loop                         the loops view: every loop, its runs, watch and steer them
 /loop run|pause|resume|rm <id>
 /loop test <id>               run the gate once, without waking the model
+/loop watch|steer|take|cancel <id>, /loop leave|done   background runs, below
 ```
+
+## Background runs
+
+A loop with `run` set does its work in a separate Pi beside your conversation:
+
+- `fork`: a copy of your conversation as it is when the loop fires, so it knows what you've been doing.
+- `thread`: the loop's own conversation, continued every run.
+- `fresh`: a new conversation each run.
+
+Each run ends with `loop_report`: whether it found something, one line, and optionally when to run
+next or to stop. Findings land in your conversation as a short note; everything else stays out of it.
+
+From the loops view (`/loop`) you can watch a run live and type to steer it, or go into it (`t`, or
+`/loop take <id>`): the run stops at its next step and your Pi switches into its conversation, a regular
+session. `/loop leave` brings you back and lets it carry on in the background; `/loop done` brings you
+back and ends it. `loop.maxBackground` in settings limits how many run at once (default: no limit).
 
 ## Gates
 
@@ -83,13 +112,6 @@ Log each decision to `$LOOP_STATE_DIR` so you can tune the thresholds later.
 {"loops": [{"id": "api-check", "prompt": "/check", "every": "5m", "gate": ".pi/gates/check", "context": ["AGENTS.md"]}]}
 ```
 
-## Running loops with no session open
-
-[herdr-pi-loops](https://github.com/recursive-systems/herdr-pi-loops) is a Herdr plugin that runs
-declared loops for you: each role folder gets a pane, Pi starts there only for a turn, and one
-dashboard shows every loop. A scheduler like it embeds this extension with `mode: "host"` in the
-context it passes, and then serves only that folder's own `.pi/loop.json`.
-
 ## Good to know
 
 - Loops run only while a Pi session is open in the project. For anything that must never be
@@ -99,8 +121,6 @@ context it passes, and then serves only that folder's own `.pi/loop.json`.
   session loses the lock, it stops changing loops at once and takes them back once the lock is free.
 - The default time zone is your machine's. Set another in `.pi/settings.json` with
   `{"loop": {"timezone": "<Area/City>"}}`, using any IANA name, such as `Asia/Tokyo`.
-- In [Herdr](https://herdr.dev), the sidebar can show a countdown to the next loop: add the
-  `$loop` token to your agent rows.
 - Every run starts with `[loop <id> · <schedule> · fire #N]`, which you can rely on.
 
 ## Tests
