@@ -1023,3 +1023,38 @@ test("a run that asks for a dialog: declined, and it says it needs you; a comman
 	assert.equal(r.unread, true);
 	assert.match(await untilNote(pi, "its note", 30_000), /needs you/);
 });
+
+
+test("opening a finished run to read it and leaving with /new starts nothing in it", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	await pi.ask("hello", 60_000);
+	await pi.command("/loop 1h --fresh say hi");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const run = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	const asked = () => fs.readFileSync(run.session, "utf8").split("\n").filter(l => l.includes('"role":"user"')).length;
+	const before = asked();
+	await pi.command(`/loop open ${id}`);
+	await untilAsync("in the run", async () => (await mainFile(pi)) === run.session);
+	assert.equal((await pi.send({ type: "new_session" })).success, true);
+	await until("recorded as done again", () => loopOf(p, id)?.lastRun?.status === "done", 30_000);
+	await new Promise(r => setTimeout(r, 4000));
+	assert.equal(asked(), before, "no new turn in the run you only read");
+	assert.doesNotMatch(await listOf(pi), /running in background/);
+});
+
+test("a skill as a background loop's prompt keeps the loop's header (and the run inherits -a, trusting the project's skills)", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t, ["-a"]);
+	fs.mkdirSync(path.join(p.cwd, ".pi/skills/echo"), { recursive: true });
+	fs.writeFileSync(path.join(p.cwd, ".pi/skills/echo/SKILL.md"), "---\nname: echo\ndescription: Say what you are asked to say. Use for e2e tests.\n---\n\nSay the words you are given.\n");
+	await pi.send({ type: "prompt", message: "/reload" });
+	await new Promise(r => setTimeout(r, 2000));
+	await pi.command("/loop 1h --fresh /skill:echo hello");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const run = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	const user = fs.readFileSync(run.session, "utf8").split("\n").find(l => l.includes('"role":"user"')) ?? "";
+	assert.match(user, /Say the words you are given/, "the skill was expanded");
+	assert.match(user, new RegExp(`\\[loop ${id} ·`), "with the loop's header");
+	assert.match(user, /loop_report/, "and the report hint");
+});

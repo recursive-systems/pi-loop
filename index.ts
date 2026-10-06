@@ -59,7 +59,7 @@ const CONTINUE_NOTE = "[loop] The owner stepped out. Carry on from where you are
 const MAX_NEXT_MS = 7 * 24 * 60 * 60_000;
 
 /** Process-wide: background runs and the folder lock outlive one extension instance (Pi rebuilds extensions on /new, /resume and session switches). */
-interface Away { id: string; file: string; home: string; homeId?: string; fire: number; mode: RunMode; report: string }
+interface Away { id: string; file: string; home: string; homeId?: string; fire: number; mode: RunMode; report: string; /** It was running when you went in (not just opened to read). */ live?: boolean }
 interface Note { content: string; details: Record<string, unknown> }
 interface Shared {
 	lock?: FolderLock; lockPath?: string;
@@ -734,7 +734,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const composed = runText(l, fireNo, reason, gate, s.mode);
 		// A command (not a prompt template here) runs only as its own message: Pi doesn't read "/cmd" followed by the
 		// header on new lines as that command. It then has no header or report hint; what it does is its own.
-		const text = composed.expand && l.prompt.startsWith("/") ? l.prompt : composed.text;
+		// A skill (/skill:name) reads its name up to the first space, so the header can follow on the same line.
+		const head = `[loop ${l.id} · ${desc(l)} · fire #${fireNo} · background ${s.mode}${reason === "due" ? "" : ` · ${reason}`}${gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : ""}]`;
+		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
+		const text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
+			: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
 		const run = new Run(l.id, fireNo, s.mode, { cwd: ctx!.cwd, sessionArgs: s.args, ...modelArgs(), env: childEnv(l, report) });
 		shared.runs.set(l.id, run);
 		if (reason !== "manual" || l.nextAt <= now) l.nextAt = nextFor(l, now);
@@ -782,7 +786,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const retry = cur.startFailures <= 3;
 		if (gate) cur.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: Date.now(), rev: cur.rev ?? 0 };
 		else if (retry) cur.nextAt = Math.min(cur.nextAt, Date.now() + 2 * 60_000);
-		cur.lastRun = { fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid };
+		// A run started again on its own conversation (leave, steer) keeps that conversation: it can still be opened.
+		const session = run.sessionFile ?? (cur.lastRun?.fire === run.fire ? cur.lastRun?.session : undefined);
+		cur.lastRun = { fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid, ...(session ? { session } : {}) };
 		save(); refreshStatus();
 		notify(`loop ${id}: its background run couldn't start (${why}); ${gate || retry ? "it is tried again soon" : "it runs again at its next time"}`, "warning");
 	}
@@ -808,6 +814,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (run.handedOver) return; // taken over while its answer was being read
 		const crashed = run.exited && !run.cancelled;
 		await run.stop();
+		if (run.handedOver) return;
 		if (shared.runs.get(id) === run) shared.runs.delete(id);
 		const l = loops.find(x => x.id === id);
 		const rep = readReport(report);
@@ -877,7 +884,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			shared.runs.delete(l.id);
 		}
 		l.lastRun = { ...(l.lastRun ?? { fire: fireNo, mode: l.run ?? "fresh", startedAt: Date.now() }), status: "away", session: file, unread: false, host: process.pid };
-		const away: Away = { id: l.id, file, home: homeFile, homeId: ctx!.sessionManager.getSessionId?.(), fire: fireNo, mode: l.lastRun.mode, report: reportFileOf(l, fireNo) };
+		const away: Away = { id: l.id, file, home: homeFile, homeId: ctx!.sessionManager.getSessionId?.(), fire: fireNo, mode: l.lastRun.mode, report: reportFileOf(l, fireNo), live: !!run };
 		shared.away = away;
 		save(); refreshStatus();
 		const res = await cctx.switchSession(file, { withSession: async (c: any) => {
@@ -1213,6 +1220,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		syncDeclared();
 		expire(now);
 		for (const id of waited.keys()) if (!loops.some(l => l.id === id && !l.paused)) waited.delete(id);
+		for (const id of slotWait) if (!loops.some(l => l.id === id && !l.paused)) slotWait.delete(id);
 		// A kept wake whose loop was redefined since is about the old definition: drop it.
 		for (const l of loops) if (l.pendingWake && l.pendingWake.rev !== (l.rev ?? 0)) { delete l.pendingWake; save(); }
 		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && shared.away?.id !== l.id && (l.nextAt <= now || l.pendingWake));
@@ -1303,7 +1311,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		loops = load();
 		maxBackground = configuredMaxBackground(c.cwd);
 		waited.clear(); declaredSeen = undefined; declaredErrors.clear();
-		shared.current = { finishRun, afterLeave, runStarted, runFailed } as any;
+		const self: Instance = { finishRun, afterLeave, runStarted, runFailed };
+		// Run events go to this instance only once it holds the folder's lock (until then they wait in shared.pending).
+		if (shared.current?.finishRun !== finishRun) shared.current = undefined;
 		// The same process switching sessions (/new, /resume, going into a loop's run) keeps the folder's lock:
 		// releasing it for a moment would let another session here take the loops.
 		// You were in a run's conversation and went somewhere else than with /loop leave or /loop done (/new, /resume,
@@ -1312,13 +1322,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (shared.away && now !== shared.away.file) {
 			const a = shared.away;
 			shared.away = undefined;
-			shared.pending.push(cur => cur.afterLeave(a, false));
+			// A run that was going carries on; one you only opened to read stays finished.
+			shared.pending.push(cur => cur.afterLeave(a, !a.live));
 		}
 		const kept = shared.lock && shared.lockPath === lock && shared.lock.mine() ? shared.lock : undefined;
 		if (kept) {
 			folderLock = kept;
 			readOnly = false;
 			syncDeclared(); reconcile();
+			shared.current = self;
 			drain();
 		} else {
 			// A claim the previous instance still had going would otherwise hold the lock for nobody.
@@ -1326,7 +1338,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			folderLock = new FolderLock(lock, {}, () => lostLock());
 			shared.lock = folderLock; shared.lockPath = lock;
 			readOnly = true;
-			claimLock(() => { loops = load(); syncDeclared(); reconcile(); interrupted(); refreshStatus(); drain(); });
+			claimLock(() => { loops = load(); syncDeclared(); reconcile(); interrupted(); refreshStatus(); shared.current = self; drain(); });
 		}
 		if (timer) clearInterval(timer);
 		timer = setInterval(tick, TICK_MS);
@@ -1419,7 +1431,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	// -------------------------------------------------------------- command --
 
 	pi.registerCommand("loop", {
-		description: "Recurring prompts: /loop [10m|2h|1d|at HH:MM [Area/City]] <prompt> · /loop (the loops view) · /loop rm|pause|resume|run|test|watch|take|cancel <id> · /loop steer <id> <text> · /loop leave|done · /loop clear",
+		description: "Recurring prompts: /loop [10m|2h|1d|at HH:MM [Area/City]] <prompt> · /loop (the loops view) · /loop rm|pause|resume|run|test|watch|take|open|cancel <id> · /loop steer <id> <text> · /loop leave|done · /loop clear",
 		handler: async (args: string, commandCtx?: ExtensionContext) => {
 			refreshZone();
 			const trimmed = args.trim();
@@ -1457,7 +1469,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 					case "test": notify(await testGate(target, commandCtx)); return;
 					case "run": case "now": {
 						if (readOnly) { notify(`loops are owned by pid ${ownerPid()}`, "warning"); return; }
-						const l = find(target)!; const err = fire(l, "manual"); if (!err) notify(`fired ${l.id}`); return;
+						const l = find(target)!; const err = fire(l, "manual"); notify(err ?? `fired ${l.id}`); return;
 					}
 				}
 			}
