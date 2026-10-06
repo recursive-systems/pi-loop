@@ -139,6 +139,10 @@ export class Run {
 	handedOver = false;
 	/** Set while its result is being collected; your words then wait and start it again. */
 	finishing = false;
+	/** Its outcome has been recorded (once, by whichever instance is live). */
+	recorded = false;
+	/** Turns started so far: a command's own turn may begin before or after Pi answers "handled". */
+	private starts = 0;
 	cancelled = false;
 	private buf = "";
 	private seq = 0;
@@ -209,7 +213,7 @@ export class Run {
 			this.push([`  ! declined a ${msg.method} (needs you): ${String(msg.title ?? "").slice(0, 100)}`]);
 			return;
 		}
-		if (msg.type === "agent_start") { this.working = true; this.changed(); return; }
+		if (msg.type === "agent_start") { this.starts++; this.working = true; this.changed(); return; }
 		if (msg.type === "agent_settled") { this.settle(); return; }
 		if (msg.type === "message_end" && msg.message) this.push(messageLines(msg.message));
 	}
@@ -232,11 +236,20 @@ export class Run {
 	/** Start the loop's work; resolves once Pi accepted it. */
 	async prompt(text: string): Promise<void> {
 		this.working = true;
+		const before = this.starts;
 		const r = await this.send({ type: "prompt", message: text });
 		if (!r?.success) { this.working = false; throw new Error(r?.error ?? "the run's Pi refused the prompt"); }
 		this.push([`› ${text.split("\n")[0].slice(0, 200)}`]);
-		// An extension command is handled without a turn: there will be no agent_settled.
-		if (r.data?.disposition === "handled") this.settle();
+		// An extension command is handled without a turn: there will be no agent_settled, unless the command
+		// started one itself (before or shortly after its answer).
+		if (r.data?.disposition === "handled") this.settleUnlessStarted(before);
+	}
+
+	/** Settle a handled command unless it started a turn of its own, now or within a few seconds. */
+	private settleUnlessStarted(before: number) {
+		if (this.starts > before) return;
+		const t = setTimeout(() => { if (this.starts === before && this.working) this.settle(); }, 3_000);
+		t.unref?.();
 	}
 
 	private settle() {
@@ -248,11 +261,12 @@ export class Run {
 	/** Your words to the run: steered into the work if it is running, otherwise a new turn. */
 	async steer(text: string): Promise<string | undefined> {
 		const steering = this.working;
+		const before = this.starts;
 		if (!steering) this.working = true;
 		const r = await this.send(steering ? { type: "steer", message: text } : { type: "prompt", message: text });
 		if (!r?.success) { if (!steering) this.settle(); return r?.error ?? "not delivered"; }
 		this.push([`› (you) ${text.slice(0, 200)}`]);
-		if (!steering && r.data?.disposition === "handled") this.settle();
+		if (!steering && r.data?.disposition === "handled") this.settleUnlessStarted(before);
 		return undefined;
 	}
 

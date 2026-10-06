@@ -1059,3 +1059,14 @@ test("a skill as a background loop's prompt keeps the loop's header (and the run
 	assert.match(user, new RegExp(`\\[loop ${id} ·`), "with the loop's header");
 	assert.match(user, /loop_report/, "and the report hint");
 });
+
+
+test("a background run's conversations are filed under its loop's folder (--<folder>-loop-<id>--)", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	fs.mkdirSync(path.join(p.cwd, "svc/.pi"), { recursive: true });
+	fs.writeFileSync(path.join(p.cwd, "svc/.pi/loop.json"), JSON.stringify({ loops: [{ id: "svc-check", prompt: "say hi", every: "1h", run: "fresh" }] }));
+	await until("the declared loop", () => loopOf(p, "svc-check"), 30_000);
+	await pi.command("/loop run svc-check");
+	const r = await until("the run done", () => loopOf(p, "svc-check")?.lastRun?.status === "done" && loopOf(p, "svc-check").lastRun, 60_000);
+	assert.match(path.basename(path.dirname(r.session)), /-svc-loop-svc-check--$/, r.session);
+});

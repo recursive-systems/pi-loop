@@ -61,6 +61,8 @@ const MAX_NEXT_MS = 7 * 24 * 60 * 60_000;
 /** Process-wide: background runs and the folder lock outlive one extension instance (Pi rebuilds extensions on /new, /resume and session switches). */
 interface Away { id: string; file: string; home: string; homeId?: string; fire: number; mode: RunMode; report: string; /** It was running when you went in (not just opened to read). */ live?: boolean }
 interface Note { content: string; details: Record<string, unknown> }
+/** What a finished run came to, collected before it is recorded. */
+interface Outcome { status: RunRecord["status"]; summary: string; findings: boolean; rep?: Report }
 interface Shared {
 	lock?: FolderLock; lockPath?: string;
 	runs: Map<string, Run>;
@@ -68,6 +70,8 @@ interface Shared {
 	again: Set<string>;
 	/** You are in this loop run's conversation (taken over); the main session waits. */
 	away?: Away;
+	/** You are on your way back from it: notes and turns wait until you are there. */
+	leaving?: Away;
 	/** Findings that came in while you were away, delivered when you are back. */
 	notes: Note[];
 	/** The live extension instance: finished runs report to it, whichever instance started them. */
@@ -77,6 +81,7 @@ interface Shared {
 }
 interface Instance {
 	finishRun(id: string, run: Run, report: string): Promise<void>;
+	recordRun(id: string, run: Run, outcome: Outcome): void;
 	afterLeave(a: Away, finish: boolean): Promise<void>;
 	runStarted(id: string, run: Run, note?: string): void;
 	runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision): void;
@@ -344,7 +349,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	};
 	const stateDirOf = (l: Loop) => path.join(home(l), ".pi", "loop-state", l.id);
 	/** Busy: a run, compaction or queued prompt, or a loop turn of ours not finished yet. */
-	const busy = () => { if (shared.away) return true; try { return !ctx!.isIdle() || !!ctx!.hasPendingMessages?.() || !!phase; } catch { return true; } };
+	const busy = () => { if (shared.away || shared.leaving) return true; try { return !ctx!.isIdle() || !!ctx!.hasPendingMessages?.() || !!phase; } catch { return true; } };
 	let maxBackground = 0;
 	const overLimit = () => maxBackground > 0 && shared.runs.size >= maxBackground;
 	/** Background loops waiting for a slot (to say so, rather than "waiting for this session"). */
@@ -688,7 +693,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// Beside this session's folder: Pi's own per-project folder (--<cwd>--), or the --session-dir it was given.
 		const own = main ? path.dirname(main) : undefined;
 		const root = !own ? path.join(agentDir(), "sessions") : /^--.*--$/.test(path.basename(own)) ? path.dirname(own) : own;
-		const dir = sessionFolder(root, fs.realpathSync(ctx!.cwd), `-loop-${l.id}`);
+		// Named after the loop's own folder (the project, or its dir): --<folder>-loop-<id>--, so tools that read
+		// session folders can tell whose job a run was.
+		const dir = sessionFolder(root, fs.realpathSync(home(l)), `-loop-${l.id}`);
 		if (mode === "fork" && !main) return { args: ["--session-dir", dir], mode: "fresh", note: "this session isn't saved, so it ran fresh" };
 		if (mode === "fork") return { args: ["--fork", main!, "--session-dir", dir], mode };
 		if (mode === "thread") return { args: ["--session-dir", dir, "--continue"], mode };
@@ -806,33 +813,40 @@ export default function loopExtension(pi: ExtensionAPI) {
 		live(cur => cur.finishRun(run.loopId, run, report));
 	}
 
-	/** A run is over: record it, apply what it reported, and tell the owner only when it found something. */
+	/** A run is over: collect what it came to, then have the live instance record it (a switch may happen meanwhile). */
 	async function finishRun(id: string, run: Run, report: string) {
-		if (run.handedOver) return;
+		if (run.handedOver || run.recorded || run.finishing) return;
 		run.finishing = true;
 		const text = run.exited ? (run.sessionFile ? lastAssistantText(run.sessionFile) : undefined) : await run.lastText();
 		if (run.handedOver) return; // taken over while its answer was being read
 		const crashed = run.exited && !run.cancelled;
 		await run.stop();
 		if (run.handedOver) return;
-		if (shared.runs.get(id) === run) shared.runs.delete(id);
-		const l = loops.find(x => x.id === id);
 		const rep = readReport(report);
 		const status = run.cancelled ? "cancelled" : crashed ? "failed" : "done";
 		const findings = status === "failed" || !!run.needsYou || (rep ? rep.findings : true);
 		const summary = (crashed ? "its Pi exited before the run finished" : rep?.summary) ?? text?.split("\n").find(x => x.trim())?.trim() ?? "(no answer)";
-		const rec: RunRecord = { fire: run.fire, mode: run.mode, status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
-			result: summary.slice(0, 2000), findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), unread: findings && status !== "cancelled" };
+		live(cur => cur.recordRun(id, run, { status, summary, findings, rep }));
+	}
+
+	/** Record a finished run once: its record, what it reported, again, and a note only if it found something. */
+	function recordRun(id: string, run: Run, o: Outcome) {
+		if (run.recorded) return;
+		run.recorded = true;
+		if (shared.runs.get(id) === run) shared.runs.delete(id);
+		const l = loops.find(x => x.id === id);
+		const rec: RunRecord = { fire: run.fire, mode: run.mode, status: o.status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
+			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), unread: o.findings && o.status !== "cancelled" };
 		if (l) {
 			l.lastRun = rec;
-			if (status === "done" && rep) applyReport(l, rep);
+			if (o.status === "done" && o.rep) applyReport(l, o.rep);
 			// Due again while it ran: once more now, unless the run chose its own next time (or the loop paces itself).
-			const again = shared.again.delete(id) && !rep?.next && l.schedule.kind !== "auto";
+			const again = shared.again.delete(id) && !o.rep?.next && l.schedule.kind !== "auto";
 			if (again && loops.includes(l) && !l.paused) l.nextAt = Math.min(l.nextAt, Date.now());
 			save(); refreshStatus();
 		}
-		if (rec.unread) deliver({ content: `[loop ${id} · background ${run.mode} · run #${run.fire} · ${status}] ${rec.result}${rec.needsYou ? `\nneeds you: ${rec.needsYou}` : ""}${rec.session ? `\n(/loop open ${id} to go into it)` : ""}`,
-			details: { id, fire: run.fire, mode: run.mode, status, session: rec.session } });
+		if (rec.unread) deliver({ content: `[loop ${id} · background ${run.mode} · run #${run.fire} · ${o.status}] ${rec.result}${rec.needsYou ? `\nneeds you: ${rec.needsYou}` : ""}${rec.session ? `\n(/loop open ${id} to go into it)` : ""}`,
+			details: { id, fire: run.fire, mode: run.mode, status: o.status, session: rec.session } });
 	}
 
 	/** A loop_report's next / stop. */
@@ -850,7 +864,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** Findings into the main conversation, quietly (no turn); kept until you are back if you are in a run. */
 	function deliver(n: Note) {
-		if (shared.away) { shared.notes.push(n); return; }
+		if (shared.away || shared.leaving) { shared.notes.push(n); return; }
 		try {
 			pi.sendMessage({ customType: "loop-result", content: n.content, display: true, details: n.details }, busy() ? { deliverAs: "nextTurn" } : undefined);
 		} catch { shared.notes.push(n); }
@@ -887,9 +901,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const away: Away = { id: l.id, file, home: homeFile, homeId: ctx!.sessionManager.getSessionId?.(), fire: fireNo, mode: l.lastRun.mode, report: reportFileOf(l, fireNo), live: !!run };
 		shared.away = away;
 		save(); refreshStatus();
-		const res = await cctx.switchSession(file, { withSession: async (c: any) => {
-			try { c.ui.notify(`You are in ${l.id}'s run #${fireNo}. /loop leave lets it carry on in the background; /loop done finishes it; both bring you back.`, "info"); } catch { /* no UI */ }
-		} });
+		let res: any;
+		try {
+			res = await cctx.switchSession(file, { withSession: async (c: any) => {
+				try { c.ui.notify(`You are in ${l.id}'s run #${fireNo}. /loop leave lets it carry on in the background; /loop done finishes it; both bring you back.`, "info"); } catch { /* no UI */ }
+			} });
+		} catch { res = { cancelled: true }; }
 		if (res?.cancelled) {
 			// The switch didn't happen: you are still here, so the run carries on in the background.
 			shared.away = undefined;
@@ -904,15 +921,20 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const a = shared.away;
 		if (!a) return "you are not in a loop's run";
 		await cctx.waitForIdle?.();
-		// Cleared before the switch, so the session that starts there doesn't read it as leaving some other way.
+		// Cleared before the switch, so the session that starts there doesn't read it as leaving some other way;
+		// `leaving` holds notes and turns until you are there.
 		shared.away = undefined;
-		const res = await cctx.switchSession(a.home, { withSession: async (c: any) => {
-			try { c.ui.notify(finish ? `Back. ${a.id}'s run is finished.` : `Back. ${a.id}'s run carries on in the background.`, "info"); } catch { /* no UI */ }
-		} });
-		if (res?.cancelled) { shared.away = a; return "couldn't switch back"; }
+		shared.leaving = a;
+		let res: any;
+		try {
+			res = await cctx.switchSession(a.home, { withSession: async (c: any) => {
+				try { c.ui.notify(finish ? `Back. ${a.id}'s run is finished.` : `Back. ${a.id}'s run carries on in the background.`, "info"); } catch { /* no UI */ }
+			} });
+		} catch (e) { res = { cancelled: true, error: (e as Error).message }; }
+		if (res?.cancelled) { shared.leaving = undefined; shared.away = a; return `couldn't switch back${res.error ? `: ${res.error}` : ""}; you are still in ${a.id}'s run`; }
 		// The instance that runs from here on picks this up (Pi rebuilds extensions on a switch). Not awaited: you
 		// are back at once; the run carries on by itself.
-		live(cur => cur.afterLeave(a, finish));
+		live(cur => { shared.leaving = undefined; return cur.afterLeave(a, finish); });
 		return undefined;
 	}
 
@@ -954,7 +976,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		await run.stop();
 		// Its watcher records it; if none is left to (a lost event), record it here.
 		await new Promise(r => setTimeout(r, 2500));
-		if (shared.runs.get(l!.id) === run) await finishRun(l!.id, run, reportFileOf(l!, run.fire));
+		if (shared.runs.get(l!.id) === run && !run.recorded) live(cur => cur.finishRun(l!.id, run, reportFileOf(l!, run.fire)));
 		return `stopped ${l!.id}'s run #${run.fire}`;
 	}
 
@@ -968,7 +990,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			while (shared.runs.get(l!.id) === run && Date.now() < end) await new Promise(r => setTimeout(r, 200));
 			run = shared.runs.get(l!.id);
 		}
-		if (!run && l?.lastRun?.session && !readOnly && shared.away?.id !== l.id) return resumeRun(l, text);
+		if (!run && l && loops.includes(l) && l.lastRun?.session && !readOnly && shared.away?.id !== l.id) return resumeRun(l, text);
 		if (!run) return `${l?.id ?? id} has no run in the background${l?.lastRun?.session ? `; /loop open ${l.id} goes into its last one` : ""}`;
 		const err = await run.steer(text);
 		return err ? `couldn't steer ${l!.id}: ${err}` : `sent to ${l!.id}'s run #${run.fire}`;
@@ -1311,7 +1333,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		loops = load();
 		maxBackground = configuredMaxBackground(c.cwd);
 		waited.clear(); declaredSeen = undefined; declaredErrors.clear();
-		const self: Instance = { finishRun, afterLeave, runStarted, runFailed };
+		const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed };
 		// Run events go to this instance only once it holds the folder's lock (until then they wait in shared.pending).
 		if (shared.current?.finishRun !== finishRun) shared.current = undefined;
 		// The same process switching sessions (/new, /resume, going into a loop's run) keeps the folder's lock:
