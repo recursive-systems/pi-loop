@@ -29,7 +29,7 @@ The prompt comes back to *the same session*, so the agent remembers what it did 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.5.0
+pi install git:github.com/recursive-systems/pi-loop@v0.5.1
 ```
 
 Add `-l` to install it for one project only.
@@ -65,6 +65,12 @@ loops itself, so such a run doesn't start.
 
 Each run ends with `loop_report`: whether it found something, one line, and optionally when to run
 next or to stop. Findings land in your conversation as a short note; everything else stays out of it.
+
+A run stays alive while a compatible extension reports outstanding background work or a pending
+completion notice. With pi-subagents (session-liveness v1 support), an async reader can finish and
+wake the same run to process its answer. Report completion only after that processing, not after
+launching the reader. This does not make arbitrary detached shell commands durable or external
+side effects exactly once; cancelling a loop is not a promise to cancel its detached descendants.
 
 From the loops view (`/loop`) you can watch a run live and type to steer it, or go into it (`t`, or
 `/loop take <id>`): the run stops at its next step and your Pi switches into its conversation, a regular
@@ -145,6 +151,8 @@ For an existing Pi gateway connection, also set `PI_E2E_MODELS_FILE` and
 Pi reads authentication directly; credentials are not printed. Use synthetic test data only.
 Without an explicit model selection, those tests skip. There is no automatic provider fallback.
 Run one case first with Node's `--test-name-pattern`, then use `--test-concurrency=1`
-to avoid parallel model load.
+to avoid parallel model load. The async handoff regression also needs `PI_E2E_SUBAGENTS`, an absolute
+path to the installed real pi-subagents extension (`index.js`); it starts a harmless reader against
+the selected model and checks that its native completion is processed once in the original loop.
 
 MIT

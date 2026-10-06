@@ -7,7 +7,9 @@ schedule. Optional gate scripts decide whether a due loop wakes the model.
   one-owner-per-folder lock (an OS lock held by a small Perl helper; hosts use it too). `schedule.ts`
   holds intervals, daily times and DST. `gate.ts` runs gates. `prompt.ts` builds a fire's
   message. `background.ts` runs a loop's turn in a child Pi over RPC (fork, thread or fresh) and
-  `view.ts` is the loops view. Background runs and the folder lock live process-wide (`shared` in
+  `view.ts` is the loops view. `liveness.ts` is explicitly loaded in each RPC child: it implements the
+  optional session-liveness v1 host contract and sends only busy/idle/error, so a settled turn with
+  detached work or queued completions is not mistaken for a completed loop. Background runs and the folder lock live process-wide (`shared` in
   `index.ts`), because Pi rebuilds extensions on every session switch.
 - What an agent using pi-loop knows comes in three layers. Keep each short and consistent with the others:
   1. Always in context: `loop_manage`'s description, `promptSnippet` and `promptGuidelines` in `index.ts`.

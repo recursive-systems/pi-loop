@@ -742,6 +742,64 @@ async function untilNote(pi: Pi, what: string, ms = 240_000) {
 const lockPid = (cwd: string) => Number(fs.readFileSync(path.join(cwd, ".pi/loops.lock"), "utf8").trim().split(/\s+/)[0]);
 const REPORT = (findings: boolean, summary: string, extra = "") => `Then call loop_report with findings ${findings} and summary "${summary}"${extra}. Do nothing else.`;
 
+test("a fresh loop stays alive for an async reader and consumes its completion once", { skip: real, timeout: 480_000 }, async t => {
+	const subagents = process.env.PI_E2E_SUBAGENTS;
+	if (!subagents || !fs.existsSync(subagents)) return t.skip("set PI_E2E_SUBAGENTS to the installed real pi-subagents extension");
+	const { p, pi } = await bgSession(t, { files: {
+		".pi/agents/loop-reader.md": "---\nname: loop-reader\ndescription: Harmless integration-test reader\ntools: bash\n---\nPerform only the supplied synthetic test task. Never delegate.\n",
+	} }, { extensions: [subagents] });
+	const finished = path.join(p.cwd, "reader-finished.txt"), consumed = path.join(p.cwd, "reader-consumed.txt");
+	const task = `Use bash once to run: sleep 35; printf READER_RESULT > ${finished}. Then return exactly READER_RESULT. No other work.`;
+	const prompt = `This is a two-phase integration test. First call subagent action list with capabilities true. ` +
+		`Then launch exactly one loop-reader using subagent, async true, context fresh, model ${PROVIDER}/${MODEL}, task ${JSON.stringify(task)}. ` +
+		`After launch, end this turn with exactly WAITING_FOR_READER. Do not call loop_report yet, do not poll or wait, do not start another child. ` +
+		`When the native background completion notice arrives in a later turn, consume it once: use bash to append exactly one line READER_RESULT to ${consumed}. ` +
+		`Only then call loop_report with findings false and summary READER_CONSUMED. Never report the launch as completed work.`;
+	await pi.command(`/loop 1h --fresh ${prompt}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	// While the run waits for its reader, stepping in would strand the reader's completion: refused.
+	const launchEnded = () => {
+		const f = loopOf(p, id)?.lastRun?.session;
+		if (!f || !fs.existsSync(f) || fs.existsSync(finished)) return false;
+		return fs.readFileSync(f, "utf8").trim().split("\n").map(l => JSON.parse(l)).some(e =>
+			e.type === "message" && e.message?.role === "assistant" && JSON.stringify(e.message.content).includes("WAITING_FOR_READER"));
+	};
+	await until("the launch turn ended", launchEnded, 240_000);
+	await new Promise(r => setTimeout(r, 2_000));
+	assert.match(await pi.command(`/loop take ${id}`), /waiting for background work/);
+	assert.equal(loopOf(p, id).lastRun.status, "running", "still its own run after the refused takeover");
+	await until("the actual reader completes", () => fs.existsSync(finished), 360_000);
+	await until("the loop finishes", () => loopOf(p, id)?.lastRun?.status === "done", 120_000);
+	const run = loopOf(p, id).lastRun;
+	assert.equal(run.result, "READER_CONSUMED", "the launch-only turn must not finish the loop");
+	assert.equal(run.findings, false);
+	assert.equal(fs.readFileSync(consumed, "utf8").trim(), "READER_RESULT", "one completion, processed once");
+	const entries = fs.readFileSync(run.session, "utf8").trim().split("\n").map(l => JSON.parse(l));
+	const texts = entries.filter(e => e.type === "message").map(e => JSON.stringify(e.message));
+	assert.ok(texts.some(s => s.includes("WAITING_FOR_READER")), "the launching model really ended its first turn");
+	assert.equal(entries.filter(e => e.type === "custom_message" && e.customType === "subagent-notify").length, 1,
+		"one native completion reached the original loop session");
+});
+
+test("a background run may use another extension's synchronous subagent tool", { skip: real, timeout: 300_000 }, async t => {
+	const tool = path.join(tmp(t, "pi-loop-e2e-tool-"), "sync-subagent.ts");
+	fs.writeFileSync(tool, `import { Type } from "typebox";
+export default function (pi: any) {
+	pi.registerTool({ name: "subagent", label: "Sync subagent", description: "A synchronous test helper named subagent; returns SYNC_OK.",
+		parameters: Type.Object({}), async execute() { return { content: [{ type: "text", text: "SYNC_OK" }], details: undefined }; } });
+}
+`);
+	const { p, pi } = await bgSession(t, {}, { extensions: [tool] });
+	await pi.command(`/loop 1h --fresh Call the subagent tool once with no arguments. ${REPORT(false, "SYNC_OK")}`);
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run finishes", () => ["done", "failed"].includes(loopOf(p, id)?.lastRun?.status), 240_000);
+	const run = loopOf(p, id).lastRun;
+	assert.equal(run.status, "done", JSON.stringify(run));
+	assert.equal(run.result, "SYNC_OK");
+});
+
 test("a fork loop runs beside the conversation, sees it, and its findings come back as a quiet note", { skip: real, timeout: 420_000 }, async t => {
 	const { p, pi } = await bgSession(t);
 	await pi.ask("Remember this code word: KUMQUAT. Reply with just ok.");
