@@ -1070,3 +1070,36 @@ test("a background run's conversations are filed under its loop's folder (--<fol
 	const r = await until("the run done", () => loopOf(p, "svc-check")?.lastRun?.status === "done" && loopOf(p, "svc-check").lastRun, 60_000);
 	assert.match(path.basename(path.dirname(r.session)), /-svc-loop-svc-check--$/, r.session);
 });
+
+
+test("a thread loop with its own folder carries on from its 0.4.0 folder (--<cwd>-loop-<id>--), moved once", { timeout: 180_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	fs.mkdirSync(path.join(p.cwd, "op/.pi"), { recursive: true });
+	fs.writeFileSync(path.join(p.cwd, "op/.pi/loop.json"), JSON.stringify({ loops: [{ id: "op-check", prompt: "say hi", every: "1h", run: "thread" }] }));
+	await until("the declared loop", () => loopOf(p, "op-check"), 30_000);
+	await pi.command("/loop run op-check");
+	const first = await until("the first run done", () => loopOf(p, "op-check")?.lastRun?.status === "done" && loopOf(p, "op-check").lastRun, 60_000);
+	const now = path.dirname(first.session);
+	// As 0.4.0 left it: the thread under the session's cwd name.
+	const legacy = path.join(path.dirname(now), path.basename(now).replace(/-op-loop-op-check--$/, "-loop-op-check--"));
+	assert.notEqual(legacy, now);
+	fs.renameSync(now, legacy);
+	await pi.command("/loop run op-check");
+	const second = await until("the second run done", () => loopOf(p, "op-check")?.lastRun?.fire === first.fire + 1 && loopOf(p, "op-check").lastRun.status === "done" && loopOf(p, "op-check").lastRun, 60_000);
+	assert.equal(second.session, first.session, "the same thread, in the loop's own folder");
+	assert.ok(!fs.existsSync(legacy), "the old folder was moved, not copied");
+});
+
+test("a command run in the background whose own turn starts a few seconds after it is handled isn't cut short", { timeout: 120_000 }, async t => {
+	const ext = path.join(tmp(t, "pi-loop-e2e-ext-"), "late.ts");
+	fs.writeFileSync(ext, `export default function (pi: any) {
+	pi.registerCommand("late-turn", { description: "starts a turn later", handler: async () => { setTimeout(() => pi.sendUserMessage("late turn marker"), 2500); } });
+}\n`);
+	const { p, pi } = await closedSession(t, ["-e", ext]);
+	await pi.command("/loop 1h --fresh /late-turn");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const r = await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	assert.ok(r.session && fs.existsSync(r.session), JSON.stringify(r));
+	assert.match(fs.readFileSync(r.session, "utf8"), /late turn marker/, "its turn ran before the run was stopped");
+});

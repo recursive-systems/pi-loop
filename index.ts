@@ -689,24 +689,38 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** The session arguments for a background run of `mode`, and the mode it really gets. */
 	function sessionArgsFor(l: Loop, mode: RunMode): { args: string[]; mode: RunMode; note?: string } {
 		// While you are in a run, "this conversation" is still the one you left.
-		const main = shared.away?.home ?? ctx!.sessionManager.getSessionFile?.();
+		const here = shared.away ?? shared.leaving;
+		const main = here?.home ?? ctx!.sessionManager.getSessionFile?.();
 		// Beside this session's folder: Pi's own per-project folder (--<cwd>--), or the --session-dir it was given.
 		const own = main ? path.dirname(main) : undefined;
 		const root = !own ? path.join(agentDir(), "sessions") : /^--.*--$/.test(path.basename(own)) ? path.dirname(own) : own;
 		// Named after the loop's own folder (the project, or its dir): --<folder>-loop-<id>--, so tools that read
 		// session folders can tell whose job a run was.
 		const dir = sessionFolder(root, fs.realpathSync(home(l)), `-loop-${l.id}`);
+		moveLegacyFolder(l, sessionFolder(root, fs.realpathSync(ctx!.cwd), `-loop-${l.id}`), dir);
 		if (mode === "fork" && !main) return { args: ["--session-dir", dir], mode: "fresh", note: "this session isn't saved, so it ran fresh" };
 		if (mode === "fork") return { args: ["--fork", main!, "--session-dir", dir], mode };
 		if (mode === "thread") return { args: ["--session-dir", dir, "--continue"], mode };
 		return { args: ["--session-dir", dir], mode };
 	}
 
+	/**
+	 * 0.4.0 named every loop's folder after the session's cwd. A loop with its own folder (dir) now has its own
+	 * name; its old folder is moved there once, so a thread carries on and its last run can still be opened.
+	 */
+	function moveLegacyFolder(l: Loop, legacy: string, dir: string) {
+		if (legacy === dir || !fs.existsSync(legacy) || fs.existsSync(dir)) return;
+		try { fs.renameSync(legacy, dir); } catch { return; }
+		const s = l.lastRun?.session;
+		if (s && s.startsWith(legacy + path.sep)) { l.lastRun!.session = dir + s.slice(legacy.length); save(); }
+	}
+
 	function childEnv(l: Loop, report: string): NodeJS.ProcessEnv {
 		const sm = ctx!.sessionManager;
 		// The parent's session id (as subagents pass it), so tools that group sessions can file the run under it.
-		const id = shared.away ? shared.away.homeId ?? "" : sm.getSessionId?.() ?? "";
-		const file = shared.away?.home ?? sm.getSessionFile?.() ?? "";
+		const here = shared.away ?? shared.leaving;
+		const id = here ? here.homeId ?? "" : sm.getSessionId?.() ?? "";
+		const file = here?.home ?? sm.getSessionFile?.() ?? "";
 		return { ...process.env, PI_LOOP_CHILD: "1", PI_LOOP_ID: l.id, PI_LOOP_REPORT: report, PI_LOOP_PARENT_SESSION: id, PI_LOOP_PARENT_FILE: file };
 	}
 
@@ -723,7 +737,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	 */
 	function fireBackground(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
 		if (shared.runs.has(l.id)) { shared.again.add(l.id); return; }
-		if (shared.away?.id === l.id) { shared.again.add(l.id); return; }
+		if ((shared.away ?? shared.leaving)?.id === l.id) { shared.again.add(l.id); return; }
 		const now = Date.now();
 		if (overLimit()) {
 			// Its turn waits for a slot (loop.maxBackground); a gate's wake is kept.
@@ -831,7 +845,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** Record a finished run once: its record, what it reported, again, and a note only if it found something. */
 	function recordRun(id: string, run: Run, o: Outcome) {
-		if (run.recorded) return;
+		if (run.recorded || run.handedOver) return;
 		run.recorded = true;
 		if (shared.runs.get(id) === run) shared.runs.delete(id);
 		const l = loops.find(x => x.id === id);
@@ -897,6 +911,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			await run.stop();
 			shared.runs.delete(l.id);
 		}
+		const prev = l.lastRun;
 		l.lastRun = { ...(l.lastRun ?? { fire: fireNo, mode: l.run ?? "fresh", startedAt: Date.now() }), status: "away", session: file, unread: false, host: process.pid };
 		const away: Away = { id: l.id, file, home: homeFile, homeId: ctx!.sessionManager.getSessionId?.(), fire: fireNo, mode: l.lastRun.mode, report: reportFileOf(l, fireNo), live: !!run };
 		shared.away = away;
@@ -908,10 +923,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			} });
 		} catch { res = { cancelled: true }; }
 		if (res?.cancelled) {
-			// The switch didn't happen: you are still here, so the run carries on in the background.
+			// The switch didn't happen: you are still here. A live run carries on in the background; a finished one
+			// you only meant to read stays as it was (nothing starts in it).
 			shared.away = undefined;
-			live(cur => cur.afterLeave(away, false));
-			return "couldn't switch into the run; it carries on in the background";
+			if (away.live) { live(cur => cur.afterLeave(away, false)); return "couldn't switch into the run; it carries on in the background"; }
+			l.lastRun = prev; save(); refreshStatus();
+			return "couldn't switch into the run";
 		}
 		return undefined;
 	}
@@ -1245,7 +1262,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		for (const id of slotWait) if (!loops.some(l => l.id === id && !l.paused)) slotWait.delete(id);
 		// A kept wake whose loop was redefined since is about the old definition: drop it.
 		for (const l of loops) if (l.pendingWake && l.pendingWake.rev !== (l.rev ?? 0)) { delete l.pendingWake; save(); }
-		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && shared.away?.id !== l.id && (l.nextAt <= now || l.pendingWake));
+		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && (shared.away ?? shared.leaving)?.id !== l.id && (l.nextAt <= now || l.pendingWake));
 		// Background loops need only a run slot: each due one starts now, or runs once more after its current run.
 		for (const l of dueNow.filter(x => x.run)) {
 			if (shared.runs.has(l.id)) {
@@ -1272,7 +1289,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** Ad hoc loops past their end are removed (not while a run of theirs is going or you are in one). */
 	function expire(now: number) {
-		const over = (l: Loop) => l.expiresAt !== undefined && l.expiresAt <= now && !shared.runs.has(l.id) && shared.away?.id !== l.id && !gating.has(l.id);
+		const over = (l: Loop) => l.expiresAt !== undefined && l.expiresAt <= now && !shared.runs.has(l.id) && (shared.away ?? shared.leaving)?.id !== l.id && !gating.has(l.id);
 		// A declared loop past its `until` is paused: its file is yours to edit.
 		for (const l of loops) if (l.source && over(l) && !l.paused) { l.paused = true; notify(`loop ${l.id} reached its until and is paused (${l.source})`, "info"); save(); }
 		const gone = loops.filter(l => !l.source && over(l));

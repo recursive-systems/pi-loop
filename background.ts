@@ -263,7 +263,10 @@ export class Run {
 		const steering = this.working;
 		const before = this.starts;
 		if (!steering) this.working = true;
-		const r = await this.send(steering ? { type: "steer", message: text } : { type: "prompt", message: text });
+		// While it is working (or a handled command may still start a turn), a prompt that steers: steered into a
+		// running turn, or a turn of its own if none is running (a bare steer would wait in the queue for a turn
+		// that never comes, and your words would be lost when the run is stopped).
+		const r = await this.send(steering ? { type: "prompt", message: text, streamingBehavior: "steer" } : { type: "prompt", message: text });
 		if (!r?.success) { if (!steering) this.settle(); return r?.error ?? "not delivered"; }
 		this.push([`› (you) ${text.slice(0, 200)}`]);
 		if (!steering && r.data?.disposition === "handled") this.settleUnlessStarted(before);
