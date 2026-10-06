@@ -1210,15 +1210,76 @@ test("a thread whose conversation was made in another folder carries on from a c
 	assert.equal(third.session, second.session, "and continues the copy from then on");
 });
 
-test("a folder whose loops this session runs is held: a session opened in it is read-only", { timeout: 120_000 }, async t => {
+test("a folder whose loops this session runs is held: a session opened in it is read-only, also after /new", { timeout: 180_000 }, async t => {
 	const { p, pi } = await closedSession(t);
 	fs.mkdirSync(path.join(p.cwd, "op/.pi"), { recursive: true });
 	fs.writeFileSync(path.join(p.cwd, "op/.pi/loop.json"), JSON.stringify({ loops: [{ id: "op-held", prompt: "say hi", every: "1h", run: "fresh" }] }));
 	await until("the declared loop", () => loopOf(p, "op-held"), 30_000);
-	const there = new Pi(t, { cwd: path.join(p.cwd, "op"), agent: p.agent }, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
-	await there.ready();
-	assert.match(await there.command("/loop run op-held"), /owned by pid \d+/);
-	assert.ok(!fs.existsSync(path.join(p.cwd, "op/.pi/loops.json")), "it doesn't run the folder's loops itself");
+	// As an old role session left it: its own loop list in the folder.
+	const own = JSON.stringify([{ id: "role-own", prompt: "hi", schedule: { kind: "every", ms: 3_600_000 }, catchUp: "latest", paused: false, createdAt: 1, nextAt: 1, fires: 0 }]);
+	fs.writeFileSync(path.join(p.cwd, "op/.pi/loops.json"), own);
+	const opened = async () => {
+		const there = new Pi(t, { cwd: path.join(p.cwd, "op"), agent: p.agent }, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
+		await there.ready();
+		assert.match(await there.command("/loop run role-own"), /owned by pid \d+/, "its loops can't be run there");
+		await new Promise(r => setTimeout(r, 3000));
+		assert.equal(fs.readFileSync(path.join(p.cwd, "op/.pi/loops.json"), "utf8"), own, "nor changed");
+		there.stop();
+	};
+	await opened();
+	assert.equal((await pi.send({ type: "new_session" })).success, true); // Pi rebuilds the extension; the locks stay
+	await new Promise(r => setTimeout(r, 2000));
+	await opened();
 	await pi.command("/loop run op-held");
-	await until("run by the session that holds it", () => loopOf(p, "op-held")?.lastRun?.status === "done", 60_000);
+	await until("still run by the session that holds it", () => loopOf(p, "op-held")?.lastRun?.status === "done", 60_000);
+});
+
+test("a run in another folder takes the machine's own pi-loop when it is 0.5 or later, and refuses an older one", { timeout: 180_000 }, async t => {
+	for (const older of [false, true]) {
+		const p = project(t);
+		fs.mkdirSync(path.join(p.cwd, "op/.pi"), { recursive: true });
+		fs.writeFileSync(path.join(p.cwd, "op/.pi/loop.json"), JSON.stringify({ loops: [{ id: "op-own", prompt: "say hi", every: "1h", run: "fresh" }] }));
+		// As on a box: the project pins pi-loop; the machine's own settings list one too.
+		fs.writeFileSync(path.join(p.cwd, ".pi/settings.json"), JSON.stringify({ packages: [PACKAGE] }));
+		const settings = JSON.parse(fs.readFileSync(path.join(p.agent, "settings.json"), "utf8"));
+		if (older) {
+			// A real 0.2.1 checkout where Pi keeps the machine's git packages (listed, its extension not loaded here).
+			const dir = path.join(p.agent, "git/github.com/recursive-systems/pi-loop");
+			execFileSync("git", ["clone", "-q", "--depth", "1", "--branch", "v0.2.1", "https://github.com/recursive-systems/pi-loop", dir]);
+			settings.packages = [{ source: "git:github.com/recursive-systems/pi-loop@v0.2.1", extensions: [], skills: [] }];
+		} else settings.packages = [PACKAGE];
+		fs.writeFileSync(path.join(p.agent, "settings.json"), JSON.stringify(settings));
+		fs.writeFileSync(path.join(p.agent, "trust.json"), JSON.stringify({ [fs.realpathSync(p.cwd)]: true }));
+		const pi = new Pi(t, p, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-"), asPackage: true });
+		await pi.ready();
+		await until("the declared loop", () => fs.existsSync(path.join(p.cwd, ".pi/loops.json")) && loopOf(p, "op-own"), 30_000);
+		await pi.command("/loop run op-own");
+		const r = await until("the run over", () => ["done", "failed"].includes(loopOf(p, "op-own")?.lastRun?.status) && loopOf(p, "op-own").lastRun, 60_000);
+		if (older) {
+			assert.equal(r.status, "failed");
+			assert.match(r.result, /\(0\.2\.1\) is older than 0\.5/);
+		} else {
+			assert.equal(r.status, "done", JSON.stringify(r));
+			const system = fs.readFileSync(r.session, "utf8").split("\n").map(l => { try { return JSON.parse(l); } catch { return {}; } }).find(e => e.message?.role === "system");
+			assert.match(JSON.stringify(system), /loop_report/, "the machine's own pi-loop gave the run loop_report");
+		}
+		pi.stop();
+	}
+});
+
+test("asked to make an in-conversation loop in an adopted folder, loop_manage refuses", { timeout: 300_000, skip: real }, async t => {
+	const p = project(t, { fireworks: true });
+	const sib = tmp(t, "pi-loop-e2e-sib-");
+	fs.mkdirSync(path.join(sib, ".pi"), { recursive: true });
+	fs.mkdirSync(path.join(sib, "role"), { recursive: true });
+	const rel = path.join(path.relative(p.cwd, sib), "role");
+	fs.writeFileSync(path.join(p.cwd, ".pi/settings.json"), JSON.stringify({ loop: { folders: [path.relative(p.cwd, sib)] } }));
+	const pi = new Pi(t, p, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
+	await pi.ready();
+	await new Promise(r => setTimeout(r, 1500));
+	await pi.ask(`Call loop_manage once with action "create", id "x-here", prompt "hi", every "1h", dir "${rel}" and no run. Then tell me exactly what it replied.`);
+	const results = pi.lines.filter(l => l.type === "tool_execution_end" && l.toolName === "loop_manage").map(l => JSON.stringify(l.result));
+	assert.ok(results.length, "the model called it");
+	assert.match(results.join("\n"), /adopted folder runs in the background/);
+	assert.equal(fs.existsSync(path.join(p.cwd, ".pi/loops.json")) ? loopOf(p, "x-here") : undefined, undefined);
 });
