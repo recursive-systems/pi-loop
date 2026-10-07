@@ -82,8 +82,8 @@ One session can carry several responsibilities, each a loop:
 - **Give each job its own folder** (`dir`): its gate, its `.pi/prompts/<name>.md` and its state
   live there, so two folders can each have a `/check`. `context: ["AGENTS.md"]` attaches that
   folder's instructions to the job's turns only. Gate paths are relative to the folder.
-- **Declare loops in files** so adding a job is adding a folder. `.pi/loop.json` in the project or
-  in any folder directly under it:
+- **Declare loops in files**: the project's own `.pi/loop.json`. Folders under the project aren't
+  read; a folder's loops run in a session opened in that folder:
 
   ```json
   {"loops": [{"id": "api-check", "prompt": "/check", "every": "5m", "gate": ".pi/gates/check",
@@ -91,9 +91,8 @@ One session can carry several responsibilities, each a loop:
   ```
 
   Fields are those of `loop_manage create` (`every` or `at`, `timezone`, `gate`, `maxSleep`,
-  `gateTimeout`, `gateOnError`, `priority`, `context`, `run`, `model`), plus `paused` and `until`. One file
-  per project is the way forward; folders under the project still work for setups that use them. The folder holding the file is
-  the loop's folder. Edits apply within a tick; deleting the entry deletes the loop. An id already
+  `gateTimeout`, `gateOnError`, `priority`, `context`, `run`, `model`), plus `paused` and `until`. The
+  folder holding the file is the loop's folder. Edits apply within a tick; deleting the entry deletes the loop. An id already
   used by a `loop_manage` loop is refused. Change a declared loop in its file: `loop_manage`
   `delete` and `gate` refuse it; `pause` and `resume` work until the file's `paused` changes.
 
@@ -110,9 +109,9 @@ One session can carry several responsibilities, each a loop:
   Stepping into a run from another folder isn't possible from here (Pi would move your session
   there): watch and steer it instead.
 - **One agent for several folders:** `loop.folders` in the project's settings adopts sibling folders
-  (`["../business"]`, each with a `.pi` of its own) whose loops this session also runs, in the
-  background only. The session holds each declaring folder's lock, so a session opened in a role
-  folder can't run its loops a second time. Trust each folder (Pi's `/trust`, or a saved decision on
+  (`["../business"]`, each with a `.pi` of its own) whose own `.pi/loop.json` loops this session also
+  runs, in the background only (not their subfolders'). The session holds each adopted folder's lock,
+  so a session opened in that folder can't run its loops a second time. Trust each folder (Pi's `/trust`, or a saved decision on
   a parent): a background run can't answer Pi's trust question and would start without the
   folder's settings, tools and prompts. The machine's own pi-loop must be 0.5 or later.
 - **Watching something for a while** (a deploy, a PR, a migration): an ad hoc loop with `every: auto`
