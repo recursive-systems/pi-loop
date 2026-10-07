@@ -1341,3 +1341,62 @@ test("asked to make an in-conversation loop in an adopted folder, loop_manage re
 	assert.match(results.join("\n"), /adopted folder runs in the background/);
 	assert.equal(fs.existsSync(path.join(p.cwd, ".pi/loops.json")) ? loopOf(p, "x-here") : undefined, undefined);
 });
+
+// ------------------------------------------------------------ what a run leaves behind --
+// Pi keeps a run's conversation, cost and the owner's words in the run's session; pi-loop adds only what it alone
+// knows: why the run happened (a custom entry in that session, a `fired` line in the gate log) and, at a heartbeat,
+// what the gate would have said.
+
+const logOf = (cwd: string) => { try { return fs.readFileSync(path.join(cwd, ".pi/loops.log.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l)); } catch { return []; } };
+const entriesOf = (file: string) => fs.readFileSync(file, "utf8").trim().split("\n").map(l => JSON.parse(l));
+
+test("a background run's session records why it ran and is named after it; the gate log links to it", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	fs.writeFileSync(path.join(p.cwd, ".pi/loop.json"), JSON.stringify({ loops: [{ id: "tidy", prompt: "say hi", every: "1h", run: "fresh" }] }));
+	await until("the declared loop", () => loopOf(p, "tidy"), 30_000);
+	await pi.command("/loop run tidy");
+	const r = await until("the run done", () => loopOf(p, "tidy")?.lastRun?.status === "done" && loopOf(p, "tidy").lastRun, 60_000);
+	const entries = entriesOf(r.session);
+	const marks = entries.filter(e => e.type === "custom" && e.customType === "pi-loop.run");
+	assert.deepEqual(marks.map(e => e.data), [{ loop: "tidy", fire: 1, mode: "fresh", by: "manual" }]);
+	assert.ok(entries.some(e => e.type === "session_info" && e.name === "loop tidy #1"), "named after the run");
+	const fired = logOf(p.cwd).filter(e => e.action === "fired");
+	assert.deepEqual(fired.map(e => [e.id, e.fire, e.by, e.mode, e.session]), [["tidy", 1, "manual", "fresh", r.session]]);
+});
+
+test("at a heartbeat the model wakes without the gate, and the gate's would-be answer is logged as a test", { timeout: 120_000 }, async t => {
+	// The gate leaves a mark only when it is not a test, so a test can't change what it decides next time.
+	const gate = '#!/bin/sh\n[ "$LOOP_TEST" = 1 ] || touch "$LOOP_STATE_DIR/real"\necho "{\\"action\\":\\"skip\\",\\"reason\\":\\"all quiet (test=$LOOP_TEST)\\"}"\n';
+	const p = project(t, {
+		loops: [due("disk", { gate: { command: ".pi/gates/disk", timeoutMs: 10_000, onError: "wake", maxSleepMs: 60_000 }, lastWokeAt: Date.now() - 3_600_000 })],
+		gates: { disk: gate },
+	});
+	const sessions = tmp(t, "pi-loop-e2e-sessions-");
+	const pi = new Pi(t, p, {}, { sessionDir: sessions });
+	await pi.ready();
+	const msg = await pi.waitForUser(/^\[loop disk /);
+	assert.match(msg, /gate: max sleep 1m reached; gate not consulted/);
+	const shadow = await until("the shadow line", () => logOf(p.cwd).find(e => e.action === "shadow"), 30_000);
+	assert.deepEqual([shadow.id, shadow.of, shadow.fire, shadow.decision, shadow.reason], ["disk", "heartbeat", 1, "skip", "all quiet (test=1)"]);
+	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loop-state/disk/real")), "the gate ran as a test only");
+	const fired = logOf(p.cwd).find(e => e.action === "fired");
+	assert.deepEqual([fired.fire, fired.by, fired.mode], [1, "heartbeat", "conversation"]);
+	// In this conversation the record goes into its own session.
+	const file = await mainFile(pi);
+	const mark = await until("the session's record", () => fs.existsSync(file) && entriesOf(file).find(e => e.type === "custom" && e.customType === "pi-loop.run"), 30_000);
+	assert.deepEqual(mark.data, { loop: "disk", fire: 1, mode: "conversation", by: "heartbeat", gate: { reason: "max sleep 1m reached; gate not consulted" } });
+	assert.equal(fired.session, file);
+});
+
+test("a gate's wake is recorded as by the gate, with its reason", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	fs.mkdirSync(path.join(p.cwd, ".pi/gates"), { recursive: true });
+	fs.writeFileSync(path.join(p.cwd, ".pi/gates/q"), '#!/bin/sh\necho \'{"action":"wake","reason":"queue grew"}\'\n', { mode: 0o755 });
+	fs.writeFileSync(path.join(p.cwd, ".pi/loop.json"), JSON.stringify({ loops: [{ id: "q", prompt: "say hi", every: "1m", gate: ".pi/gates/q", run: "fresh" }] }));
+	const r = await until("the run done", () => loopOf(p, "q")?.lastRun?.status === "done" && loopOf(p, "q").lastRun, 120_000);
+	const mark = entriesOf(r.session).find(e => e.type === "custom" && e.customType === "pi-loop.run");
+	assert.deepEqual(mark.data, { loop: "q", fire: r.fire, mode: "fresh", by: "gate", gate: { reason: "queue grew" } });
+	const log = logOf(p.cwd);
+	const i = log.findIndex(e => e.action === "fired" && e.fire === r.fire);
+	assert.ok(i > 0 && log[i - 1].action === "wake" && log[i - 1].reason === "queue grew", JSON.stringify(log));
+});

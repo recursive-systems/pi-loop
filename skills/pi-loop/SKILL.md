@@ -66,7 +66,10 @@ Make gates cheap and honest:
 Test before relying on it: `loop_manage test` (or `/loop test <id>`) runs the gate once and
 shows its decision without waking. You can also run the file by hand with
 `LOOP_STATE_DIR=/tmp/x LOOP_TEST=1 .pi/gates/check`. Every decision is appended to
-`.pi/loops.log.jsonl`.
+`.pi/loops.log.jsonl`, with a `fired` line (run number, `by`, session file) for each run that
+starts; at a heartbeat (`maxSleep`) the gate is also asked as a test and logged as `shadow`, so a
+skip there before a run that finds something shows a miss. Each run's session has a `pi-loop.run`
+entry saying why it ran. To judge a gate, read these with the runs' `loop_report`s.
 
 ## 4. Several jobs in one session
 

@@ -43,6 +43,8 @@ export interface GateDecision {
 	context?: string;
 	retryInMs?: number;
 	error?: boolean;
+	/** Not the gate's: the loop's maxSleep was reached, so it woke without asking the gate. */
+	heartbeat?: boolean;
 }
 
 /** Resolve a gate path inside `cwd`; returns the absolute path or an error message. */

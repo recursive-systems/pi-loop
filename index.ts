@@ -86,7 +86,7 @@ interface Instance {
 	finishRun(id: string, run: Run, report: string): Promise<void>;
 	recordRun(id: string, run: Run, outcome: Outcome): void;
 	afterLeave(a: Away, finish: boolean): Promise<void>;
-	runStarted(id: string, run: Run, note?: string): void;
+	runStarted(id: string, run: Run, note?: string, meta?: RunMeta): void;
 	runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision): void;
 }
 const shared: Shared = ((globalThis as any)[Symbol.for("pi-loop.shared")] ??= { runs: new Map(), again: new Set(), notes: [], pending: [] });
@@ -141,7 +141,7 @@ interface Loop {
 	 * Gates may record what they reported, so the wake is kept, with its reason and context, and
 	 * sent once the session is free; the gate isn't run again. Dropped if the loop is redefined.
 	 */
-	pendingWake?: { reason: string; context?: string; at: number; rev: number };
+	pendingWake?: { reason: string; context?: string; at: number; rev: number; heartbeat?: true; error?: true };
 	/** Where its turn runs: in this conversation (absent), or in the background as a fork of it, its own thread, or fresh. */
 	run?: RunMode;
 	/** A background run's model, provider/id[:thinking]; absent = this session's. */
@@ -152,6 +152,27 @@ interface Loop {
 	lastRun?: RunRecord;
 	/** Background runs that couldn't start in a row (retried soon, up to 3 times). */
 	startFailures?: number;
+}
+
+/**
+ * Why a run happened, kept in the run's own session as a custom entry (RUN_ENTRY, not in the model's context)
+ * and in the gate log's `fired` line. Its conversation, cost and the owner's words are Pi's own records.
+ */
+interface RunMeta {
+	loop: string;
+	fire: number;
+	mode: RunMode | "conversation";
+	/** What started it: its schedule (no gate), its gate's wake, its maxSleep heartbeat, or someone by hand. */
+	by: "schedule" | "gate" | "heartbeat" | "manual";
+	/** When it wasn't on time: "catch-up" or "waited 3m". */
+	late?: string;
+	gate?: { reason: string; error?: true };
+}
+const RUN_ENTRY = "pi-loop.run";
+
+/** A gate's wake kept to be sent later. */
+function keptWake(d: GateDecision, at: number, rev: number): NonNullable<Loop["pendingWake"]> {
+	return { reason: d.reason, ...(d.context ? { context: d.context } : {}), at, rev, ...(d.heartbeat ? { heartbeat: true as const } : {}), ...(d.error ? { error: true as const } : {}) };
 }
 
 /** Most text attached from context files to one turn. */
@@ -308,6 +329,22 @@ function registerReportTool(pi: ExtensionAPI, file: () => string | undefined, ru
 	});
 }
 
+/**
+ * In a background run's Pi: record in its session why the run happened (once per run, also when the run's Pi
+ * starts again on it) and name the session after the run, so /resume lists it readably.
+ */
+function markRun(pi: ExtensionAPI, c: ExtensionContext) {
+	let meta: RunMeta;
+	try { meta = JSON.parse(process.env.PI_LOOP_RUN ?? ""); } catch { return; }
+	if (!meta?.loop || !meta.fire) return;
+	try {
+		const entries: any[] = (c.sessionManager as any).getEntries?.() ?? [];
+		if (entries.some(e => e.type === "custom" && e.customType === RUN_ENTRY && e.data?.loop === meta.loop && e.data?.fire === meta.fire)) return;
+		pi.appendEntry(RUN_ENTRY, meta);
+		pi.setSessionName(meta.mode === "thread" ? `loop ${meta.loop}` : `loop ${meta.loop} #${meta.fire}`);
+	} catch { /* a record must not stop the run */ }
+}
+
 function readReport(file: string): Report | undefined {
 	try { const r = JSON.parse(fs.readFileSync(file, "utf8")); return { findings: !!r.findings, summary: r.summary, next: r.next, stop: !!r.stop }; } catch { return undefined; }
 }
@@ -392,7 +429,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	// A loop's background run: no loops of its own here (they belong to the session that started it), only loop_report.
 	if (process.env.PI_LOOP_CHILD === "1") {
 		registerReportTool(pi, () => process.env.PI_LOOP_REPORT || undefined, process.env.PI_LOOP_ID || "this");
-		pi.on("session_start", (_e, c) => { ctx = c; });
+		pi.on("session_start", (_e, c) => { ctx = c; markRun(pi, c); });
 		pi.registerCommand("loop", {
 			description: "This is a loop's background run; its loops belong to the session that started it",
 			handler: async () => { try { ctx?.ui.notify("This is a loop's background run. Its loops belong to the session that started it; /loop leave there brings you back.", "info"); } catch { /* no UI */ } },
@@ -703,7 +740,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 					l.lastGate = { at: Date.now(), action: d.action, reason: d.reason };
 					logDecision(gateLog, { ts: new Date().toISOString(), id: l.id, action: d.action, reason: d.reason, ms: Date.now() - started, ...(d.error ? { error: true } : {}) });
 					if (d.action === "wake") {
-						l.pendingWake = { reason: d.reason, ...(d.context ? { context: d.context } : {}), at: started, rev };
+						l.pendingWake = keptWake(d, started, rev);
 						waited.set(l.id, waited.get(l.id) ?? started);
 					}
 					save(); refreshStatus(); return;
@@ -720,6 +757,19 @@ export default function loopExtension(pi: ExtensionAPI) {
 			});
 		inflight.set(done, started + (l.gate!.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS));
 		void done.finally(() => inflight.delete(done));
+	}
+
+	/**
+	 * At a heartbeat the model wakes without asking the gate. Ask it anyway, as a test (it decides but records
+	 * nothing), and log what it would have said: a skip whose run then finds something is a miss the gate made.
+	 */
+	function shadowGate(l: Loop, fireNo: number, lastWokeAt: number | undefined) {
+		const started = Date.now(), log = gateLog;
+		let where: string;
+		try { where = home(l); } catch { return; }
+		void runGate(where, l.gate!, { id: l.id, prompt: l.prompt, stateDir: stateDirOf(l), test: true, session: sessionOf(ctx), lastWokeAt })
+			.then(d => logDecision(log, { ts: new Date().toISOString(), id: l.id, action: "shadow", of: "heartbeat", fire: fireNo, decision: d.action, reason: d.reason, ms: Date.now() - started, ...(d.error ? { error: true } : {}) }))
+			.catch(() => { /* a shadow decision is only a record */ });
 	}
 
 	/**
@@ -749,7 +799,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (l.run) return fireBackground(l, reason, gate);
 		// You are in a run's conversation: an in-conversation loop waits for you to be back.
 		if (shared.away) {
-			if (gate) l.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: Date.now(), rev: l.rev ?? 0 };
+			if (gate) l.pendingWake = keptWake(gate, Date.now(), l.rev ?? 0);
 			waited.set(l.id, waited.get(l.id) ?? Date.now());
 			save(); refreshStatus();
 			return `you are in ${shared.away.id}'s run; ${l.id} runs when you are back`;
@@ -781,11 +831,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 		} catch (e) {
 			Object.assign(l, { fires: before.fires, lastFiredAt: before.lastFiredAt, lastWokeAt: before.lastWokeAt, nextAt: before.nextAt });
 			// A gate may have recorded that it reported this: keep its wake rather than ask it again.
-			if (gate) { l.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: Date.now(), rev: l.rev ?? 0 }; save(); }
+			if (gate) { l.pendingWake = keptWake(gate, Date.now(), l.rev ?? 0); save(); }
 			const msg = `loop ${l.id}: couldn't send its turn (${(e as Error).message}); it is kept and sent again`;
 			notify(msg, "warning"); refreshStatus();
 			return msg;
 		}
+		const meta = runMeta(l, l.fires, reason, gate, "conversation");
+		try { (pi as any).appendEntry?.(RUN_ENTRY, meta); } catch { /* a record must not stop the turn */ }
+		logFired(meta, ctx?.sessionManager?.getSessionFile?.());
 		waited.delete(l.id);
 		delete l.pendingWake;
 		phase = { state: "queued", id: l.id };
@@ -796,6 +849,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** The loop whose turn is running in this conversation now, and where its loop_report goes. */
 	let inConversation: { id: string; report: string } | undefined;
+
+	function runMeta(l: Loop, fireNo: number, reason: Reason, gate: GateDecision | undefined, mode: RunMeta["mode"]): RunMeta {
+		const by: RunMeta["by"] = reason === "manual" ? "manual" : !gate ? "schedule" : gate.heartbeat ? "heartbeat" : "gate";
+		return { loop: l.id, fire: fireNo, mode, by, ...(reason !== "due" && reason !== "manual" ? { late: reason } : {}),
+			...(gate ? { gate: { reason: gate.reason, ...(gate.error ? { error: true as const } : {}) } } : {}) };
+	}
+
+	/** The gate log's line for a run that started: links a wake (the line before it) to the run's session. */
+	function logFired(m: RunMeta, session?: string) {
+		logDecision(gateLog, { ts: new Date().toISOString(), id: m.loop, action: "fired", fire: m.fire, by: m.by, mode: m.mode, ...(m.late ? { late: m.late } : {}), ...(session ? { session } : {}) });
+	}
 
 	/** The prompt a loop's run gets: its header, folder, gate context and the report hint. */
 	function runText(l: Loop, fireNo: number, reason: Reason, gate?: GateDecision, mode?: RunMode): { text: string; expand: boolean } {
@@ -877,13 +941,16 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return { cwd: where, extra: runExtra(where), ...modelArgs(l) };
 	}
 
-	function childEnv(l: Loop, report: string): NodeJS.ProcessEnv {
+	/** A run's Pi environment; `meta` only for a new run (its Pi records it in the run's session), not one carried on. */
+	function childEnv(l: Loop, report: string, meta?: RunMeta): NodeJS.ProcessEnv {
 		const sm = ctx!.sessionManager;
 		// The parent's session id (as subagents pass it), so tools that group sessions can file the run under it.
 		const here = shared.away ?? shared.leaving;
 		const id = here ? here.homeId ?? "" : sm.getSessionId?.() ?? "";
 		const file = here?.home ?? sm.getSessionFile?.() ?? "";
-		return { ...process.env, PI_LOOP_CHILD: "1", PI_LOOP_ID: l.id, PI_LOOP_REPORT: report, PI_LOOP_PARENT_SESSION: id, PI_LOOP_PARENT_FILE: file };
+		const env: NodeJS.ProcessEnv = { ...process.env, PI_LOOP_CHILD: "1", PI_LOOP_ID: l.id, PI_LOOP_REPORT: report, PI_LOOP_PARENT_SESSION: id, PI_LOOP_PARENT_FILE: file };
+		if (meta) env.PI_LOOP_RUN = JSON.stringify(meta); else delete env.PI_LOOP_RUN;
+		return env;
 	}
 
 	function modelArgs(l?: Loop): { model?: string; thinking?: string } {
@@ -908,7 +975,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const now = Date.now();
 		if (overLimit()) {
 			// Its turn waits for a slot (loop.maxBackground); a gate's wake is kept.
-			if (gate) l.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: now, rev: l.rev ?? 0 };
+			if (gate) l.pendingWake = keptWake(gate, now, l.rev ?? 0);
 			slotWait.add(l.id); waited.set(l.id, waited.get(l.id) ?? now);
 			l.nextAt = Math.min(l.nextAt, now);
 			save(); refreshStatus();
@@ -938,7 +1005,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
 		const text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
 			: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
-		const run = new Run(l.id, fireNo, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, report) });
+		const meta = runMeta(l, fireNo, reason, gate, s.mode);
+		const run = new Run(l.id, fireNo, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, report, meta) });
 		shared.runs.set(l.id, run);
 		if (reason !== "manual" || l.nextAt <= now) l.nextAt = nextFor(l, now);
 		waited.delete(l.id);
@@ -958,13 +1026,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 				return;
 			}
 			if (run.handedOver) return;
-			live(cur => cur.runStarted(l.id, run, s.note));
+			live(cur => cur.runStarted(l.id, run, s.note, meta));
 			await watchRun(run, report);
 		})();
 		return undefined;
 	}
 
-	function runStarted(id: string, run: Run, note?: string) {
+	function runStarted(id: string, run: Run, note?: string, meta?: RunMeta) {
 		const cur = loops.find(x => x.id === id);
 		if (!cur || run.handedOver) return;
 		delete cur.startFailures;
@@ -972,6 +1040,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		cur.lastFiredAt = cur.lastWokeAt = Date.now();
 		delete cur.pendingWake;
 		cur.lastRun = { ...(cur.lastRun ?? { fire: run.fire, mode: run.mode, startedAt: Date.now() }), status: "running", session: run.sessionFile, host: process.pid };
+		if (meta) logFired(meta, run.sessionFile);
 		save(); refreshStatus();
 		if (note) notify(`loop ${id}: ${note}`, "info");
 	}
@@ -983,7 +1052,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// this occurrence again soon, a few times, before leaving it to the schedule.
 		cur.startFailures = (cur.startFailures ?? 0) + 1;
 		const retry = cur.startFailures <= 3;
-		if (gate) cur.pendingWake = { reason: gate.reason, ...(gate.context ? { context: gate.context } : {}), at: Date.now(), rev: cur.rev ?? 0 };
+		if (gate) cur.pendingWake = keptWake(gate, Date.now(), cur.rev ?? 0);
 		else if (retry) cur.nextAt = Math.min(cur.nextAt, Date.now() + 2 * 60_000);
 		// A run started again on its own conversation (leave, steer) keeps that conversation: it can still be opened.
 		const session = run.sessionFile ?? (cur.lastRun?.fire === run.fire ? cur.lastRun?.session : undefined);
@@ -1555,7 +1624,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const since = waited.get(due.id) ?? due.pendingWake?.at;
 		if (due.pendingWake) {
 			const w = due.pendingWake;
-			fire(due, `waited ${countdown(Math.max(0, now - w.at))}`, { action: "wake", reason: w.reason, ...(w.context ? { context: w.context } : {}) });
+			fire(due, `waited ${countdown(Math.max(0, now - w.at))}`, { action: "wake", reason: w.reason, ...(w.context ? { context: w.context } : {}), ...(w.heartbeat ? { heartbeat: true } : {}), ...(w.error ? { error: true } : {}) });
 			return;
 		}
 		if (since === undefined && now - due.nextAt > TICK_MS * 4 && due.catchUp === "none") {
@@ -1568,10 +1637,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!due.gate) { fire(due, reason); return; }
 		const g = due.gate;
 		if (g.maxSleepMs && now - (due.lastWokeAt ?? due.createdAt) >= g.maxSleepMs) {
-			const d: GateDecision = { action: "wake", reason: `max sleep ${countdown(g.maxSleepMs)} reached; gate not consulted` };
+			const d: GateDecision = { action: "wake", reason: `max sleep ${countdown(g.maxSleepMs)} reached; gate not consulted`, heartbeat: true };
 			due.lastGate = { at: now, action: "wake", reason: d.reason };
 			logDecision(gateLog, { ts: new Date(now).toISOString(), id: due.id, action: "wake", reason: d.reason, ms: 0 });
+			// What the gate would have seen: the run about to start moves lastWokeAt.
+			const fireNo = due.fires + 1, woke = due.lastWokeAt;
 			fire(due, reason, d);
+			shadowGate(due, fireNo, woke);
 			return;
 		}
 		gateThen(due, reason);
