@@ -20,9 +20,9 @@
  *
  * A loop may have its own folder (`dir`, inside the project): its gate, prompt
  * template and state are found there, and `context` files from it are attached to
- * its turn. Loops can also be declared in `.pi/loop.json` files, in the project or
- * in any folder directly under it; a declared loop's folder is the one holding the
- * file, and editing the file changes the loop (run state stays in .pi/loops.json). Loops persist in
+ * its turn. Loops can also be declared in the project's own `.pi/loop.json` (folders
+ * under it are not read: a session opened there runs theirs); a declared loop's folder is
+ * the one holding the file, and editing the file changes the loop (run state stays in .pi/loops.json). Loops persist in
  * .pi/loops.json and are restored on session start; a due loop missed while no
  * session was alive fires once on start (catchUp "latest") unless it is a short
  * interval (< 1h), which just advances. One session owns the loops per project
@@ -66,7 +66,7 @@ interface Note { content: string; details: Record<string, unknown> }
 interface Outcome { status: RunRecord["status"]; summary: string; findings: boolean; rep?: Report }
 interface Shared {
 	lock?: FolderLock; lockPath?: string;
-	/** Locks on the folders whose declared loops this session runs (role folders, adopted ones), by folder. */
+	/** Locks on the folders whose declared loops this session runs (adopted ones), by folder. */
 	folderLocks?: Map<string, FolderLock>;
 	runs: Map<string, Run>;
 	/** Loops that came due while their previous run was still going: they run once more after it. */
@@ -261,7 +261,7 @@ export function configuredZone(cwd: string): { tz: string; source: string; warni
 
 /**
  * loop.folders in the project's .pi/settings.json: folders beside the project (e.g. "../business") whose loops
- * this session runs too, as if they were inside it: their .pi/loop.json and their direct subfolders'. Only a true
+ * this session runs too: each one's own .pi/loop.json (not its subfolders'). Only a true
  * sibling with a .pi folder of its own counts. `unsure` says why the setting couldn't be read in full (its loops
  * are then kept as they were rather than dropped).
  */
@@ -560,7 +560,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		lostLock();
 		return false;
 	}
-	/** Let go of the folders this session ran (role and adopted folders), so their next owner can take them. */
+	/** Let go of the folders this session ran (adopted folders), so their next owner can take them. */
 	function releaseFolderLocks() {
 		for (const lk of shared.folderLocks?.values() ?? []) lk.release();
 		shared.folderLocks = undefined;
@@ -1368,7 +1368,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// ------------------------------------------------------- declared loops --
 
-	/** .pi/loop.json in the project and in each folder directly under it (not hidden ones or node_modules). */
+	/**
+	 * The project's own .pi/loop.json, then each adopted folder's (loop.folders). Folders under them are not read:
+	 * a folder's loops run in a session opened there, so a session opened above it never takes them too.
+	 */
 	function declaringFiles(): string[] {
 		const cwd = ctx!.cwd;
 		const out: string[] = [];
@@ -1376,17 +1379,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		at(cwd);
 		// A host (a scheduler that embeds this extension for one folder) serves only that folder's loops.
 		if (ctx!.mode === "host") return out;
-		const under = (dir: string) => {
-			let entries: fs.Dirent[] = [];
-			try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { /* unreadable */ }
-			for (const e of entries) if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules") at(path.join(dir, e.name));
-		};
-		under(cwd);
-		const own = out.sort();
-		// Folders the project adopts (loop.folders): theirs too, after its own.
-		const more: string[] = [];
-		for (const f of configuredFolders(cwd)) { const n = out.length; at(f); under(f); more.push(...out.splice(n).sort()); }
-		return [...own, ...more];
+		for (const f of configuredFolders(cwd)) at(f);
+		return out;
 	}
 
 	/** Bring loops in line with the .pi/loop.json files: add, update and remove declared loops; keep run state. */

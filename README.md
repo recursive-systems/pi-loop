@@ -29,7 +29,7 @@ The prompt comes back to *the same session*, so the agent remembers what it did 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.6.0
+pi install git:github.com/recursive-systems/pi-loop@v0.7.0
 ```
 
 Add `-l` to install it for one project only.
@@ -120,11 +120,12 @@ Log each decision to `$LOOP_STATE_DIR` so you can tune the thresholds later.
   the one with the highest `priority` goes first.
 - **Each job can have its own folder** with its gate, its prompt template and its instructions
   (`dir`, and `context: ["AGENTS.md"]` to attach them to that job's turns only).
-- **Declare loops in files.** A `.pi/loop.json` in the project, or in any folder directly under it,
-  defines loops; edit the file to change them. Adding a folder adds a job. `loop.folders` in the
+- **Declare loops in files.** The project's `.pi/loop.json` defines its loops; edit the file to
+  change them. Folders under the project aren't read: a folder's loops run in a session opened in
+  that folder, so a session opened above it never picks them up too. `loop.folders` in the
   project's `.pi/settings.json` (`["../business"]`) adopts folders beside it (each with a `.pi` of its
-  own): their loops run here too, in the background. The session holds each declaring folder's lock, so
-  a session opened in one of those folders is read-only instead of running its loops twice:
+  own): their own `.pi/loop.json` loops run here too, in the background. The session holds each adopted
+  folder's lock, so a session opened in one of those folders is read-only instead of running its loops twice:
 
 ```json
 {"loops": [{"id": "api-check", "prompt": "/check", "every": "5m", "gate": ".pi/gates/check", "context": ["AGENTS.md"]}]}
