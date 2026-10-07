@@ -29,7 +29,7 @@ The prompt comes back to *the same session*, so the agent remembers what it did 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.5.1
+pi install git:github.com/recursive-systems/pi-loop@v0.6.0
 ```
 
 Add `-l` to install it for one project only.
@@ -129,6 +129,24 @@ Log each decision to `$LOOP_STATE_DIR` so you can tune the thresholds later.
 ```json
 {"loops": [{"id": "api-check", "prompt": "/check", "every": "5m", "gate": ".pi/gates/check", "context": ["AGENTS.md"]}]}
 ```
+
+## What a loop leaves behind
+
+To see how a loop is doing (how often it woke for nothing, what it missed, what it costs), look at
+what Pi already keeps, plus three things only pi-loop knows:
+
+- **Each run is a Pi session.** It holds the conversation, its cost, and anything you said to the run.
+  pi-loop adds a `pi-loop.run` entry (not in the model's context) saying why it ran:
+  `{"loop": "disk", "fire": 4, "mode": "fresh", "by": "gate", "gate": {"reason": "free fell 6 GiB"}}`.
+  `by` is `schedule`, `gate`, `heartbeat` (its `maxSleep`) or `manual`. Background runs are named
+  `loop <id> #<fire>` in `/resume`.
+- **`.pi/loops.log.jsonl`** has every gate decision, and a `fired` line for each run that started,
+  with the run's session file.
+- **At a heartbeat** the model wakes without asking the gate. pi-loop asks the gate anyway, as a test,
+  and logs its answer as a `shadow` line. A `skip` there followed by a run that found something is a
+  miss the gate made.
+
+What the gate measured is for the gate to keep, in `$LOOP_STATE_DIR`.
 
 ## Good to know
 
