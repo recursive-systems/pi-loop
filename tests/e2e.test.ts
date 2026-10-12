@@ -1048,7 +1048,7 @@ test("the loops view in Pi's terminal UI: cards for each loop, a run's transcrip
 		while (!re.test(plain())) { if (Date.now() > end) throw new Error(`no ${what} on screen; last: ${plain().slice(-1500)}`); await new Promise(r => setTimeout(r, 200)); }
 	};
 	const type = async (s: string) => { term.stdin.write(s); await new Promise(r => setTimeout(r, 400)); };
-	await seen(/loops: /, "the status line", 60_000);
+	await seen(/loops [●◉◆✕○◌]/, "the status line (one dot per loop)", 60_000);
 	await type("/loop");
 	await type("\r");
 	await seen(/loops · /, "the loops view");

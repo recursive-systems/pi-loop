@@ -47,6 +47,7 @@ import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateCo
 import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
 import { LoopsView, type LoopRow, type ViewAction } from "./view.ts";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 
 type Phase = { state: "queued" | "running"; id: string } | undefined;
 
@@ -578,24 +579,84 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// -------------------------------------------------------------- display --
 
+	// The status line: one dot per loop and a few words about the one that needs attention.
+	//   ● quiet   ◉ running   ◆ something to see   ✕ failing or needs you   ○ late or waiting   ◌ paused
+	// Its words name, in order: a failure or a run that needs you, results to see, a run in progress,
+	// a loop waiting for this session or late. When all is quiet it is the dots alone. A status bar
+	// extension can show it as one of its rows ("statusbar:*" events); otherwise it's a footer status.
+	const LATE_MS = 15 * 60_000;
+	let barMode = false;
+	type Dot = "quiet" | "running" | "see" | "failing" | "late" | "paused";
+	function loopDot(l: Loop, now: number): Dot {
+		const r = l.lastRun;
+		if ((r?.unread && (r.status === "failed" || r.needsYou)) || (l.gateErrors ?? 0) > 0) return "failing";
+		if (r?.unread) return "see";
+		if (shared.runs.has(l.id) || phase?.id === l.id) return "running";
+		if (l.paused) return "paused";
+		if (waited.has(l.id) || slotWait.has(l.id) || l.pendingWake || now - l.nextAt > LATE_MS) return "late";
+		return "quiet";
+	}
+	function statusLine(theme?: any): string {
+		const fg = (c: string, t: string) => { try { return theme ? theme.fg(c, t) : t; } catch { return t; } };
+		if (readOnly) return fg("dim", `loops ${loops.length} (owned by pid ${ownerPid()})`);
+		if (shared.away) return `loops: in ${shared.away.id}'s run · /loop leave or /loop done`;
+		const now = Date.now();
+		const dots = loops.map(l => ({ l, d: loopDot(l, now) }));
+		const glyph: Record<Dot, [string, string]> = {
+			quiet: ["●", "dim"], running: ["◉", "accent"], see: ["◆", "warning"], failing: ["✕", "error"], late: ["○", "warning"], paused: ["◌", "dim"],
+		};
+		const strip = dots.map(({ d }) => fg(glyph[d][1], glyph[d][0])).join("");
+		const say = (l: Loop, d: Dot): string => {
+			const r = l.lastRun;
+			switch (d) {
+				case "failing":
+					if ((l.gateErrors ?? 0) > 0) return `${l.id}: gate failing (${l.gateErrors} in a row)`;
+					return r?.needsYou ? `${l.id}: needs you` : `${l.id}: run failed`;
+				case "see": return `${l.id}: results to see`;
+				case "running": { const at = r?.startedAt; return `${l.id} running${at ? ` ${countdown(Math.max(0, now - at))}` : ""}`; }
+				case "late":
+					if (waited.has(l.id)) return `${l.id} waiting for this session`;
+					if (slotWait.has(l.id)) return `${l.id} waiting for a background slot`;
+					return `${l.id} late ${countdown(Math.max(0, now - l.nextAt))}`;
+				default: return "";
+			}
+		};
+		const order: Dot[] = ["failing", "see", "running", "late"];
+		const notable = order.flatMap(d => dots.filter(x => x.d === d));
+		const color: Record<string, string> = { failing: "error", see: "warning", running: "accent", late: "warning" };
+		let words = "";
+		if (notable.length) {
+			const { l, d } = notable[0]!;
+			words = " " + fg(color[d]!, say(l, d)) + (notable.length > 1 ? fg("dim", ` +${notable.length - 1}`) : "");
+		}
+		return `${fg("muted", "loops")} ${strip}${words}`;
+	}
+
 	function refreshStatus() {
 		if (!ctx) return;
-		const active = loops.filter(l => !l.paused);
-		if (!loops.length) { ctx.ui.setStatus(STATUS_KEY, undefined); return; }
-		if (readOnly) { ctx.ui.setStatus(STATUS_KEY, `loops: ${loops.length} (owned by pid ${ownerPid()})`); return; }
-		if (shared.away) { ctx.ui.setStatus(STATUS_KEY, `loops: in ${shared.away.id}'s run · /loop leave or /loop done`); return; }
-		const now = Date.now();
-		const bg = shared.runs.size ? ` · ${shared.runs.size} in background` : "";
-		const unread = loops.filter(l => l.lastRun?.unread).length;
-		const inbox = unread ? ` · ${unread} to see (/loop)` : "";
-		const waiting = (waited.size ? ` \u00b7 ${waited.size} waiting` : "") + bg + inbox;
-		if (phase) { ctx.ui.setStatus(STATUS_KEY, `loops: ${active.length} \u00b7 ${phase.id} ${phase.state}${waiting}`); return; }
-		if (waited.size) { ctx.ui.setStatus(STATUS_KEY, `loops: ${active.length}${waiting} for this session to be free`); return; }
-		const next = active.slice().sort((a, b) => a.nextAt - b.nextAt)[0];
-		ctx.ui.setStatus(STATUS_KEY, next
-			? `loops: ${active.length}${loops.length > active.length ? ` (+${loops.length - active.length} paused)` : ""} · next ${next.id} ${when(next)} (in ${countdown(Math.max(0, next.nextAt - now))})`
-			: `loops: ${loops.length} paused`);
+		if (!loops.length) {
+			if (barMode) pi.events.emit("statusbar:remove", { id: "loops" }); else ctx.ui.setStatus(STATUS_KEY, undefined);
+			return;
+		}
+		if (barMode) { registerBarItem(); return; }
+		let theme: any; try { theme = ctx.ui.theme; } catch { /* no UI */ }
+		ctx.ui.setStatus(STATUS_KEY, statusLine(theme));
 	}
+
+	/** Our row in a status bar extension: the same line, and Enter opens the loops view. */
+	function registerBarItem() {
+		pi.events.emit("statusbar:item", {
+			id: "loops",
+			order: 20,
+			render: (theme: any, width: number) => (loops.length ? [truncateToWidth(` ${statusLine(theme)}`, width)] : []),
+			open: (c: any) => openView(c),
+		});
+	}
+	pi.events.on("statusbar:ready", () => {
+		barMode = true;
+		try { ctx?.ui.setStatus(STATUS_KEY, undefined); } catch { /* no UI yet */ }
+		refreshStatus();
+	});
 
 	function listText(): string {
 		const zoneLine = `default zone ${zone.tz} (${zone.source === "system" ? "system" : `loop.timezone in ${zone.source}`})`;

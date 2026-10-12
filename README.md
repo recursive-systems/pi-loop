@@ -47,6 +47,25 @@ Add `-l` to install it for one project only.
 /loop watch|steer|take|open|cancel <id>, /loop leave|done   background runs, below
 ```
 
+## The status line
+
+One dot per loop, and a few words only about the loop that needs you:
+
+```
+loops ●●●●●●                                  all quiet
+loops ●●◉●●● meter-billing running 2m          a run in progress
+loops ●●●●◆● engineering-health: results to see
+loops ●●✕●●● gateway-upkeep: gate failing (3 in a row)
+loops ●●●○●● ci-upkeep late 20m                 waiting for this session, or overdue
+```
+
+`●` quiet, `◉` running, `◆` results to see, `✕` failing or needs you, `○` late or waiting, `◌` paused.
+The words name the most urgent one (failing, then results, then running, then late), `+N` for the rest.
+
+A status bar extension can show this line as one of its rows: when it emits `statusbar:ready` on
+`pi.events`, pi-loop sends `statusbar:item` (`{ id: "loops", order, render(theme, width), open(ctx) }`,
+`open` shows the loops view) instead of setting a footer status.
+
 ## Background runs
 
 A loop with `run` set does its work in a separate Pi beside your conversation:
