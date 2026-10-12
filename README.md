@@ -61,6 +61,7 @@ loops ●●●○●● ci-upkeep late 20m                 waiting for this ses
 
 `●` quiet, `◉` running, `◆` results to see, `✕` failing or needs you, `○` late or waiting, `◌` paused.
 The words name the most urgent one (failing, then results, then running, then late), `+N` for the rest.
+The loops view (`/loop`) shows the same symbol on each loop, with the reason beside it, and the key at the bottom.
 
 A status bar extension can show this line as one of its rows: when it emits `statusbar:ready` on
 `pi.events`, pi-loop sends `statusbar:item` (`{ id: "loops", order, render(theme, width), open(ctx) }`,
