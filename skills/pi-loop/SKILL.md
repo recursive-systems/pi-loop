@@ -124,7 +124,10 @@ One session can carry several responsibilities, each a loop:
 The message starts with `[loop <id> · <schedule> · fire #N …]`. Do the template's work, send the
 result where it says, and keep "nothing to do" turns to one line. End with `loop_report`: findings
 true only if there is something the owner should see (a background run with no findings stays
-quiet), a one-line summary, and `next` or `stop` when the timing should change. To stop or change the loop,
+quiet), a one-line summary, `ask` only when the owner must do something only they can (the one
+thing, a few words: "Reconnect Stripe in Executor"; it is shown to them as is), and `next` or `stop`
+when the timing should change. A classifier decides from the report and what the owner was already
+told whether it interrupts them; anything else waits in the loops view. To stop or change the loop,
 use `loop_manage` (`pause`, `delete`, `gate`), or edit its `.pi/loop.json` if it is declared there.
 Don't just ignore the loop.
 

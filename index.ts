@@ -42,7 +42,7 @@ import {
 	type Schedule,
 } from "./schedule.ts";
 import { fileURLToPath } from "node:url";
-import { Run, RUN_MODES, extensionFlags, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord } from "./background.ts";
+import { Run, RUN_MODES, extensionFlags, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord, type Surface } from "./background.ts";
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
@@ -54,7 +54,8 @@ type Phase = { state: "queued" | "running"; id: string } | undefined;
 const STATUS_KEY = "loop";
 /** What a loop run is asked to do at the end, so findings and pacing don't depend on its wording. */
 const REPORT_HINT = "When you finish, call loop_report once: findings true only if there is something the owner should see " +
-	"(false when all is as expected), a one-line summary, and optionally next (e.g. \"15m\") to choose when this loop runs again, or stop: true to end it.";
+	"(false when all is as expected), a one-line summary, ask only if the owner must do something (the one thing, a few words), " +
+	"and optionally next (e.g. \"15m\") to choose when this loop runs again, or stop: true to end it.";
 const TAKEOVER_NOTE = "[loop] The owner is taking over this conversation now. Stop here and reply with one line saying where you are.";
 const CONTINUE_NOTE = "[loop] The owner stepped out. Carry on from where you are, and call loop_report when you are done.";
 /** Longest a self-paced loop may put off its next run. */
@@ -89,7 +90,10 @@ interface Instance {
 	afterLeave(a: Away, finish: boolean): Promise<void>;
 	runStarted(id: string, run: Run, note?: string, meta?: RunMeta): void;
 	runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision): void;
+	judged(id: string, fire: number, verdict: Verdict): void;
 }
+/** The judge's decision about one run's report. */
+interface Verdict { surface: Surface; ask?: string; by: string }
 const shared: Shared = ((globalThis as any)[Symbol.for("pi-loop.shared")] ??= { runs: new Map(), again: new Set(), notes: [], pending: [] });
 shared.pending ??= [];
 /** Hand a run event to the live instance now, or to the next one. */
@@ -153,6 +157,8 @@ interface Loop {
 	lastRun?: RunRecord;
 	/** Background runs that couldn't start in a row (retried soon, up to 3 times). */
 	startFailures?: number;
+	/** What was put in front of the owner lately (newest last), so the judge can tell a repeat from news. */
+	surfaced?: { at: number; ask: string; dismissed?: true }[];
 }
 
 /**
@@ -296,6 +302,38 @@ export function configuredMaxBackground(cwd: string): number {
 	return 0;
 }
 
+/**
+ * loop.judge in the project's or agent's settings.json: the classifier model ("provider/id") that decides whether a
+ * run's report interrupts the owner, or "off". Absent: TypeSafe's Jev when it is available.
+ */
+export function configuredJudge(cwd: string): string | undefined {
+	for (const file of [path.join(cwd, ".pi", "settings.json"), path.join(agentDir(), "settings.json")]) {
+		let raw: unknown;
+		try { raw = (JSON.parse(fs.readFileSync(file, "utf8")) as { loop?: { judge?: unknown } }).loop?.judge; } catch { continue; }
+		if (typeof raw === "string" && raw.trim()) return raw.trim();
+	}
+	return undefined;
+}
+
+/** The question the judge answers about a report (a classifier "choice"), tuned on real loop reports. */
+const JUDGE_QUESTION = {
+	type: "choice" as const,
+	instructions: "A scheduled background job just reported to its owner. Decide whether to interrupt the owner with it now. " +
+		"Compare with what was already surfaced to them: an item they were already told about, unchanged, is not news; one they dismissed stays dismissed unless it changed.",
+	criteria: {
+		needs_you: "Something new or changed needs the owner: a decision, an approval, or an action only they can take (sign in, pay, cancel, choose), or something newly broken that stays broken until they act.",
+		worth_knowing: "Something changed or was done that the owner may like to know later, but nothing new waits on them.",
+		routine: "Nothing new: all fine, a repeat of what they were already told, or only bookkeeping.",
+	},
+};
+
+/** The first sentence of a summary, short enough for one line. */
+function firstSentence(s: string): string {
+	const one = s.split("\n")[0]!.trim();
+	const m = /^(.{12,}?[.!?])(\s|$)/.exec(one);
+	return (m ? m[1]! : one).slice(0, 100);
+}
+
 /** "2d", "12h", "30m" from now, or an ISO time: when an ad hoc loop ends. */
 export function parseLifetime(p: { for?: string; until?: string }, now: number): number | string | undefined {
 	if (p.for && p.until) return "use either for or until";
@@ -317,6 +355,7 @@ function registerReportTool(pi: ExtensionAPI, file: () => string | undefined, ru
 		parameters: Type.Object({
 			findings: Type.Boolean({ description: "true only if there is something the owner should see; false when everything is as expected (the run then stays quiet)." }),
 			summary: Type.String({ description: "One line: what this run found or did." }),
+			ask: Type.Optional(Type.String({ description: "Only if the owner must do something only they can (decide, approve, sign in, pay): the one thing, as a short imperative of a few words, e.g. \"Reconnect Stripe in Executor\". Shown to them as is." })),
 			next: Type.Optional(Type.String({ description: "When this loop should run again, e.g. 2m while something is changing, 1h when quiet (1m to 7d)." })),
 			stop: Type.Optional(Type.Boolean({ description: "true when what this loop watches is done, so it should end." })),
 		}),
@@ -324,7 +363,7 @@ function registerReportTool(pi: ExtensionAPI, file: () => string | undefined, ru
 			const f = file();
 			if (!f) return { content: [{ type: "text", text: "No loop run is in progress here, so there is nothing to report to." }], details: {} };
 			fs.mkdirSync(path.dirname(f), { recursive: true });
-			fs.writeFileSync(f, JSON.stringify({ findings: !!p.findings, summary: p.summary, ...(p.next ? { next: p.next } : {}), ...(p.stop ? { stop: true } : {}) }));
+			fs.writeFileSync(f, JSON.stringify({ findings: !!p.findings, summary: p.summary, ...(p.ask ? { ask: String(p.ask).slice(0, 120) } : {}), ...(p.next ? { next: p.next } : {}), ...(p.stop ? { stop: true } : {}) }));
 			return { content: [{ type: "text", text: "Reported." }], details: {} };
 		},
 	});
@@ -347,7 +386,7 @@ function markRun(pi: ExtensionAPI, c: ExtensionContext) {
 }
 
 function readReport(file: string): Report | undefined {
-	try { const r = JSON.parse(fs.readFileSync(file, "utf8")); return { findings: !!r.findings, summary: r.summary, next: r.next, stop: !!r.stop }; } catch { return undefined; }
+	try { const r = JSON.parse(fs.readFileSync(file, "utf8")); return { findings: !!r.findings, summary: r.summary, next: r.next, stop: !!r.stop, ...(r.ask ? { ask: String(r.ask) } : {}) }; } catch { return undefined; }
 }
 
 function slug(prompt: string): string {
@@ -579,21 +618,30 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// -------------------------------------------------------------- display --
 
-	// The status line: one dot per loop and a few words about the one that needs attention.
-	//   ● quiet   ◉ running   ◆ something to see   ✕ failing or needs you   ○ late or waiting   ◌ paused
-	// Its words name, in order: a failure or a run that needs you, results to see, a run in progress,
-	// a loop waiting for this session or late. When all is quiet it is the dots alone. A status bar
-	// extension can show it as one of its rows ("statusbar:*" events); otherwise it's a footer status.
+	// The status line: one dot per loop and, only when something needs the owner, that one thing.
+	//   ● quiet   ◉ running   ✕ needs you   ○ late or waiting   ◌ paused
+	// "Needs you" is a run whose report the judge put in front of the owner (its ask), a run that failed or
+	// asked them something, or a gate failing 3 times in a row. A status bar extension can show the line as
+	// one of its rows ("statusbar:*" events); otherwise it's a footer status.
 	const LATE_MS = 15 * 60_000;
+	const GATE_FAILING = 3;
 	let barMode = false;
 	function loopDot(l: Loop, now: number): Dot {
 		const r = l.lastRun;
-		if ((r?.unread && (r.status === "failed" || r.needsYou)) || (l.gateErrors ?? 0) > 0) return "failing";
-		if (r?.unread) return "see";
+		if (r?.unread && !r.dismissed && (r.status === "failed" || r.needsYou || r.surface === "needs_you")) return "needs";
+		if ((l.gateErrors ?? 0) >= GATE_FAILING) return "needs";
 		if (shared.runs.has(l.id) || phase?.id === l.id) return "running";
 		if (l.paused) return "paused";
 		if (waited.has(l.id) || slotWait.has(l.id) || l.pendingWake || now - l.nextAt > LATE_MS) return "late";
 		return "quiet";
+	}
+	/** The one thing a loop needs from the owner, in a few words (only for "needs"). */
+	function askOf(l: Loop): string {
+		const r = l.lastRun;
+		if (r?.unread && !r.dismissed && (r.status === "failed" || r.needsYou || r.surface === "needs_you"))
+			return r.ask || r.needsYou || (r.status === "failed" ? `${l.id}: run failed` : firstSentence(r.result ?? l.id));
+		if ((l.gateErrors ?? 0) >= GATE_FAILING) return `${l.id}: gate failing`;
+		return "";
 	}
 	function statusLine(theme?: any): string {
 		const fg = (c: string, t: string) => { try { return theme ? theme.fg(c, t) : t; } catch { return t; } };
@@ -602,32 +650,20 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const now = Date.now();
 		const dots = loops.map(l => ({ l, d: loopDot(l, now) }));
 		const strip = dots.map(({ d }) => fg(GLYPH[d].color, GLYPH[d].glyph)).join("");
-		const say = (l: Loop, d: Dot): string => sayDot(l, d, now);
-		const order: Dot[] = ["failing", "see", "running", "late"];
-		const notable = order.flatMap(d => dots.filter(x => x.d === d));
-		let words = "";
-		if (notable.length) {
-			const { l, d } = notable[0]!;
-			words = " " + fg(GLYPH[d].color, say(l, d)) + (notable.length > 1 ? fg("dim", ` +${notable.length - 1}`) : "");
-		}
+		const needs = dots.filter(x => x.d === "needs");
+		const words = needs.length ? " " + fg(GLYPH.needs.color, askOf(needs[0]!.l)) + (needs.length > 1 ? fg("dim", ` +${needs.length - 1}`) : "") : "";
 		return `${fg("muted", "loops")} ${strip}${words}`;
 	}
 
-	/** A few words on why a loop has its symbol (empty for quiet and paused). */
+	/** Why a loop has its symbol, for the loops view (empty for quiet, running and paused). */
 	function sayDot(l: Loop, d: Dot, now = Date.now()): string {
-		const r = l.lastRun;
-		switch (d) {
-			case "failing":
-				if ((l.gateErrors ?? 0) > 0) return `${l.id}: gate failing (${l.gateErrors} in a row)`;
-				return r?.needsYou ? `${l.id}: needs you` : `${l.id}: run failed`;
-			case "see": return `${l.id}: results to see`;
-			case "running": { const at = r?.startedAt; return `${l.id} running${at ? ` ${countdown(Math.max(0, now - at))}` : ""}`; }
-			case "late":
-				if (waited.has(l.id)) return `${l.id} waiting for this session`;
-				if (slotWait.has(l.id)) return `${l.id} waiting for a background slot`;
-				return `${l.id} late ${countdown(Math.max(0, now - l.nextAt))}`;
-			default: return "";
+		if (d === "needs") return askOf(l) + ((l.gateErrors ?? 0) >= GATE_FAILING && !l.lastRun?.unread ? ` (${l.gateErrors} in a row)` : "");
+		if (d === "late") {
+			if (waited.has(l.id)) return "waiting for this session";
+			if (slotWait.has(l.id)) return "waiting for a background slot";
+			return `late ${countdown(Math.max(0, now - l.nextAt))}`;
 		}
+		return "";
 	}
 
 	function refreshStatus() {
@@ -1161,8 +1197,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		run.recorded = true;
 		if (shared.runs.get(id) === run) shared.runs.delete(id);
 		const l = loops.find(x => x.id === id);
+		const ask = o.rep?.ask?.trim() || undefined;
 		const rec: RunRecord = { fire: run.fire, mode: run.mode, status: o.status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
-			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), unread: o.findings && o.status !== "cancelled" };
+			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), ...(ask ? { ask } : {}), unread: false };
 		if (l) {
 			l.lastRun = rec;
 			if (o.status === "done" && o.rep) applyReport(l, o.rep);
@@ -1171,8 +1208,67 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (again && loops.includes(l) && !l.paused) l.nextAt = Math.min(l.nextAt, Date.now());
 			save(); refreshStatus();
 		}
-		if (rec.unread) deliver({ content: `[loop ${id} · background ${run.mode} · run #${run.fire} · ${o.status}] ${rec.result}${rec.needsYou ? `\nneeds you: ${rec.needsYou}` : ""}${rec.session ? `\n(/loop open ${id} to go into it)` : ""}`,
-			details: { id, fire: run.fire, mode: run.mode, status: o.status, session: rec.session } });
+		// What reaches the owner is decided after the run is recorded: a failure or a question for them always,
+		// anything else it reported only when the judge says it needs them.
+		if (o.status === "cancelled") return;
+		if (o.status === "failed" || run.needsYou) { judged(id, run.fire, { surface: "needs_you", ask: run.needsYou || `${id}: run failed`, by: "fact" }); return; }
+		if (!o.findings && !ask) return;
+		const loop = l;
+		void judge(loop, o.summary, ask).then(v => live(cur => cur.judged(id, run.fire, v)));
+	}
+
+	/** Ask the classifier whether this report should interrupt the owner; the run's own ask decides without one. */
+	async function judge(l: Loop | undefined, summary: string, ask: string | undefined): Promise<Verdict> {
+		const fallback: Verdict = { surface: ask ? "needs_you" : "worth_knowing", ...(ask ? { ask } : {}), by: "fallback" };
+		const choice = configuredJudge(ctx?.cwd ?? process.cwd()) ?? "typesafe/jev-latest";
+		if (choice === "off" || !l) return fallback;
+		const slash = choice.indexOf("/");
+		const registry: any = (ctx as any)?.modelRegistry;
+		const model = slash > 0 ? registry?.getModelOfType?.("classifier", choice.slice(0, slash), choice.slice(slash + 1)) : undefined;
+		if (!model || typeof registry?.classify !== "function") return fallback;
+		const ago = (at: number) => countdown(Math.max(0, Date.now() - at)) + " ago";
+		try {
+			const r = await registry.classify(model, {
+				state: {
+					loop: l.id, job: l.prompt.slice(0, 300), report: summary.slice(0, 1500), ...(ask ? { ask } : {}),
+					already_surfaced: (l.surfaced ?? []).slice(-5).map(x => ({ when: ago(x.at), ask: x.ask, ...(x.dismissed ? { owner: "dismissed" } : {}) })),
+				},
+				questions: { surface: JUDGE_QUESTION },
+			});
+			const c = r?.stopReason === "stop" ? r.answers?.surface?.choice : undefined;
+			if (c !== "needs_you" && c !== "worth_knowing" && c !== "routine") return fallback;
+			return { surface: c, ...(ask ? { ask } : {}), by: choice };
+		} catch { return fallback; }
+	}
+
+	/** Record the judge's decision on a run, and put it in front of the owner when it needs them. */
+	function judged(id: string, fire: number, v: Verdict) {
+		const l = loops.find(x => x.id === id);
+		const rec = l?.lastRun;
+		if (!l || !rec || rec.fire !== fire || readOnly) return;
+		rec.surface = v.surface;
+		rec.judgedBy = v.by;
+		if (v.surface === "routine") { save(); refreshStatus(); return; }
+		rec.unread = true;
+		if (v.surface === "needs_you") {
+			rec.ask = v.ask || rec.ask || firstSentence(rec.result ?? id);
+			l.surfaced = [...(l.surfaced ?? []), { at: Date.now(), ask: rec.ask }].slice(-10);
+			deliver({ content: `[loop ${id} · background ${rec.mode} · run #${fire} · ${rec.status}] needs you: ${rec.ask}\n${rec.result ?? ""}${rec.session ? `\n(/loop open ${id} to go into it)` : ""}`,
+				details: { id, fire, mode: rec.mode, status: rec.status, session: rec.session } });
+		}
+		save(); refreshStatus();
+	}
+
+	/** The owner set aside what a loop surfaced: not shown again, and the judge treats a repeat as routine. */
+	function dismiss(id: string): string {
+		const l = find(id);
+		const rec = l?.lastRun;
+		if (!l || !rec?.unread) return `${id} has nothing to dismiss`;
+		rec.unread = false; rec.dismissed = true;
+		const last = l.surfaced?.[l.surfaced.length - 1];
+		if (last && rec.ask && last.ask === rec.ask) last.dismissed = true;
+		save(); refreshStatus();
+		return `dismissed ${id}`;
 	}
 
 	/** A loop_report's next / stop. */
@@ -1369,8 +1465,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const detail = [desc(l), l.run ? `background ${l.run}` : "in conversation", l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
 				r && !live ? `last #${r.fire} ${r.status}${r.result ? `: ${r.result.split("\n")[0]}` : ""}${r.needsYou ? ` · needs you` : ""}` : ""].filter(Boolean).join(" · ");
 			const dot = loopDot(l, Date.now());
-			const why = dot === "running" || dot === "paused" ? "" : sayDot(l, dot).replace(new RegExp(`^${l.id}:? ?`), "");
-			return { id: l.id, state, detail, running: !!live, hasRun: !!r?.session, unread: !!r?.unread, paused: l.paused, dot, ...(why ? { why } : {}) };
+			const why = sayDot(l, dot);
+			// Worth knowing, not yet seen: a muted line in the view only (never the status line).
+			const news = dot !== "needs" && r?.unread && !r.dismissed && r.result ? `new: ${firstSentence(r.result)}` : "";
+			return { id: l.id, state, detail, running: !!live, hasRun: !!r?.session, unread: !!r?.unread, paused: l.paused, dot, ...(why ? { why } : {}), ...(news ? { news } : {}) };
 		});
 	}
 
@@ -1390,6 +1488,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			case "pause": notify(setPaused(action.id, true)); return;
 			case "resume": notify(setPaused(action.id, false)); return;
 			case "stop": notify(await cancelRun(action.id)); return;
+			case "dismiss": notify(dismiss(action.id)); return;
 		}
 	}
 
@@ -1717,7 +1816,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		loops = load();
 		maxBackground = configuredMaxBackground(c.cwd);
 		waited.clear(); declaredSeen = undefined; declaredErrors.clear();
-		const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed };
+		const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed, judged };
 		// Run events go to this instance only once it holds the folder's lock (until then they wait in shared.pending).
 		if (shared.current?.finishRun !== finishRun) shared.current = undefined;
 		// The same process switching sessions (/new, /resume, going into a loop's run) keeps the folder's lock:
