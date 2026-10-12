@@ -47,21 +47,29 @@ Add `-l` to install it for one project only.
 /loop watch|steer|take|open|cancel <id>, /loop leave|done   background runs, below
 ```
 
-## The status line
+## What reaches you
 
-One dot per loop, and a few words only about the loop that needs you:
+A run tells you only what needs you. After a background run reports, a classifier model (TypeSafe's
+Jev by default, through Pi's model registry) reads the report, the run's `ask` and what was put in
+front of you before, and decides:
+
+- **needs you**: a decision, approval or action only you can take, new or changed. It lights the
+  status line with the ask itself and posts it in the conversation.
+- **worth knowing**: shown, muted, in the loops view only.
+- **routine**: recorded, nothing more.
+
+A failed run, or one that asked you something, always needs you. `d` in the loops view dismisses
+what a loop surfaced; the judge then treats a repeat of it as routine. Set the judge in settings
+with `{"loop": {"judge": "<provider>/<id>"}}`, or `"off"`; without one, a run's own `ask` decides.
 
 ```
-loops ●●●●●●                                  all quiet
-loops ●●◉●●● meter-billing running 2m          a run in progress
-loops ●●●●◆● engineering-health: results to see
-loops ●●✕●●● gateway-upkeep: gate failing (3 in a row)
-loops ●●●○●● ci-upkeep late 20m                 waiting for this session, or overdue
+loops ●●●●●●
+loops ●●✕●●● Reconnect Stripe in Executor
+loops ●●✕●✕● Reconnect Stripe in Executor +1
 ```
 
-`●` quiet, `◉` running, `◆` results to see, `✕` failing or needs you, `○` late or waiting, `◌` paused.
-The words name the most urgent one (failing, then results, then running, then late), `+N` for the rest.
-The loops view (`/loop`) shows the same symbol on each loop, with the reason beside it, and the key at the bottom.
+`●` quiet, `◉` running, `✕` needs you, `○` late or waiting, `◌` paused. The loops view (`/loop`)
+shows the same symbols, the reason beside each, and the key.
 
 A status bar extension can show this line as one of its rows: when it emits `statusbar:ready` on
 `pi.events`, pi-loop sends `statusbar:item` (`{ id: "loops", order, render(theme, width), open(ctx) }`,

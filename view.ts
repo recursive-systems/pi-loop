@@ -2,24 +2,23 @@
  * The loops view (/loop in the terminal UI): every loop with its state, and a live view of a run you can steer.
  *
  *   list    one row per loop, its state as a symbol (the key is at the bottom, the same as the status line's)
- *           ↑/↓ or j/k move · Enter watch its run · t go into its run · r run now · p pause/resume · x cancel its run · Esc close
+ *           ↑/↓ or j/k move · d dismiss what it surfaced · Enter watch its run · t go into its run · r run now · p pause/resume · x cancel its run · Esc close
  *   watch   type to steer, Enter sends · Tab go into the run · Esc back to the list
  */
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 /** A loop's state at a glance, the same in the status line and in this view. */
-export type Dot = "quiet" | "running" | "see" | "failing" | "late" | "paused";
+export type Dot = "quiet" | "running" | "needs" | "late" | "paused";
 export const GLYPH: Record<Dot, { glyph: string; color: string; meaning: string }> = {
 	quiet: { glyph: "●", color: "dim", meaning: "quiet" },
 	running: { glyph: "◉", color: "accent", meaning: "running" },
-	see: { glyph: "◆", color: "warning", meaning: "to see" },
-	failing: { glyph: "✕", color: "error", meaning: "failing" },
+	needs: { glyph: "✕", color: "error", meaning: "needs you" },
 	late: { glyph: "○", color: "warning", meaning: "late" },
 	paused: { glyph: "◌", color: "dim", meaning: "paused" },
 };
 
-export interface LoopRow { id: string; state: string; detail: string; running: boolean; hasRun: boolean; unread: boolean; paused: boolean; dot: Dot; why?: string }
-export type ViewAction = { action: "take" | "run" | "pause" | "resume" | "stop"; id: string } | undefined;
+export interface LoopRow { id: string; state: string; detail: string; running: boolean; hasRun: boolean; unread: boolean; paused: boolean; dot: Dot; why?: string; news?: string }
+export type ViewAction = { action: "take" | "run" | "pause" | "resume" | "stop" | "dismiss"; id: string } | undefined;
 
 export interface ViewDeps {
 	rows(): LoopRow[];
@@ -77,6 +76,7 @@ export class LoopsView {
 		else if (data === "t") { if (row.hasRun || row.running) { this.finish({ action: "take", id: row.id }); return; } this.note = `${row.id} has no run to go into`; }
 		else if (data === "r") { this.finish({ action: "run", id: row.id }); return; }
 		else if (data === "p") { this.finish({ action: row.paused ? "resume" : "pause", id: row.id }); return; }
+		else if (data === "d") { if (row.dot === "needs" || row.news) { this.finish({ action: "dismiss", id: row.id }); return; } this.note = `${row.id} has nothing to dismiss`; }
 		else if (data === "x") { if (row.running) { this.finish({ action: "stop", id: row.id }); return; } this.note = `${row.id} has no run going`; }
 		this.tui.requestRender();
 	}
@@ -108,6 +108,7 @@ export class LoopsView {
 			const why = r.why ? `  ${this.fg(GLYPH[r.dot].color === "dim" ? "muted" : GLYPH[r.dot].color, r.why)}` : "";
 			put(`${mark}${dot}${i === this.sel ? this.fg("accent", r.id) : r.id}  ${this.fg("muted", r.state)}${why}`);
 			if (r.detail) put(`      ${this.fg("muted", r.detail)}`);
+			if (r.news) put(`      ${this.fg("muted", r.news)}`);
 		});
 		put("");
 		// The key: every symbol and what it means, wrapped to the view's width.
@@ -118,7 +119,7 @@ export class LoopsView {
 			line += (len ? "   " : "") + k.text; len += (len ? 3 : 0) + k.len;
 		}
 		if (line) put(line);
-		put(this.fg("muted", this.note || "Enter watch · t go in · r run now · p pause/resume · x cancel run · Esc close"));
+		put(this.fg("muted", this.note || "Enter watch · t go in · r run now · p pause/resume · d dismiss · x cancel run · Esc close"));
 		return out;
 	}
 }

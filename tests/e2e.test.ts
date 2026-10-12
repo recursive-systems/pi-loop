@@ -1069,6 +1069,41 @@ test("the loops view in Pi's terminal UI: cards for each loop, a run's transcrip
 });
 
 
+test("the status line shows only what needs you: the judged ask, not results that are worth knowing; d in the view dismisses it", { timeout: 120_000 }, async t => {
+	const p = project(t);
+	const run = (extra: object) => ({ fire: 3, mode: "fresh", status: "done", startedAt: Date.now() - 90_000, endedAt: Date.now() - 60_000, findings: true, unread: true, ...extra });
+	fs.writeFileSync(path.join(p.cwd, ".pi/loops.json"), JSON.stringify([
+		{ ...due("billing"), nextAt: Date.now() + 3_600_000, run: "fresh",
+			lastRun: run({ result: "The Stripe connection was rejected, so billing sync stopped.", surface: "needs_you", ask: "Reconnect Stripe in Executor" }),
+			surfaced: [{ at: Date.now() - 60_000, ask: "Reconnect Stripe in Executor" }] },
+		{ ...due("ci"), nextAt: Date.now() + 3_600_000, run: "fresh", lastRun: run({ result: "Shipped 2 fixes. CI is green.", surface: "worth_knowing" }) },
+		{ ...due("health"), nextAt: Date.now() + 3_600_000, run: "fresh", lastRun: run({ result: "Still open: two items." }) },
+	]));
+	const term = spawn("python3", [path.join(PACKAGE, "tests/terminal.py"), PI, "--no-session", "-e", PACKAGE], { cwd: p.cwd, env: { ...process.env, PI_CODING_AGENT_DIR: p.agent, TERM: "xterm-256color" } });
+	let screen = "";
+	term.stdout.setEncoding("utf8");
+	term.stdout.on("data", (d: string) => { screen += d; });
+	t.after(() => term.kill("SIGTERM"));
+	const plain = () => screen.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]/g, "");
+	const seen = async (re: RegExp, what: string, from = 0, ms = 30_000) => {
+		const end = Date.now() + ms;
+		while (!re.test(plain().slice(from))) { if (Date.now() > end) throw new Error(`no ${what} on screen; last: ${plain().slice(-1500)}`); await new Promise(r => setTimeout(r, 200)); }
+	};
+	const type = async (s: string) => { term.stdin.write(s); await new Promise(r => setTimeout(r, 400)); };
+	await seen(/loops ✕●● Reconnect Stripe in Executor/, "the ask, and quiet dots for the others", 0, 60_000);
+	assert.doesNotMatch(plain(), /results to see|Shipped 2 fixes\. CI/, "nothing worth knowing in the status line");
+	await type("/loop");
+	await type("\r");
+	await seen(/new: Shipped 2 fixes\./, "what is worth knowing, in the view");
+	await seen(/✕ needs you/, "the key");
+	const before = plain().length;
+	await type("d");
+	await seen(/loops ●●●/, "all quiet after dismissing", before);
+	const billing = p.loops().find((l: any) => l.id === "billing");
+	assert.equal(billing.lastRun.dismissed, true);
+	assert.equal(billing.surfaced.at(-1).dismissed, true, "the judge will see it was dismissed");
+});
+
 // The switch and lock mechanics need no model: on the closed provider a run's turn fails at once and the run settles.
 async function closedSession(t: any, args: string[] = [], opts: Parameters<typeof project>[1] = {}) {
 	const p = project(t, opts);
