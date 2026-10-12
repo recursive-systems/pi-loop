@@ -46,7 +46,7 @@ import { Run, RUN_MODES, extensionFlags, lastAssistantText, sessionFolder, trans
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
-import { LoopsView, type LoopRow, type ViewAction } from "./view.ts";
+import { LoopsView, GLYPH, type Dot, type LoopRow, type ViewAction } from "./view.ts";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
 type Phase = { state: "queued" | "running"; id: string } | undefined;
@@ -586,7 +586,6 @@ export default function loopExtension(pi: ExtensionAPI) {
 	// extension can show it as one of its rows ("statusbar:*" events); otherwise it's a footer status.
 	const LATE_MS = 15 * 60_000;
 	let barMode = false;
-	type Dot = "quiet" | "running" | "see" | "failing" | "late" | "paused";
 	function loopDot(l: Loop, now: number): Dot {
 		const r = l.lastRun;
 		if ((r?.unread && (r.status === "failed" || r.needsYou)) || (l.gateErrors ?? 0) > 0) return "failing";
@@ -602,34 +601,33 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (shared.away) return `loops: in ${shared.away.id}'s run · /loop leave or /loop done`;
 		const now = Date.now();
 		const dots = loops.map(l => ({ l, d: loopDot(l, now) }));
-		const glyph: Record<Dot, [string, string]> = {
-			quiet: ["●", "dim"], running: ["◉", "accent"], see: ["◆", "warning"], failing: ["✕", "error"], late: ["○", "warning"], paused: ["◌", "dim"],
-		};
-		const strip = dots.map(({ d }) => fg(glyph[d][1], glyph[d][0])).join("");
-		const say = (l: Loop, d: Dot): string => {
-			const r = l.lastRun;
-			switch (d) {
-				case "failing":
-					if ((l.gateErrors ?? 0) > 0) return `${l.id}: gate failing (${l.gateErrors} in a row)`;
-					return r?.needsYou ? `${l.id}: needs you` : `${l.id}: run failed`;
-				case "see": return `${l.id}: results to see`;
-				case "running": { const at = r?.startedAt; return `${l.id} running${at ? ` ${countdown(Math.max(0, now - at))}` : ""}`; }
-				case "late":
-					if (waited.has(l.id)) return `${l.id} waiting for this session`;
-					if (slotWait.has(l.id)) return `${l.id} waiting for a background slot`;
-					return `${l.id} late ${countdown(Math.max(0, now - l.nextAt))}`;
-				default: return "";
-			}
-		};
+		const strip = dots.map(({ d }) => fg(GLYPH[d].color, GLYPH[d].glyph)).join("");
+		const say = (l: Loop, d: Dot): string => sayDot(l, d, now);
 		const order: Dot[] = ["failing", "see", "running", "late"];
 		const notable = order.flatMap(d => dots.filter(x => x.d === d));
-		const color: Record<string, string> = { failing: "error", see: "warning", running: "accent", late: "warning" };
 		let words = "";
 		if (notable.length) {
 			const { l, d } = notable[0]!;
-			words = " " + fg(color[d]!, say(l, d)) + (notable.length > 1 ? fg("dim", ` +${notable.length - 1}`) : "");
+			words = " " + fg(GLYPH[d].color, say(l, d)) + (notable.length > 1 ? fg("dim", ` +${notable.length - 1}`) : "");
 		}
 		return `${fg("muted", "loops")} ${strip}${words}`;
+	}
+
+	/** A few words on why a loop has its symbol (empty for quiet and paused). */
+	function sayDot(l: Loop, d: Dot, now = Date.now()): string {
+		const r = l.lastRun;
+		switch (d) {
+			case "failing":
+				if ((l.gateErrors ?? 0) > 0) return `${l.id}: gate failing (${l.gateErrors} in a row)`;
+				return r?.needsYou ? `${l.id}: needs you` : `${l.id}: run failed`;
+			case "see": return `${l.id}: results to see`;
+			case "running": { const at = r?.startedAt; return `${l.id} running${at ? ` ${countdown(Math.max(0, now - at))}` : ""}`; }
+			case "late":
+				if (waited.has(l.id)) return `${l.id} waiting for this session`;
+				if (slotWait.has(l.id)) return `${l.id} waiting for a background slot`;
+				return `${l.id} late ${countdown(Math.max(0, now - l.nextAt))}`;
+			default: return "";
+		}
 	}
 
 	function refreshStatus() {
@@ -1370,7 +1368,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const state = live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
 			const detail = [desc(l), l.run ? `background ${l.run}` : "in conversation", l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
 				r && !live ? `last #${r.fire} ${r.status}${r.result ? `: ${r.result.split("\n")[0]}` : ""}${r.needsYou ? ` · needs you` : ""}` : ""].filter(Boolean).join(" · ");
-			return { id: l.id, state, detail, running: !!live, hasRun: !!r?.session, unread: !!r?.unread, paused: l.paused };
+			const dot = loopDot(l, Date.now());
+			const why = dot === "running" || dot === "paused" ? "" : sayDot(l, dot).replace(new RegExp(`^${l.id}:? ?`), "");
+			return { id: l.id, state, detail, running: !!live, hasRun: !!r?.session, unread: !!r?.unread, paused: l.paused, dot, ...(why ? { why } : {}) };
 		});
 	}
 

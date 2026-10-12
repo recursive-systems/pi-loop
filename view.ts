@@ -1,12 +1,24 @@
 /**
  * The loops view (/loop in the terminal UI): every loop with its state, and a live view of a run you can steer.
  *
- *   list    ↑/↓ or j/k move · Enter watch its run · t go into its run · r run now · p pause/resume · x cancel its run · Esc close
+ *   list    one row per loop, its state as a symbol (the key is at the bottom, the same as the status line's)
+ *           ↑/↓ or j/k move · Enter watch its run · t go into its run · r run now · p pause/resume · x cancel its run · Esc close
  *   watch   type to steer, Enter sends · Tab go into the run · Esc back to the list
  */
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
-export interface LoopRow { id: string; state: string; detail: string; running: boolean; hasRun: boolean; unread: boolean; paused: boolean }
+/** A loop's state at a glance, the same in the status line and in this view. */
+export type Dot = "quiet" | "running" | "see" | "failing" | "late" | "paused";
+export const GLYPH: Record<Dot, { glyph: string; color: string; meaning: string }> = {
+	quiet: { glyph: "●", color: "dim", meaning: "quiet" },
+	running: { glyph: "◉", color: "accent", meaning: "running" },
+	see: { glyph: "◆", color: "warning", meaning: "to see" },
+	failing: { glyph: "✕", color: "error", meaning: "failing" },
+	late: { glyph: "○", color: "warning", meaning: "late" },
+	paused: { glyph: "◌", color: "dim", meaning: "paused" },
+};
+
+export interface LoopRow { id: string; state: string; detail: string; running: boolean; hasRun: boolean; unread: boolean; paused: boolean; dot: Dot; why?: string }
 export type ViewAction = { action: "take" | "run" | "pause" | "resume" | "stop"; id: string } | undefined;
 
 export interface ViewDeps {
@@ -91,11 +103,21 @@ export class LoopsView {
 		if (!rows.length) put(this.fg("muted", "No loops."));
 		rows.forEach((r, i) => {
 			const mark = i === this.sel ? "▸ " : "  ";
-			const dot = r.running ? this.fg("accent", "● ") : r.unread ? this.fg("warning", "◆ ") : "  ";
-			put(`${mark}${dot}${i === this.sel ? this.fg("accent", r.id) : r.id}  ${this.fg("muted", r.state)}`);
+			const g = GLYPH[r.dot];
+			const dot = this.fg(g.color, `${g.glyph} `);
+			const why = r.why ? `  ${this.fg(GLYPH[r.dot].color === "dim" ? "muted" : GLYPH[r.dot].color, r.why)}` : "";
+			put(`${mark}${dot}${i === this.sel ? this.fg("accent", r.id) : r.id}  ${this.fg("muted", r.state)}${why}`);
 			if (r.detail) put(`      ${this.fg("muted", r.detail)}`);
 		});
 		put("");
+		// The key: every symbol and what it means, wrapped to the view's width.
+		const keys = Object.values(GLYPH).map(g => ({ text: `${this.fg(g.color, g.glyph)} ${this.fg("muted", g.meaning)}`, len: g.meaning.length + 2 }));
+		let line = "", len = 0;
+		for (const k of keys) {
+			if (len && len + 3 + k.len > w) { put(line); line = ""; len = 0; }
+			line += (len ? "   " : "") + k.text; len += (len ? 3 : 0) + k.len;
+		}
+		if (line) put(line);
 		put(this.fg("muted", this.note || "Enter watch · t go in · r run now · p pause/resume · x cancel run · Esc close"));
 		return out;
 	}
