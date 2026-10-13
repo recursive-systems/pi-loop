@@ -1104,6 +1104,36 @@ test("the status line shows only what needs you: the judged ask, not results tha
 	assert.equal(billing.surfaced.at(-1).dismissed, true, "the judge will see it was dismissed");
 });
 
+const asking = (id: string) => ({ ...due(id), nextAt: Date.now() + 3_600_000, run: "fresh",
+	lastRun: { fire: 3, mode: "fresh", status: "done", startedAt: Date.now() - 90_000, endedAt: Date.now() - 60_000, findings: true, unread: true,
+		result: "The Stripe connection was rejected, so billing sync stopped.", surface: "needs_you", ask: "Reconnect Stripe in Executor" },
+	surfaced: [{ at: Date.now() - 60_000, ask: "Reconnect Stripe in Executor" }] });
+
+test("/loop dismiss <id> clears what a loop surfaced, without the view", async t => {
+	const p = project(t, { loops: [asking("billing")] });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	assert.match(await pi.command("/loop dismiss billing"), /dismissed billing/);
+	const billing = p.loops().find((l: any) => l.id === "billing");
+	assert.equal(billing.lastRun.unread, false);
+	assert.equal(billing.lastRun.dismissed, true);
+	assert.equal(billing.surfaced.at(-1).dismissed, true, "the judge will see it was dismissed");
+	assert.match(await pi.command("/loop dismiss billing"), /billing has nothing to dismiss/);
+});
+
+test("told that what a loop asked is handled, the agent dismisses it with loop_manage", { skip: real }, async t => {
+	const p = project(t, { fireworks: true, loops: [asking("billing"), { ...due("ci"), nextAt: Date.now() + 3_600_000 }] });
+	const pi = new Pi(t, p);
+	await pi.ready();
+	await pi.ask("I reconnected Stripe, so the billing loop's question is handled. Clear it so it stops showing.");
+	const calls = pi.lines.filter(l => l.type === "tool_execution_start" && l.toolName === "loop_manage").map(l => l.args);
+	assert.ok(calls.some((a: any) => a?.action === "dismiss"), `loop_manage dismiss was called: ${JSON.stringify(calls)}`);
+	const loops = p.loops();
+	assert.equal(loops.find((l: any) => l.id === "billing").lastRun.dismissed, true, JSON.stringify(loops));
+	assert.equal(loops.length, 2, "nothing deleted");
+	assert.ok(!loops.some((l: any) => l.paused), "nothing paused");
+});
+
 // The switch and lock mechanics need no model: on the closed provider a run's turn fails at once and the run settles.
 async function closedSession(t: any, args: string[] = [], opts: Parameters<typeof project>[1] = {}) {
 	const p = project(t, opts);

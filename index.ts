@@ -1261,9 +1261,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** The owner set aside what a loop surfaced: not shown again, and the judge treats a repeat as routine. */
 	function dismiss(id: string): string {
+		if (readOnly) return `loops are owned by pid ${ownerPid()}`;
 		const l = find(id);
+		if (!l) return `no loop "${id}"`;
 		const rec = l?.lastRun;
-		if (!l || !rec?.unread) return `${id} has nothing to dismiss`;
+		if (!rec?.unread) return `${l.id} has nothing to dismiss`;
 		rec.unread = false; rec.dismissed = true;
 		const last = l.surfaced?.[l.surfaced.length - 1];
 		if (last && rec.ask && last.ask === rec.ask) last.dismissed = true;
@@ -1938,7 +1940,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	// -------------------------------------------------------------- command --
 
 	pi.registerCommand("loop", {
-		description: "Recurring prompts: /loop [10m|2h|1d|at HH:MM [Area/City]] <prompt> · /loop (the loops view) · /loop rm|pause|resume|run|test|watch|take|open|cancel <id> · /loop steer <id> <text> · /loop leave|done · /loop clear",
+		description: "Recurring prompts: /loop [10m|2h|1d|at HH:MM [Area/City]] <prompt> · /loop (the loops view) · /loop rm|pause|resume|run|test|dismiss|watch|take|open|cancel <id> · /loop steer <id> <text> · /loop leave|done · /loop clear",
 		handler: async (args: string, commandCtx?: ExtensionContext) => {
 			await settledClaim();
 			refreshZone();
@@ -1975,6 +1977,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 					case "pause": notify(setPaused(target, true)); return;
 					case "resume": notify(setPaused(target, false)); return;
 					case "test": notify(await testGate(target, commandCtx)); return;
+					case "dismiss": notify(dismiss(target)); return;
 					case "run": case "now": {
 						if (readOnly) { notify(`loops are owned by pid ${ownerPid()}`, "warning"); return; }
 						const l = find(target)!; const err = fire(l, "manual"); notify(err ?? `fired ${l.id}`); return;
@@ -2036,8 +2039,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		name: "loop_manage",
 		label: "Manage loops",
 		description:
-			"Recurring prompts (loops) in this session: create, list, delete, pause, resume, run (fire now), gate (set or remove a gate) " +
-			"or test (run the gate once without waking). A loop's turn runs in this conversation, or (run) in the background as a fork of it, " +
+			"Recurring prompts (loops) in this session: create, list, delete, pause, resume, run (fire now), gate (set or remove a gate), " +
+			"test (run the gate once without waking) or dismiss (clear what a loop's last run surfaced, once the owner says it's handled). A loop's turn runs in this conversation, or (run) in the background as a fork of it, " +
 			"its own thread or a fresh conversation, which the owner can watch, steer or go into with /loop. Every loop run ends with loop_report " +
 			"(findings or not; optionally when to run next, or stop), so a self-paced loop (every: auto) chooses its own next time. Loops made here " +
 			"end after 7 days unless for/until says otherwise. " +
@@ -2047,7 +2050,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			"session is busy and fires once when it is free (highest priority first), never stacking. A loop can have its own folder " +
 			"(dir) holding its gate, prompt template and context files. Loops can also be declared in .pi/loop.json files (see the " +
 			"pi-loop skill). Loops persist across restarts and fire only while a Pi session is open in this project.",
-		promptSnippet: "Schedule recurring prompts in this session (/loop): create, list, delete, pause, resume, run, gate, test",
+		promptSnippet: "Schedule recurring prompts in this session (/loop): create, list, delete, pause, resume, run, gate, test, dismiss",
 		promptGuidelines: [
 			"Use loop_manage when the user wants something done periodically or daily in this session; reply with the loop id and next fire time. Run loop_manage list first and change an existing loop rather than adding a duplicate.",
 			"For loop_manage loops, put the instructions in a prompt template (.pi/prompts/<name>.md) and make the loop prompt /<name>, saying where results go; a loop turn's output stays in this session otherwise.",
@@ -2057,7 +2060,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal("create"), Type.Literal("list"), Type.Literal("delete"),
-				Type.Literal("pause"), Type.Literal("resume"), Type.Literal("run"), Type.Literal("gate"), Type.Literal("test"),
+				Type.Literal("pause"), Type.Literal("resume"), Type.Literal("run"), Type.Literal("gate"), Type.Literal("test"), Type.Literal("dismiss"),
 			]),
 			prompt: Type.Optional(Type.String({ description: "create: the prompt to re-send each time." })),
 			every: Type.Optional(Type.String({ description: "create: fixed interval like 5m, 2h, 1d. Default 10m. Mutually exclusive with `at`." })),
@@ -2085,6 +2088,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 					case "delete": return remove(p.id ?? "");
 					case "pause": return setPaused(p.id ?? "", true);
 					case "resume": return setPaused(p.id ?? "", false);
+					case "dismiss": return dismiss(p.id ?? "");
 					case "run": {
 						if (readOnly) return `loops are owned by pid ${ownerPid()}`;
 						const l = find(p.id ?? ""); if (!l) return `no loop "${p.id}"`;

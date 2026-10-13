@@ -127,9 +127,10 @@ true only if there is something the owner should see (a background run with no f
 quiet), a one-line summary, `ask` only when the owner must do something only they can (the one
 thing, a few words: "Reconnect Stripe in Executor"; it is shown to them as is), and `next` or `stop`
 when the timing should change. A classifier decides from the report and what the owner was already
-told whether it interrupts them; anything else waits in the loops view. To stop or change the loop,
-use `loop_manage` (`pause`, `delete`, `gate`), or edit its `.pi/loop.json` if it is declared there.
-Don't just ignore the loop.
+told whether it interrupts them; anything else waits in the loops view. When the owner says what a
+loop surfaced is handled, clear it with `loop_manage` `dismiss` (never on your own judgment). To stop
+or change the loop, use `loop_manage` (`pause`, `delete`, `gate`), or edit its `.pi/loop.json` if it
+is declared there. Don't just ignore the loop.
 
 When the job delegates authorized async work, a compatible pi-subagents version keeps this run
 alive for the native completion. You can end the launch turn and let that notice wake the same
