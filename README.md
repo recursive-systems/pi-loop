@@ -76,6 +76,18 @@ A status bar extension can show this line as one of its rows: when it emits `sta
 `pi.events`, pi-loop sends `statusbar:item` (`{ id: "loops", order, render(theme, width), open(ctx) }`,
 `open` shows the loops view) instead of setting a footer status.
 
+Other extensions can follow the loops too, to show them in a terminal multiplexer's sidebar or send a
+notification, without pi-loop knowing about either. Each time the loops change, pi-loop emits
+`loop:state` on `pi.events`:
+
+```js
+{ v: 1, loops: [{ id: "backup", state: "needs", ask: "Reconnect the storage account", nextAt: 1767225600000 }] }
+```
+
+`state` is a symbol's name (`quiet`, `running`, `needs`, `late`, `paused`), `ask` comes only with
+`needs`, and `nextAt` is in epoch milliseconds. A session that doesn't own the folder's loops sends
+an empty list. Emit `loop:ready` to get the current state again, for example when your extension starts.
+
 ## Background runs
 
 A loop with `run` set does its work in a separate Pi beside your conversation:

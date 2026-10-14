@@ -30,7 +30,9 @@ schedule. Optional gate scripts decide whether a due loop wakes the model.
   only after `sendUserMessage` returns, so a crash re-sends the same id and fire: a host must treat
   that as the same occurrence. Keep that contract working: the lock, kept wakes and draining gates at
   shutdown are what make it safe.
-- The `[loop <id> · … ]` header line is a public contract. Change it only in a major version.
+- The `[loop <id> · … ]` header line is a public contract. Change it only in a major version. So are
+  the `pi.events` channels (`statusbar:*`, `loop:state` v1 and `loop:ready`): hosts such as
+  multiplexers adapt to them in their own extensions, never here.
 
 ## Writing for people
 

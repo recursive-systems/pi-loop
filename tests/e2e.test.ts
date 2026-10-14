@@ -218,6 +218,46 @@ test("a project's loops have one owner; a second session is read-only", async t 
 	assert.deepEqual(p.loops().map((l: any) => l.id), ["one"]);
 });
 
+test("other extensions hear what the loops are doing on pi.events, and can ask for it again", async t => {
+	const later = (id: string, extra: object = {}) => due(id, { nextAt: Date.now() + 3_600_000, ...extra });
+	const p = project(t, { loops: [later("quiet"), later("resting", { paused: true }), later("broken", { gateErrors: 3 })] });
+	// A listener as another extension would be: it records each loop:state and asks with loop:ready on /probe-ready.
+	const heard = path.join(p.cwd, "heard.jsonl"), probe = path.join(p.cwd, "probe.ts");
+	fs.writeFileSync(probe, `import fs from "node:fs";
+export default function (pi: any) {
+	pi.events.on("loop:state", (s: any) => fs.appendFileSync(${JSON.stringify(heard)}, JSON.stringify({ pid: process.pid, ...s }) + "\\n"));
+	pi.registerCommand("probe-ready", { description: "ask", handler: async () => pi.events.emit("loop:ready", {}) });
+}
+`);
+	const states = () => { try { return fs.readFileSync(heard, "utf8").trim().split("\n").map(l => JSON.parse(l)); } catch { return []; } };
+	const until = async (pred: (s: any) => boolean) => {
+		const end = Date.now() + 15_000;
+		while (!states().some(pred)) { if (Date.now() > end) throw new Error(`no matching loop:state; heard ${JSON.stringify(states())}`); await new Promise(r => setTimeout(r, 200)); }
+		return states().filter(pred).pop();
+	};
+	const owner = new Pi(t, p, {}, { args: ["-e", probe] });
+	await owner.ready();
+	const s = await until(s => s.loops.length === 3);
+	assert.equal(s.v, 1);
+	assert.deepEqual(s.loops.map((l: any) => [l.id, l.state, l.ask]), [["quiet", "quiet", undefined], ["resting", "paused", undefined], ["broken", "needs", "broken: gate failing"]]);
+	assert.ok(s.loops.every((l: any) => typeof l.nextAt === "number"));
+
+	// A change is sent once; nothing is re-sent while nothing changes.
+	await owner.command("/loop pause quiet");
+	await until(s => s.loops[0]?.state === "paused");
+	const n = states().length;
+	await owner.command("/probe-ready");
+	await until(() => states().length === n + 1);
+	assert.deepEqual(states()[n], states()[n - 1], "loop:ready re-sends the current state");
+
+	// A session that doesn't own the loops says it has none, so a sidebar doesn't show them twice.
+	const second = new Pi(t, p, {}, { args: ["-e", probe] });
+	await second.ready();
+	await second.command("/probe-ready");
+	const other = await until(s => s.pid === second.proc.pid);
+	assert.deepEqual(other.loops, []);
+});
+
 test("a loop that came due while no session ran fires once on start, with its header", async t => {
 	const p = project(t, { loops: [due("nightly")] });
 	const pi = new Pi(t, p);
