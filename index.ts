@@ -666,8 +666,28 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return "";
 	}
 
+	// What the loops are doing, for other extensions (a terminal multiplexer's sidebar, a notifier) on `pi.events`:
+	//   loop:state  (sent here) { v: 1, loops: [{ id, state, ask?, nextAt }] } each time it changes; state is a
+	//               symbol's name (quiet, running, needs, late, paused), ask only for needs. No loops while this
+	//               session doesn't own them (another session does).
+	//   loop:ready  (send it) asks for the current loop:state, e.g. when your extension starts.
+	let sentState = "";
+	function publishState(force = false) {
+		const now = Date.now();
+		const state = { v: 1, loops: readOnly ? [] : loops.map(l => {
+			const d = loopDot(l, now), ask = d === "needs" ? askOf(l) : "";
+			return { id: l.id, state: d, ...(ask ? { ask } : {}), nextAt: l.nextAt };
+		}) };
+		const json = JSON.stringify(state);
+		if (!force && json === sentState) return;
+		sentState = json;
+		pi.events.emit("loop:state", state);
+	}
+	pi.events.on("loop:ready", () => { if (ctx) publishState(true); });
+
 	function refreshStatus() {
 		if (!ctx) return;
+		publishState();
 		if (!loops.length) {
 			if (barMode) pi.events.emit("statusbar:remove", { id: "loops" }); else ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
