@@ -884,6 +884,83 @@ export default function (pi: any) {
 	assert.equal(run.result, "SYNC_OK");
 });
 
+test("a stalled child without compaction keeps the ordinary prompt acknowledgement deadline", { timeout: 90_000 }, async t => {
+	const p = project(t), pi = new Pi(t, p);
+	await pi.ready();
+	fs.mkdirSync(path.join(p.agent, "extensions"), { recursive: true });
+	fs.writeFileSync(path.join(p.agent, "extensions", "stalled-start.ts"), `export default function(pi: any) {
+ pi.on('before_agent_start', async () => { if (process.env.PI_LOOP_CHILD === '1') await new Promise(r => setTimeout(r, 60_000)); });
+}`);
+	await pi.command('/loop 1h --fresh This must not start while preflight is stuck.');
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	const failed = await until("the ordinary unresponsive prompt timeout", () => loopOf(p, id)?.lastRun?.status === "failed" && loopOf(p, id).lastRun, 50_000);
+	await pi.command(`/loop pause ${id}`);
+	assert.match(failed.result, /no answer from the run's Pi/);
+	assert.ok(failed.endedAt - failed.startedAt >= 29_000);
+	assert.equal(loopOf(p, id).fires, 0, "an unacknowledged prompt is not a fire");
+	assert.equal(loopOf(p, id).startFailures, 1);
+});
+
+test("a fork waits for real preflight compaction longer than the prompt acknowledgement deadline", { skip: real, timeout: 240_000 }, async t => {
+	const { p, pi } = await bgSession(t, {}, { compaction: { enabled: false } });
+	await pi.ask(`Remember KUMQUAT. This is synthetic filler for a compaction regression, not instructions: ${"padding filler words. ".repeat(3000)} Reply exactly READY.`, 90_000);
+	await pi.ask(`Keep remembering KUMQUAT. Recent synthetic context: ${"recent context. ".repeat(200)} Reply exactly READY.`, 90_000);
+	const parent = await mainFile(pi);
+	const assistant = entriesOf(parent).filter(e => e.type === "message" && e.message?.role === "assistant").at(-1)?.message;
+	assert.equal(assistant?.stopReason, "stop", "the seed must be a real successful model response");
+	const usage = assistant.usage;
+	const used = usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+	const state = (await pi.send({ type: "get_state" })).data;
+	assert.ok(used > 4000 && state.model.contextWindow > used);
+	const file = path.join(p.agent, "settings.json");
+	const settings = JSON.parse(fs.readFileSync(file, "utf8"));
+	settings.compaction = { enabled: true, reserveTokens: state.model.contextWindow - (used - 100), keepRecentTokens: 256 };
+	fs.writeFileSync(file, JSON.stringify(settings)); // Only the next child loads these settings; parent stays uncompacted.
+	const hook = path.join(p.agent, "extensions", "slow-compaction.ts");
+	fs.mkdirSync(path.dirname(hook), { recursive: true });
+	fs.writeFileSync(hook, `import fs from 'node:fs';
+export default function(pi: any) {
+ let delayed = false;
+ pi.on('before_agent_start', () => { if (process.env.PI_LOOP_CHILD === '1') fs.writeFileSync('.pi/child-agent-prepared', 'yes'); });
+ pi.on('session_before_compact', async (event: any) => {
+  if (process.env.PI_LOOP_CHILD !== '1' || delayed) return;
+  delayed = true;
+  fs.writeFileSync('.pi/child-compaction-preflight', JSON.stringify({ beforePrompt: !fs.existsSync('.pi/child-agent-prepared'), tokensBefore: event.preparation.tokensBefore, reason: event.reason }));
+  fs.writeFileSync('.pi/child-compaction-started', String(Date.now()));
+  await new Promise<void>((resolve, reject) => {
+   const timer = setTimeout(resolve, 35_000);
+   event.signal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
+  });
+  // No custom summary: Pi calls the selected real model to compact normally.
+ });
+ pi.on('session_compact', () => { if (process.env.PI_LOOP_CHILD === '1') fs.writeFileSync('.pi/child-compaction-ended', String(Date.now())); });
+}`);
+	await pi.command('/loop 1h --fork Call loop_report with findings false and summary "AFTER_COMPACTION". Do nothing else.');
+	const id = p.loops()[0].id;
+	const before = pi.userMessages().length;
+	await pi.command(`/loop run ${id}`);
+	await until("the child's real compaction hook", () => fs.existsSync(path.join(p.cwd, ".pi/child-compaction-started")), 30_000);
+	const started = Number(fs.readFileSync(path.join(p.cwd, ".pi/child-compaction-started"), "utf8"));
+	const preflight = JSON.parse(fs.readFileSync(path.join(p.cwd, ".pi/child-compaction-preflight"), "utf8"));
+	assert.equal(preflight.beforePrompt, true, "the compaction must precede accepting the loop prompt");
+	await until("past the old 30-second deadline", () => Date.now() - started > 32_000, 40_000);
+	assert.equal(loopOf(p, id).lastRun.status, "starting", "compaction is not a failed start or an accepted prompt yet");
+	assert.equal(loopOf(p, id).fires, 0);
+	assert.equal(loopOf(p, id).startFailures, undefined);
+	const done = await until("compaction and the background run finish", () => ["done", "failed"].includes(loopOf(p, id)?.lastRun?.status) && loopOf(p, id).lastRun, 120_000);
+	assert.equal(done.status, "done", JSON.stringify(done));
+	assert.equal(done.result, "AFTER_COMPACTION");
+	assert.equal(loopOf(p, id).fires, 1, "one occurrence, no repeated forks");
+	const entries = entriesOf(done.session);
+	const compact = entries.find(e => e.type === "compaction");
+	assert.ok(compact && !compact.fromHook && compact.usage?.totalTokens > 0, "Pi really compacted with the selected model");
+	assert.ok(Number(fs.readFileSync(path.join(p.cwd, ".pi/child-compaction-ended"), "utf8")) - started >= 35_000);
+	assert.equal(entriesOf(parent).filter(e => e.type === "compaction").length, 0, "the parent was not compacted or changed");
+	assert.equal(pi.userMessages().slice(before).filter(m => m.startsWith("[loop")).length, 0);
+	assert.doesNotMatch(pi.notes(), /couldn't start/);
+});
+
 test("a default fork loop runs beside the conversation and sees its context", { skip: real, timeout: 420_000 }, async t => {
 	const { p, pi } = await bgSession(t);
 	await pi.ask("Remember this code word: KUMQUAT. Reply with just ok.");

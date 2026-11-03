@@ -31,7 +31,7 @@ conversation itself:
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.11.0
+pi install git:github.com/recursive-systems/pi-loop@v0.11.1
 ```
 
 Add `-l` to install it for one project only.
@@ -102,6 +102,10 @@ Loops do their work in a separate Pi beside your conversation:
 The same default applies to `/loop`, `loop_manage create` and `.pi/loop.json`. Set `run` to
 `"foreground"` (or pass `/loop --foreground`) to run in the conversation instead. Before the first
 conversation is saved, a fork runs fresh because there is no saved conversation to copy.
+
+A copied conversation may need compaction before Pi accepts the loop prompt. Compaction pauses the
+normal 30-second prompt-acceptance clock, with a ten-minute overall cap for that wait. A run is
+counted only when Pi actually accepts its prompt.
 
 **Upgrading to 0.11:** saved loops and declarations with no `run` mode become background forks
 when loaded. Explicit `fork`, `thread` and `fresh` modes stay unchanged. To keep an old loop in

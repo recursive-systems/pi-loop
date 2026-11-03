@@ -146,6 +146,9 @@ function messageLines(m: any): string[] {
 }
 
 const DIALOGS = new Set(["select", "confirm", "input", "editor"]);
+// Pi acknowledges a prompt only after preflight compaction. Allow that real work to finish,
+// but still bound an unresponsive compactor; unrelated RPC requests keep their normal deadline.
+const COMPACTION_ACK_WAIT_MS = 10 * 60_000;
 
 /** One live background run. */
 export class Run {
@@ -167,6 +170,9 @@ export class Run {
 	recorded = false;
 	/** Turns started so far: a command's own turn may begin before or after Pi answers "handled". */
 	private starts = 0;
+	private compactionStartedAt?: number;
+	private compactedMs = 0;
+	private compactionWaiters = new Set<() => void>();
 	cancelled = false;
 	private buf = "";
 	private seq = 0;
@@ -181,6 +187,10 @@ export class Run {
 		readonly mode: RunMode,
 		private readonly opts: { cwd: string; sessionArgs: string[]; extra?: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv },
 	) {}
+
+	private compactionTime(now: number) {
+		return this.compactedMs + (this.compactionStartedAt === undefined ? 0 : now - this.compactionStartedAt);
+	}
 
 	onChange(fn: () => void) { this.changes.add(fn); return () => this.changes.delete(fn); }
 	private changed() { for (const fn of this.changes) { try { fn(); } catch { /* a viewer's problem */ } } }
@@ -246,6 +256,15 @@ export class Run {
 			this.push([`  ! declined a ${msg.method} (needs you): ${String(msg.title ?? "").slice(0, 100)}`]);
 			return;
 		}
+		if (msg.type === "compaction_start" || msg.type === "auto_compaction_start") { this.compactionStartedAt ??= performance.now(); return; }
+		if (msg.type === "compaction_end" || msg.type === "auto_compaction_end") {
+			if (this.compactionStartedAt !== undefined) {
+				this.compactedMs += performance.now() - this.compactionStartedAt;
+				this.compactionStartedAt = undefined;
+				for (const check of this.compactionWaiters) check();
+			}
+			return;
+		}
 		if (msg.type === "agent_start") { this.starts++; this.working = true; this.changed(); return; }
 		if (msg.type === "agent_settled") { this.settle(); return; }
 		if (msg.type === "message_end" && msg.message) this.push(messageLines(msg.message));
@@ -260,8 +279,30 @@ export class Run {
 		if (this.exited) return Promise.resolve({ success: false, error: "the run's Pi exited" });
 		const id = `l${++this.seq}`;
 		return new Promise(resolve => {
-			const t = setTimeout(() => { this.waiting.delete(id); resolve({ success: false, error: "no answer from the run's Pi" }); }, ms);
-			this.waiting.set(id, r => { clearTimeout(t); resolve(r); });
+			const prompt = "type" in cmd && cmd.type === "prompt";
+			const started = performance.now(), compactedBefore = this.compactionTime(started);
+			const finish = (r: any) => {
+				clearTimeout(t);
+				this.compactionWaiters.delete(expire);
+				this.waiting.delete(id);
+				resolve(r);
+			};
+			const expire = () => {
+				const now = performance.now(), elapsed = now - started;
+				const compacted = prompt ? this.compactionTime(now) - compactedBefore : 0;
+				const remaining = ms - (elapsed - compacted), cap = COMPACTION_ACK_WAIT_MS - elapsed;
+				if (compacted > 0 && remaining > 0 && cap > 0) {
+					clearTimeout(t);
+					// Pause only the acknowledgement clock, not the overall cap. Recheck immediately on
+					// compaction_end, including failure/abort, so no stale compaction grace remains.
+					t = setTimeout(expire, Math.min(this.compactionStartedAt === undefined ? remaining : cap, cap));
+					return;
+				}
+				finish({ success: false, error: "no answer from the run's Pi" });
+			};
+			let t = setTimeout(expire, ms);
+			if (prompt) this.compactionWaiters.add(expire);
+			this.waiting.set(id, finish);
 			this.write({ id, ...cmd });
 		});
 	}
