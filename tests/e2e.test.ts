@@ -170,7 +170,7 @@ class Pi {
 }
 
 const due = (id: string, extra: object = {}) => ({
-	id, prompt: `do ${id}`, schedule: { kind: "every", ms: 3_600_000 }, paused: false,
+	id, prompt: `do ${id}`, schedule: { kind: "every", ms: 3_600_000 }, run: "foreground", paused: false,
 	createdAt: Date.now() - 7_200_000, fires: 0, catchUp: "latest", nextAt: Date.now() - 1_000, ...extra,
 });
 
@@ -178,9 +178,10 @@ test("/loop makes, lists, pauses, resumes and removes a loop, kept in .pi/loops.
 	const p = project(t);
 	const pi = new Pi(t, p);
 	await pi.ready();
-	assert.match(await pi.command("/loop 2h check the build"), /loop check-the-build: every 2h, next/);
+	assert.match(await pi.command("/loop 2h check the build"), /loop check-the-build: every 2h, in the background \(fork\), next/);
 	const [l] = p.loops();
 	assert.equal(l.prompt, "check the build");
+	assert.equal(l.run, "fork");
 	assert.deepEqual(l.schedule, { kind: "every", ms: 7_200_000 });
 	assert.ok(Math.abs(l.nextAt - (Date.now() + 7_200_000)) < 60_000);
 	assert.equal((fs.statSync(path.join(p.cwd, ".pi/loops.json")).mode & 0o777), 0o600);
@@ -448,7 +449,7 @@ test("a gate's wake that comes back after the session worked is kept and sent on
 });
 
 test("a kept wake is dropped if its loop is redefined before it's sent", { timeout: 120_000 }, async t => {
-	const decl = (prompt: string) => JSON.stringify([{ id: "slow", prompt, every: "1h", gate: ".pi/gates/slow", gateTimeout: "30s" }]);
+	const decl = (prompt: string) => JSON.stringify([{ id: "slow", prompt, every: "1h", run: "foreground", gate: ".pi/gates/slow", gateTimeout: "30s" }]);
 	const p = project(t, { files: { ".pi/loop.json": decl("first"), ".pi/gates/slow": slowGate }, loops: [due("slow", { prompt: "first", source: ".pi/loop.json", rev: 1, gate: { command: ".pi/gates/slow", timeoutMs: 30_000, onError: "wake" } })] });
 	const pi = new Pi(t, p);
 	await pi.ready();
@@ -519,7 +520,7 @@ test("several sessions starting at once against a dead owner's lock: exactly one
 
 test("at shutdown a running gate is waited for even if its loop was removed meanwhile", { timeout: 120_000 }, async t => {
 	const gate = '#!/bin/sh\ndate +%s > "$LOOP_STATE_DIR/began"\nsleep 30\ndate +%s > "$LOOP_STATE_DIR/ended"\necho \'{"action":"skip","reason":"done"}\'\n';
-	const p = project(t, { files: { ".pi/loop.json": JSON.stringify([{ id: "slow", prompt: "x", every: "1h", gate: ".pi/gates/slow", gateTimeout: "60s" }]), ".pi/gates/slow": gate },
+	const p = project(t, { files: { ".pi/loop.json": JSON.stringify([{ id: "slow", prompt: "x", every: "1h", run: "foreground", gate: ".pi/gates/slow", gateTimeout: "60s" }]), ".pi/gates/slow": gate },
 		loops: [due("slow", { prompt: "x", source: ".pi/loop.json", rev: 1, gate: { command: ".pi/gates/slow", timeoutMs: 60_000, onError: "wake" } })] });
 	const pi = new Pi(t, p);
 	await pi.ready();
@@ -661,7 +662,7 @@ function adopted(t: any, p: { cwd: string }, settings: object = {}) {
 }
 
 test("loops declared in the project's .pi/loop.json are picked up, follow edits, and go when the declaration does", { timeout: 120_000 }, async t => {
-	const decl = (prompt: string) => JSON.stringify({ loops: [{ id: "check", prompt, every: "1h", gate: ".pi/gates/check", maxSleep: "12h", context: ["AGENTS.md"], priority: 2 }] });
+	const decl = (prompt: string) => JSON.stringify({ loops: [{ id: "check", prompt, every: "1h", run: "foreground", gate: ".pi/gates/check", maxSleep: "12h", context: ["AGENTS.md"], priority: 2 }] });
 	const p = project(t, {
 		files: { ...rootFiles, ".pi/loop.json": decl("/check") },
 		// Its run state from an earlier session: kept, and due now.
@@ -883,18 +884,19 @@ export default function (pi: any) {
 	assert.equal(run.result, "SYNC_OK");
 });
 
-test("a fork loop runs beside the conversation, sees it, and its findings come back as a quiet note", { skip: real, timeout: 420_000 }, async t => {
+test("a default fork loop runs beside the conversation and sees its context", { skip: real, timeout: 420_000 }, async t => {
 	const { p, pi } = await bgSession(t);
 	await pi.ask("Remember this code word: KUMQUAT. Reply with just ok.");
 	const main = await mainFile(pi);
 	const before = pi.userMessages().length;
-	await pi.command(`/loop 1h --fork Say the code word you were told earlier in this conversation, in capitals. ${REPORT(true, "the code word")} Put the word itself in the summary.`);
+	await pi.command(`/loop 1h Say the code word you were told earlier in this conversation, in capitals. ${REPORT(true, "the code word")} Put the word itself in the summary.`);
 	const id = p.loops()[0].id;
 	await pi.command(`/loop run ${id}`);
 	const run = await until("the run started", () => loopOf(p, id)?.lastRun?.status === "running" && loopOf(p, id).lastRun);
 	assert.equal(lockPid(p.cwd), pi.proc.pid, "the run's Pi takes no lock; the session keeps the loops");
-	assert.match(await untilNote(pi, "its note"), /KUMQUAT/, "the fork saw the conversation, and its finding came back");
+	await until("the fork finishes", () => loopOf(p, id)?.lastRun?.status === "done");
 	const done = loopOf(p, id).lastRun;
+	assert.match(done.result, /KUMQUAT/, "the default fork saw the conversation; a routine report need not post a note");
 	assert.equal(done.status, "done"); assert.equal(done.findings, true);
 	assert.match(path.basename(path.dirname(done.session)), /-loop-.*--$/, "the run's conversation is kept apart");
 	const header = JSON.parse(fs.readFileSync(done.session, "utf8").split("\n")[0]);
@@ -1185,6 +1187,123 @@ async function closedSession(t: any, args: string[] = [], opts: Parameters<typeo
 }
 const listOf = async (pi: Pi) => pi.command("/loop list");
 
+test("unflagged commands run in background forks; foreground requires an explicit flag", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	await pi.ask("Keep this conversation intact.", 60_000);
+	const parent = await mainFile(pi);
+	await pi.command("/loop 1h default-check");
+	assert.equal(loopOf(p, "default-check").run, "fork");
+	await pi.command("/loop run default-check");
+	const r = await until("the default fork finishes", () => loopOf(p, "default-check")?.lastRun?.status === "done" && loopOf(p, "default-check").lastRun, 60_000);
+	assert.equal(r.mode, "fork");
+	assert.notEqual(r.session, parent);
+	assert.equal(entriesOf(r.session)[0].parentSession, parent);
+	assert.equal(pi.userMessages().filter(m => m.startsWith("[loop")).length, 0);
+	await pi.command("/loop 1h --foreground foreground-check");
+	assert.equal(loopOf(p, "foreground-check").run, "foreground");
+	await pi.command("/loop run foreground-check");
+	await pi.waitForUser(/^\[loop foreground-check /);
+	assert.equal(loopOf(p, "foreground-check").lastRun, undefined);
+});
+
+test("a default loop before the first conversation is saved starts fresh instead of failing to fork", { timeout: 120_000 }, async t => {
+	const { p, pi } = await closedSession(t);
+	const parent = await mainFile(pi);
+	assert.ok(parent && !fs.existsSync(parent), "Pi allocates a path before writing the first exchange");
+	await pi.command("/loop 1h empty-parent");
+	await pi.command("/loop run empty-parent");
+	const r = await until("the empty-parent run settles", () => ["done", "failed"].includes(loopOf(p, "empty-parent")?.lastRun?.status) && loopOf(p, "empty-parent").lastRun, 60_000);
+	assert.equal(r.status, "done", JSON.stringify(r));
+	assert.equal(r.mode, "fresh", "there is no saved conversation to fork yet");
+	assert.equal(loopOf(p, "empty-parent").run, "fork", "later runs can fork once the conversation is saved");
+	assert.equal(pi.userMessages().filter(m => m.startsWith("[loop")).length, 0);
+});
+
+test("omitted declared and saved modes migrate to forks without losing a kept wake", { timeout: 120_000 }, async t => {
+	const id = "saved-declared", rev = 7;
+	const declaration = [{ id, prompt: `do ${id}`, every: "1h" },
+		{ id: "stay-here", prompt: "hi", every: "1h", run: "foreground", paused: true },
+		{ id: "own-thread", prompt: "hi", every: "1h", run: "thread", paused: true },
+		{ id: "clean-run", prompt: "hi", every: "1h", run: "fresh", paused: true },
+		{ id: "model-default", prompt: "hi", every: "1h", model: "closed/none", paused: true }];
+	const { p, pi } = await closedSession(t, [], {
+		files: { ".pi/loop.json": JSON.stringify(declaration) },
+		loops: [due(id, { run: undefined, source: ".pi/loop.json", rev,
+			pendingWake: { reason: "already checked", context: "kept evidence", at: Date.now(), rev } }),
+			later("saved-only", { run: undefined })],
+	});
+	await pi.ask("Saved parent context.", 60_000);
+	assert.equal(loopOf(p, "saved-only").run, "fork", "saved ad hoc mode is migrated and persisted too");
+	const r = await until("the migrated fork finishes", () => loopOf(p, id)?.lastRun?.status === "done" && loopOf(p, id).lastRun, 60_000);
+	assert.equal(r.mode, "fork");
+	assert.equal(loopOf(p, id).rev, rev, "normalizing a missing mode must not invalidate a kept wake");
+	assert.equal(loopOf(p, id).pendingWake, undefined, "the kept wake was consumed");
+	const messages = entriesOf(r.session).filter(e => e.type === "message" && e.message?.role === "user");
+	assert.match(JSON.stringify(messages.at(-1)), /already checked/);
+	assert.match(JSON.stringify(messages.at(-1)), /kept evidence/);
+	assert.deepEqual(["stay-here", "own-thread", "clean-run", "model-default"].map(x => loopOf(p, x).run),
+		["foreground", "thread", "fresh", "fork"]);
+	assert.equal(loopOf(p, "model-default").model, "closed/none");
+	assert.equal(pi.userMessages().filter(m => m.startsWith("[loop")).length, 0);
+});
+
+test("loop_manage defaults to a background fork and accepts explicit foreground", { skip: real, timeout: 300_000 }, async t => {
+	const { p, pi } = await bgSession(t);
+	await pi.ask('Call loop_manage twice with action create and every "1h". First: id "tool-default", prompt \'Call loop_report once with findings false and summary "TOOL_BG_READY". Do nothing else.\', OMIT run entirely. Second: id "tool-foreground", same prompt but summary "TOOL_FG_READY", run "foreground". Do not start either loop. Do nothing else.');
+	const calls = pi.lines.filter(l => l.type === "tool_execution_start" && l.toolName === "loop_manage").map(l => l.args);
+	assert.ok(calls.some((a: any) => a.id === "tool-default" && a.run === undefined), "the real tool was called without run");
+	assert.equal(loopOf(p, "tool-default").run, "fork");
+	assert.equal(loopOf(p, "tool-foreground").run, "foreground");
+	const before = pi.userMessages().length;
+	await pi.command("/loop run tool-default");
+	await until("the tool-created fork finishes", () => loopOf(p, "tool-default")?.lastRun?.status === "done");
+	assert.equal(loopOf(p, "tool-default").lastRun.result, "TOOL_BG_READY");
+	assert.equal(pi.userMessages().slice(before).filter(m => m.startsWith("[loop")).length, 0);
+	await pi.command("/loop run tool-foreground");
+	await pi.waitForUser(/^\[loop tool-foreground /);
+	await pi.waitFor(l => l.type === "tool_execution_end" && l.toolName === "loop_report", 60_000);
+	assert.equal(loopOf(p, "tool-foreground").lastRun, undefined);
+});
+
+test("mode edits never duplicate an active foreground or background turn", { skip: real, timeout: 300_000 }, async t => {
+	const id = "mode-switch";
+	const decl = (run: string, prompt: string) => JSON.stringify([{ id, every: "1h", run, prompt }]);
+	const seed = 'Call loop_report with findings false and summary "RETAINED_BACKGROUND". Do nothing else.';
+	const foreground = 'This is a new occurrence. Use bash to run sleep 35. Then call loop_report with findings false and summary "ORIGINAL_FINISHED". Do nothing else.';
+	const child = 'This is a NEW independent occurrence, not the previous completed task. You MUST run bash sleep 45 now, even if an earlier occurrence already slept. Then call loop_report with findings false and summary "NEXT_FINISHED". Do nothing else.';
+	const { p, pi } = await bgSession(t, { files: { ".pi/loop.json": decl("fork", seed) } });
+	await until("the initial declaration", () => loopOf(p, id));
+	await pi.command(`/loop run ${id}`);
+	const first = await until("a retained background session", () => ["done", "failed"].includes(loopOf(p, id)?.lastRun?.status) && loopOf(p, id).lastRun, 60_000);
+	assert.equal(first.status, "done", JSON.stringify(first));
+	const retained = loopOf(p, id).lastRun.session;
+	fs.writeFileSync(path.join(p.cwd, ".pi/loop.json"), decl("foreground", foreground));
+	await until("the foreground mode is loaded", () => loopOf(p, id)?.run === "foreground", TICK * 2);
+	await pi.command(`/loop run ${id}`);
+	await pi.waitFor(l => l.type === "tool_execution_start" && l.toolName === "bash", 60_000);
+	assert.match(await pi.command(`/loop steer ${id} resume the retained session`), /waits for its current foreground turn/);
+	assert.equal(loopOf(p, id).lastRun.session, retained);
+	assert.equal(loopOf(p, id).lastRun.status, "done", "steering must not resume a child alongside a foreground turn");
+	fs.writeFileSync(path.join(p.cwd, ".pi/loop.json"), decl("fork", child));
+	await until("the mode edit is loaded", () => loopOf(p, id)?.run === "fork", TICK * 2);
+	assert.match(await pi.command(`/loop run ${id}`), /waits for its current foreground turn/);
+	assert.equal(loopOf(p, id).lastRun.session, retained, "no duplicate child alongside the old foreground turn");
+	await pi.waitFor(l => l.type === "tool_execution_end" && l.toolName === "loop_report", 120_000);
+	await pi.waitFor(l => l.type === "agent_settled", 60_000);
+	assert.equal(loopOf(p, id).fires, 2, "the original foreground turn was not restarted");
+	await pi.command(`/loop run ${id}`);
+	await until("the next run is background", () => loopOf(p, id)?.lastRun?.status === "running", 60_000);
+	assert.equal(loopOf(p, id).lastRun.mode, "fork");
+	fs.writeFileSync(path.join(p.cwd, ".pi/loop.json"), decl("foreground", child));
+	await until("the reciprocal mode edit is loaded", () => loopOf(p, id)?.run === "foreground", TICK * 2);
+	assert.equal(loopOf(p, id).lastRun.status, "running", "test precondition: a real child remains active");
+	assert.match(await pi.command(`/loop run ${id}`), /waits for its current background run/);
+	assert.equal(loopOf(p, id).lastRun.status, "running", "the background child was not interrupted");
+	assert.equal(pi.userMessages().filter(m => m.startsWith(`[loop ${id} `)).length, 1, "no foreground duplicate");
+	assert.equal(loopOf(p, id).fires, 3);
+	await pi.command(`/loop cancel ${id}`);
+});
+
 test("leaving a run with Pi's own /new counts as /loop leave: the run carries on, and in-conversation loops run again", { timeout: 120_000 }, async t => {
 	const { p, pi } = await closedSession(t);
 	await pi.ask("hello", 60_000); // the conversation has something saved to come back to
@@ -1198,7 +1317,7 @@ test("leaving a run with Pi's own /new counts as /loop leave: the run carries on
 	assert.equal((await pi.send({ type: "new_session" })).success, true);
 	await until("the run carried on and settled", () => loopOf(p, id)?.lastRun?.status === "done", 60_000);
 	assert.doesNotMatch(await listOf(pi), /you are in/, "not in the run any more");
-	await pi.command("/loop 1h ping");
+	await pi.command("/loop 1h --foreground ping");
 	const ping = p.loops().find((l: any) => l.prompt === "ping").id;
 	await pi.command(`/loop run ${ping}`);
 	await pi.waitForUser(new RegExp(`^\\[loop ${ping} ·`), 30_000);
@@ -1348,7 +1467,8 @@ test("a sibling folder's loops are run only when the project adopts it (loop.fol
 	fs.mkdirSync(path.join(sib, ".pi"), { recursive: true });
 	fs.mkdirSync(path.join(sib, "role/.pi"), { recursive: true });
 	fs.writeFileSync(path.join(sib, ".pi/loop.json"), JSON.stringify({ loops: [{ id: "sib-only", prompt: "hi", every: "1h", run: "fresh" },
-		{ id: "sib-here", prompt: "hi", every: "1h" }] }));
+		{ id: "sib-here", prompt: "hi", every: "1h", run: "foreground" },
+		{ id: "sib-default", prompt: "hi", every: "1h" }] }));
 	// A folder under the adopted one is not read, as under the project.
 	fs.writeFileSync(path.join(sib, "role/.pi/loop.json"), JSON.stringify({ loops: [{ id: "role-under", prompt: "hi", every: "1h", run: "fresh" }] }));
 	await pi.command("/reload");
@@ -1359,6 +1479,7 @@ test("a sibling folder's loops are run only when the project adopts it (loop.fol
 	const l = await until("adopted: its loop", () => fs.existsSync(path.join(p.cwd, ".pi/loops.json")) && loopOf(p, "sib-only"), 30_000);
 	assert.equal(l.dir, path.relative(fs.realpathSync(p.cwd), fs.realpathSync(sib)));
 	assert.equal(loopOf(p, "sib-here"), undefined, "a loop in an adopted folder runs only in the background");
+	assert.equal(loopOf(p, "sib-default").run, "fork", "omitting run works in an adopted folder too");
 	assert.equal(loopOf(p, "role-under"), undefined, "nor its subfolders'");
 	// A settings file that can't be read keeps the adopted loops (and their state) rather than dropping them.
 	fs.writeFileSync(path.join(p.cwd, ".pi/settings.json"), "{ not json");
@@ -1473,7 +1594,7 @@ test("asked to make an in-conversation loop in an adopted folder, loop_manage re
 	const pi = new Pi(t, p, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
 	await pi.ready();
 	await new Promise(r => setTimeout(r, 1500));
-	await pi.ask(`Call loop_manage once with action "create", id "x-here", prompt "hi", every "1h", dir "${rel}" and no run. Then tell me exactly what it replied.`);
+	await pi.ask(`Call loop_manage once with action "create", id "x-here", prompt "hi", every "1h", dir "${rel}" and run "foreground". Then tell me exactly what it replied.`);
 	const results = pi.lines.filter(l => l.type === "tool_execution_end" && l.toolName === "loop_manage").map(l => JSON.stringify(l.result));
 	assert.ok(results.length, "the model called it");
 	assert.match(results.join("\n"), /adopted folder runs in the background/);

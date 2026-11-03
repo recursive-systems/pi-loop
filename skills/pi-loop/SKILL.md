@@ -5,8 +5,9 @@ description: How to set up loops (recurring prompts in this session, the loop_ma
 
 # Loops that work
 
-A loop re-sends its prompt to this same session on a schedule. Each fire is a full model turn
-with the whole conversation as context. Every rule below follows from that.
+A loop runs in the background by default, on a fork of the conversation as it is when it fires.
+Each fire is a full model turn. Use `foreground` only when the user explicitly wants scheduled
+checks inside the conversation.
 
 ## 1. Put the instructions in a prompt template
 
@@ -15,8 +16,8 @@ The loop reads the file each time it fires, so an edit applies on the next fire 
 `/reload`, and the loop itself stays one short line. Inside the template, say:
 
 - what to check or do,
-- where the result goes (a file, a message, a PR comment, an issue): a loop turn's output stays
-  in this session unless the prompt sends it somewhere,
+- where the result goes (a file, a message, a PR comment, an issue): background output stays
+  with its run unless the prompt sends it somewhere or its report needs the owner,
 - what "nothing to do" looks like, so the turn can end in one line.
 
 ## 2. Pick the schedule
@@ -75,10 +76,10 @@ entry saying why it ran. To judge a gate, read these with the runs' `loop_report
 
 One session can carry several responsibilities, each a loop:
 
-- **A loop waits while the session is busy.** It isn't queued behind the current turn and never
-  stacks: a 5-minute check through a 20-minute turn fires once, afterwards, and its gate runs then,
-  so the evidence is fresh. The header then says `· waited 18m`. When several are waiting,
-  `priority` (higher first) decides, then the longest overdue.
+- **Background loops run beside the conversation**, with at most one run per loop. An explicit
+  foreground loop waits while the session is busy, never stacks, and runs its gate when free.
+  Its header then says `· waited 18m`. Among waiting foreground loops, `priority` (higher first)
+  decides, then the longest overdue.
 - **Give each job its own folder** (`dir`): its gate, its `.pi/prompts/<name>.md` and its state
   live there, so two folders can each have a `/check`. `context: ["AGENTS.md"]` attaches that
   folder's instructions to the job's turns only. Gate paths are relative to the folder.
@@ -98,11 +99,12 @@ One session can carry several responsibilities, each a loop:
 
 ## 5. In the background, or watching something
 
-- **`run`** puts a loop's turn beside the conversation instead of in it: `fork` (a copy of the
-  conversation as it is then: use it when the job needs what was said), `thread` (the loop's own
-  conversation, continued each run: for jobs that build on their last run) or `fresh` (a new
-  conversation each run: for self-contained checks; the cheapest). Leave it out to run in the
-  conversation as before. The owner watches, steers and steps into runs from `/loop`.
+- **`run` defaults to `fork`**, a background copy of the conversation as it is then. Choose
+  `thread` for the loop's own continued conversation, or `fresh` for a new conversation each run
+  (self-contained checks; the cheapest). Set `foreground` explicitly to run in the conversation;
+  never choose it unless the user asks. `/loop` has matching `--fork`, `--thread`, `--fresh` and
+  `--foreground` flags. Saved loops with no mode also become forks on load. The owner watches,
+  steers and steps into background runs from `/loop`.
 - **A background run works in its loop's own folder**, so that folder's `.pi/mcp.json`, settings,
   prompts, data class and AGENTS.md apply (no need for `context` then); a `fork` copies your
   conversation but acts from there too. `"model": "provider/id:thinking"` gives it its own model.

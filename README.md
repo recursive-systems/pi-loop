@@ -7,11 +7,13 @@
 /loop at 07:30 summarize what changed overnight
 ```
 
-The prompt comes back to *the same session*, so the agent remembers what it did last time. Or it runs
-**in the background** beside your conversation, so neither waits for the other:
+Loops run **in the background by default**, on a copy of your conversation. The job knows what
+you said without taking over your chat. Use `--foreground` only when you want checks in the
+conversation itself:
 
 ```
-/loop 15m --fork check the deploy and tell me if anything changed
+/loop 15m check the deploy and tell me if anything changed
+/loop 1h --foreground review our progress here
 ```
 
 - **Gates keep it cheap.** A small script runs first and decides whether there's anything worth
@@ -29,7 +31,7 @@ The prompt comes back to *the same session*, so the agent remembers what it did 
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.7.0
+pi install git:github.com/recursive-systems/pi-loop@v0.11.0
 ```
 
 Add `-l` to install it for one project only.
@@ -39,7 +41,8 @@ Add `-l` to install it for one project only.
 ```
 /loop [5m|2h|1d|auto] <prompt>        repeat every interval (default 10m), or when each run says
 /loop at 07:30 [Area/City] <prompt>   daily, in that zone or your default
-      --fork | --thread | --fresh     run in the background (see below)
+      --fork | --thread | --fresh     background mode (default: fork)
+      --foreground                   run in this conversation instead
       --for 2d | --until <time>       how long it lives (default 7 days)
 /loop                         the loops view: every loop, its runs, watch and steer them
 /loop run|pause|resume|rm <id>
@@ -90,11 +93,21 @@ an empty list. Emit `loop:ready` to get the current state again, for example whe
 
 ## Background runs
 
-A loop with `run` set does its work in a separate Pi beside your conversation:
+Loops do their work in a separate Pi beside your conversation:
 
-- `fork`: a copy of your conversation as it is when the loop fires, so it knows what you've been doing.
+- `fork` (default): a copy of your conversation as it is when the loop fires, so it knows what you've been doing.
 - `thread`: the loop's own conversation, continued every run.
 - `fresh`: a new conversation each run.
+
+The same default applies to `/loop`, `loop_manage create` and `.pi/loop.json`. Set `run` to
+`"foreground"` (or pass `/loop --foreground`) to run in the conversation instead. Before the first
+conversation is saved, a fork runs fresh because there is no saved conversation to copy.
+
+**Upgrading to 0.11:** saved loops and declarations with no `run` mode become background forks
+when loaded. Explicit `fork`, `thread` and `fresh` modes stay unchanged. To keep an old loop in
+the conversation, stop its old Pi session, upgrade, then set `run: "foreground"` before starting
+it again. Older versions do not understand that value. A mode edit in the new version waits for
+that loop's active foreground or background turn to finish; it never cancels or duplicates it.
 
 A run starts in the loop's own folder (the project, or its `dir`), so Pi gives it that folder's settings,
 tools (`.pi/mcp.json`), prompt templates, data class and `AGENTS.md` files, as if you had started Pi
@@ -105,7 +118,8 @@ trust question), and keep the machine's own pi-loop at 0.5 or later: an older on
 loops itself, so such a run doesn't start.
 
 Each run ends with `loop_report`: whether it found something, one line, and optionally when to run
-next or to stop. Findings land in your conversation as a short note; everything else stays out of it.
+next or to stop. Only reports that need you enter the conversation; other results stay in the loops
+view, as described above.
 
 A run stays alive while a compatible extension reports outstanding background work or a pending
 completion notice. With pi-subagents (session-liveness v1 support), an async reader can finish and
@@ -156,9 +170,9 @@ Log each decision to `$LOOP_STATE_DIR` so you can tune the thresholds later.
 
 ## One session, several jobs
 
-- **Loops never pile up.** A loop that comes due while the agent is busy waits and fires once when
-  it's free, with its gate run at that moment so the evidence is fresh. When several are waiting,
-  the one with the highest `priority` goes first.
+- **Loops never pile up.** A background loop has at most one run going at a time. An explicit
+  foreground loop waits while the agent is busy and fires once when it's free, with its gate run
+  then so the evidence is fresh. Among waiting foreground loops, the highest `priority` goes first.
 - **Each job can have its own folder** with its gate, its prompt template and its instructions
   (`dir`, and `context: ["AGENTS.md"]` to attach them to that job's turns only).
 - **Declare loops in files.** The project's `.pi/loop.json` defines its loops; edit the file to

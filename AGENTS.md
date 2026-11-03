@@ -1,7 +1,8 @@
 # pi-loop
 
-A Pi extension: `/loop` and the `loop_manage` tool re-send a prompt to the same session on a
-schedule. Optional gate scripts decide whether a due loop wakes the model.
+A Pi extension: `/loop` and `loop_manage` schedule prompts in background forks by default.
+Foreground execution requires explicit `--foreground` or `run: "foreground"`. Saved loops with
+no mode migrate to forks on load. Optional gates decide whether a due loop wakes the model.
 
 - `index.ts` holds the extension: commands, the tool, the tick and persistence. `lock.ts` is the
   one-owner-per-folder lock (an OS lock held by a small Perl helper; hosts use it too). `schedule.ts`

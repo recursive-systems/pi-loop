@@ -10,13 +10,10 @@
  *   /loop rm|pause|resume|run <id> manage one (only when <id> is an existing loop)
  *   /loop clear                    delete all
  *
- * When a loop is due and the session is idle, its gate (if any) runs and its prompt
- * is sent as a user message that starts a turn. While the session is busy, a due
- * loop waits: it is not queued behind the current turn, it never stacks (a 5m loop
- * through a 20-minute turn fires once, afterwards), and its gate runs only once the
- * session is free, so the turn gets fresh evidence. When several loops are waiting,
- * the highest `priority` goes first, then the longest overdue. The turn shares this
- * session's context, which is the point of this design over a scheduled child.
+ * Loops run in the background by default, on a fork of this conversation. Explicit
+ * --foreground / run: "foreground" puts a loop in this conversation instead: it
+ * waits while the session is busy, never stacks, and runs its gate when free.
+ * Among waiting foreground loops, priority goes first, then longest overdue.
  *
  * A loop may have its own folder (`dir`, inside the project): its gate, prompt
  * template and state are found there, and `context` files from it are attached to
@@ -50,6 +47,7 @@ import { LoopsView, GLYPH, type Dot, type LoopRow, type ViewAction } from "./vie
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
 type Phase = { state: "queued" | "running"; id: string } | undefined;
+type LoopMode = RunMode | "foreground";
 
 const STATUS_KEY = "loop";
 /** What a loop run is asked to do at the end, so findings and pacing don't depend on its wording. */
@@ -147,8 +145,8 @@ interface Loop {
 	 * sent once the session is free; the gate isn't run again. Dropped if the loop is redefined.
 	 */
 	pendingWake?: { reason: string; context?: string; at: number; rev: number; heartbeat?: true; error?: true };
-	/** Where its turn runs: in this conversation (absent), or in the background as a fork of it, its own thread, or fresh. */
-	run?: RunMode;
+	/** Where its turn runs. Omitted legacy modes migrate to a background fork; foreground is explicit. */
+	run: LoopMode;
 	/** A background run's model, provider/id[:thinking]; absent = this session's. */
 	model?: string;
 	/** It ends then: ad hoc loops after 7 days unless they say otherwise; absent = never. */
@@ -159,6 +157,16 @@ interface Loop {
 	startFailures?: number;
 	/** What was put in front of the owner lately (newest last), so the judge can tell a repeat from news. */
 	surfaced?: { at: number; ask: string; dismissed?: true }[];
+}
+
+function executionMode(value: unknown): LoopMode {
+	if (value === undefined) return "fork";
+	if (value === "foreground" || RUN_MODES.includes(value as RunMode)) return value as LoopMode;
+	throw new Error("run must be fork, thread, fresh or foreground (default fork)");
+}
+
+function background(l: Loop | undefined): l is Loop & { run: RunMode } {
+	return !!l && l.run !== "foreground";
 }
 
 /**
@@ -481,6 +489,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	let lock = "";
 	let readOnly = false;
 	let loops: Loop[] = [];
+	let migratedModes = false;
 	let zone: ReturnType<typeof configuredZone> = { tz: systemZone(), source: "system" };
 	let phase: Phase;
 	let phaseAt = 0;
@@ -541,7 +550,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	 */
 	function reconcile() {
 		const now = Date.now();
-		let changed = false;
+		let changed = migratedModes;
 		for (const l of loops) {
 			if (l.paused || !zoned(l.schedule) || l.nextAt <= now) continue;
 			const next = nextFor(l, now);
@@ -559,7 +568,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	function load(): Loop[] {
-		try { return JSON.parse(fs.readFileSync(file, "utf8")) as Loop[]; } catch { return []; }
+		migratedModes = false;
+		try {
+			const saved = JSON.parse(fs.readFileSync(file, "utf8")) as Loop[];
+			for (const l of saved) if (l.run === undefined) { l.run = "fork"; migratedModes = true; }
+			return saved;
+		} catch { return []; }
 	}
 	function save() {
 		// Only the owner writes. If the lock went away (its helper died), stop at once: another session may own it now.
@@ -568,6 +582,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const tmp = `${file}.${process.pid}.tmp`;
 		fs.writeFileSync(tmp, JSON.stringify(loops, null, 2), { mode: 0o600 });
 		fs.renameSync(tmp, file);
+		migratedModes = false;
 	}
 	/** One owner per project: an OS-held lock (lock.ts). Taking it is asynchronous; until then this session is read-only. */
 	let folderLock: FolderLock | undefined;
@@ -720,7 +735,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const live = shared.runs.get(l.id);
 			const state = live ? `running in background (${live.mode}, ${live.working ? "working" : "idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
 			const p = l.prompt.length > 70 ? `${l.prompt.slice(0, 67)}…` : l.prompt;
-			const extra = [l.run ? `runs in background: ${l.run}` : "", l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "",
+			const extra = [background(l) ? `runs in background: ${l.run}` : "runs in this conversation (foreground)", l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "",
 				l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "", slotWait.has(l.id) ? `waiting for a background slot (loop.maxBackground ${maxBackground})` : waited.has(l.id) ? "waiting for this session to be free" : ""].filter(Boolean);
 			const r = l.lastRun;
 			const last = r && !live ? `\n    last run #${r.fire} ${r.status}${r.endedAt ? ` ${countdown(Math.max(0, Date.now() - r.endedAt))} ago` : ""}${r.unread ? " (new)" : ""}${r.result ? `: ${r.result.split("\n")[0].slice(0, 120)}` : ""}${r.needsYou ? ` · needs you: ${r.needsYou}` : ""}` : "";
@@ -743,9 +758,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// -------------------------------------------------------------- actions --
 
-	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Pick<Loop, "priority" | "dir" | "context" | "run" | "expiresAt"> = {}): Loop | string {
+	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Partial<Pick<Loop, "priority" | "dir" | "context" | "run" | "expiresAt">> = {}): Loop | string {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}; manage them from that session`;
-		if (more.dir && !more.run) {
+		const run = executionMode(more.run);
+		if (more.dir && run === "foreground") {
 			const root = fs.realpathSync(ctx!.cwd), abs = path.join(root, more.dir);
 			if (!abs.startsWith(root + path.sep)) return "a loop in an adopted folder runs in the background (run: fork, thread or fresh), where that folder's tools, model and data class apply";
 		}
@@ -760,7 +776,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			nextAt: 0,
 			// Ad hoc loops end: after 7 days unless they say when.
 			expiresAt: more.expiresAt ?? now + AD_HOC_LIFETIME_MS,
-			...(more.run ? { run: more.run } : {}),
+			run,
 			...(tz ? { tz } : {}),
 			...(gate ? { gate } : {}),
 			...(more.priority ? { priority: more.priority } : {}),
@@ -848,7 +864,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 				// The session is busy, worked while the gate ran, or is shutting down: keep the wake and send
 				// it once free. Gates may record what they reported, so running this one again could lose it.
 				// A background loop needs only its own run slot, not the session.
-				const blocked = l.run ? shared.runs.has(l.id) || overLimit() : busy() || activity !== act;
+				const blocked = background(l) ? shared.runs.has(l.id) || phase?.id === l.id || overLimit() : busy() || activity !== act;
 				if (raw.action === "wake" && !l.paused && (closing || blocked)) {
 					const d = backoff(l, raw, Date.now());
 					l.gateRuns = (l.gateRuns ?? 0) + 1;
@@ -911,7 +927,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!holding()) return `loops are owned by pid ${ownerPid()}`;
 		if (!heldFor(l)) return `${l.id}'s folder is held by another session (its .pi/loops.lock), or this one is still taking it`;
 		try { home(l); } catch (e) { const msg = `loop ${l.id}: ${(e as Error).message}; not fired`; notify(msg, "warning"); return msg; }
-		if (l.run) return fireBackground(l, reason, gate);
+		// A mode edit must not start a second copy of a foreground turn still in progress.
+		if (phase?.id === l.id && background(l)) return `loop ${l.id} waits for its current foreground turn to finish`;
+		if (background(l)) return fireBackground(l, reason, gate);
+		if (shared.runs.has(l.id)) return `loop ${l.id} waits for its current background run to finish`;
 		// You are in a run's conversation: an in-conversation loop waits for you to be back.
 		if (shared.away) {
 			if (gate) l.pendingWake = keptWake(gate, Date.now(), l.rev ?? 0);
@@ -998,7 +1017,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// session folders can tell whose job a run was.
 		const dir = sessionFolder(root, fs.realpathSync(home(l)), `-loop-${l.id}`);
 		moveLegacyFolder(l, sessionFolder(root, fs.realpathSync(ctx!.cwd), `-loop-${l.id}`), dir);
-		if (mode === "fork" && !main) return { args: ["--session-dir", dir], mode: "fresh", note: "this session isn't saved, so it ran fresh" };
+		if (mode === "fork" && (!main || !fs.existsSync(main))) return { args: ["--session-dir", dir], mode: "fresh", note: "this session has no saved conversation yet, so it ran fresh" };
 		if (mode === "fork") return { args: ["--fork", main!, "--session-dir", dir], mode };
 		if (mode === "thread") {
 			// Pi continues only a conversation made in the run's folder; one made elsewhere (before 0.5, runs worked in
@@ -1084,7 +1103,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	 * A background loop's turn: a child Pi on a fork of this session, the loop's own thread, or a fresh one.
 	 * The loop is rescheduled at once; the occurrence counts as fired once the child has accepted its prompt.
 	 */
-	function fireBackground(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
+	function fireBackground(l: Loop & { run: RunMode }, reason: Reason, gate?: GateDecision): string | undefined {
 		if (shared.runs.has(l.id)) { shared.again.add(l.id); return; }
 		if ((shared.away ?? shared.leaving)?.id === l.id) { shared.again.add(l.id); return; }
 		const now = Date.now();
@@ -1329,7 +1348,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// Pi opens a conversation in the folder it was started in: going into a run from another folder would move this
 		// session there (another project's lock, settings and data class). Watch and steer it from here instead.
 		const here = fs.realpathSync(ctx!.cwd);
-		let there: string | undefined = l.run ? fs.realpathSync(home(l)) : here;
+		let there: string | undefined = background(l) ? fs.realpathSync(home(l)) : here;
 		if (there === here) there = headerCwd(file) ?? here;
 		if (there !== here) {
 			return `${l.id}'s run works in ${there}, not this folder, so you can't step into it from here: watch it (/loop watch ${l.id}) and steer it (/loop steer ${l.id} <words>), or once it has finished open it there: cd ${there} && pi --session ${file}`;
@@ -1352,7 +1371,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			shared.runs.delete(l.id);
 		}
 		const prev = l.lastRun;
-		l.lastRun = { ...(l.lastRun ?? { fire: fireNo, mode: l.run ?? "fresh", startedAt: Date.now() }), status: "away", session: file, unread: false, host: process.pid };
+		l.lastRun = { ...(l.lastRun ?? { fire: fireNo, mode: background(l) ? l.run : "fresh", startedAt: Date.now() }), status: "away", session: file, unread: false, host: process.pid };
 		const away: Away = { id: l.id, file, home: homeFile, homeId: ctx!.sessionManager.getSessionId?.(), fire: fireNo, mode: l.lastRun.mode, report: reportFileOf(l, fireNo), live: !!run };
 		shared.away = away;
 		save(); refreshStatus();
@@ -1457,6 +1476,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** A finished (or interrupted) run, started again in the background on its own conversation with your words. */
 	async function resumeRun(l: Loop, text: string): Promise<string> {
+		if (phase?.id === l.id) return `loop ${l.id} waits for its current foreground turn to finish`;
 		const r = l.lastRun!;
 		const report = reportFileOf(l, r.fire);
 		try { fs.rmSync(report, { force: true }); } catch { /* none */ }
@@ -1484,7 +1504,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const live = shared.runs.get(l.id);
 			const r = l.lastRun;
 			const state = live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
-			const detail = [desc(l), l.run ? `background ${l.run}` : "in conversation", l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
+			const detail = [desc(l), background(l) ? `background ${l.run}` : "in conversation (foreground)", l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
 				r && !live ? `last #${r.fire} ${r.status}${r.result ? `: ${r.result.split("\n")[0]}` : ""}${r.needsYou ? ` · needs you` : ""}` : ""].filter(Boolean).join(" · ");
 			const dot = loopDot(l, Date.now());
 			const why = sayDot(l, dot);
@@ -1698,14 +1718,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 				schedule = { kind: "every", ms };
 			}
 		}
-		if (d.run !== undefined && !RUN_MODES.includes(d.run as RunMode)) throw new Error("run must be fork, thread or fresh (or omitted)");
+		const run = executionMode(d.run);
 		if (d.model !== undefined && (typeof d.model !== "string" || !/^[^\s/]+\/[^\s]+$/.test(d.model))) throw new Error("model must look like provider/id or provider/id:thinking");
-		if (d.model && !d.run) throw new Error("model applies to a background loop (run: fork, thread or fresh); a loop in this conversation uses its model");
+		if (d.model && run === "foreground") throw new Error("model applies to a background loop (run: fork, thread or fresh); a loop in this conversation uses its model");
 		const tz = d.timezone ? validZone(d.timezone) : undefined;
 		if (d.timezone && !tz) throw new Error(`unknown time zone "${d.timezone}"`);
 		if (tz && !zoned(schedule)) throw new Error("a time zone applies only to at loops and whole-day intervals");
 		const realFolder = fs.realpathSync(folder), realRoot = fs.realpathSync(ctx!.cwd);
-		if (realFolder !== realRoot && !realFolder.startsWith(realRoot + path.sep) && !d.run)
+		if (realFolder !== realRoot && !realFolder.startsWith(realRoot + path.sep) && run === "foreground")
 			throw new Error("a loop in an adopted folder runs in the background (run: fork, thread or fresh), where that folder's tools, model and data class apply");
 		const dir = insideDir(ctx!.cwd, path.relative(realRoot, folder) || undefined);
 		const gate = d.gate ? gateConfig({ gate: d.gate, maxSleep: d.maxSleep, gateTimeout: d.gateTimeout, gateOnError: d.gateOnError }, dir) : undefined;
@@ -1717,7 +1737,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (typeof ends === "string") throw new Error(ends);
 		return { id: d.id, prompt: d.prompt.trim(), schedule, ...(tz ? { tz } : {}), ...(gate ? { gate } : {}),
 			...(d.priority ? { priority: d.priority } : {}), ...(dir ? { dir } : {}), ...(context ? { context } : {}),
-			...(d.run ? { run: d.run as RunMode } : {}), ...(d.model ? { model: d.model } : {}), ...(ends ? { expiresAt: ends } : {}) };
+			run, ...(d.model ? { model: d.model } : {}), ...(ends ? { expiresAt: ends } : {}) };
 	}
 
 	function contextFiles(v: unknown): string[] | undefined {
@@ -1749,7 +1769,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (foreign.size && ++ticks % 4 === 0) { declaredSeen = undefined; syncDeclared(); }
 		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && heldFor(l) && (shared.away ?? shared.leaving)?.id !== l.id && (l.nextAt <= now || l.pendingWake));
 		// Background loops need only a run slot: each due one starts now, or runs once more after its current run.
-		for (const l of dueNow.filter(x => x.run)) {
+		for (const l of dueNow.filter(background)) {
+			if (phase?.id === l.id) continue;
 			if (shared.runs.has(l.id)) {
 				// Due again while it runs: once more after it (a self-paced loop's run chooses its own next time instead).
 				if (l.schedule.kind !== "auto" && !shared.again.has(l.id)) shared.again.add(l.id);
@@ -1760,10 +1781,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 			consider(l, now);
 		}
 		// A loop changed from background to in-conversation while a run of it is going waits for that run.
-		const fg = dueNow.filter(l => !l.run && !shared.runs.has(l.id));
+		const fg = dueNow.filter(l => !background(l) && !shared.runs.has(l.id));
 		if (!fg.length) { refreshStatus(); return; }
 		// Busy: due loops wait, once each, for the session to be free; nothing is queued behind the turn.
-		if (busy() || [...gating].some(id => !find(id)?.run)) {
+		if (busy() || [...gating].some(id => !background(find(id)))) {
 			for (const l of fg) if (!waited.has(l.id)) waited.set(l.id, now);
 			refreshStatus();
 			return;
@@ -2004,15 +2025,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 					}
 				}
 			}
-			// --fork / --thread / --fresh (run in the background) and --for <duration> / --until <time>, among the schedule
+			// --fork / --thread / --fresh / --foreground and --for <duration> / --until <time>, among the schedule
 			// words before the prompt; from the prompt's first word on, everything is the prompt.
 			const words = trimmed.split(/\s+/);
-			let run: RunMode | undefined; const life: { for?: string; until?: string } = {};
+			let run: LoopMode = "fork"; const life: { for?: string; until?: string } = {};
 			const kept: string[] = [];
 			let i = 0;
 			for (; i < words.length; i++) {
 				const w = words[i];
-				if (/^--(fork|thread|fresh)$/.test(w)) { run = w.slice(2) as RunMode; continue; }
+				if (/^--(fork|thread|fresh|foreground)$/.test(w)) { run = w.slice(2) as LoopMode; continue; }
 				if ((w === "--for" || w === "--until") && words[i + 1]) { life[w.slice(2) as "for" | "until"] = words[++i]; continue; }
 				const first = !kept.length;
 				if (first && (parseInterval(w) !== undefined || w.toLowerCase() === "auto")) { kept.push(w); continue; }
@@ -2030,7 +2051,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (typeof ends === "string") { notify(ends, "warning"); return; }
 			const r = add(parsed.schedule, parsed.prompt, undefined, parsed.tz, undefined, { run, expiresAt: ends });
 			if (typeof r === "string") { notify(r, "warning"); return; }
-			notify(`loop ${r.id}: ${desc(r)}${r.run ? `, in the background (${r.run})` : ""}, next ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}. /loop rm ${r.id} to stop.`);
+			notify(`loop ${r.id}: ${desc(r)}${background(r) ? `, in the background (${r.run})` : ", in this conversation (foreground)"}, next ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}. /loop rm ${r.id} to stop.`);
 		},
 	});
 
@@ -2060,20 +2081,20 @@ export default function loopExtension(pi: ExtensionAPI) {
 		label: "Manage loops",
 		description:
 			"Recurring prompts (loops) in this session: create, list, delete, pause, resume, run (fire now), gate (set or remove a gate), " +
-			"test (run the gate once without waking) or dismiss (clear what a loop's last run surfaced, once the owner says it's handled). A loop's turn runs in this conversation, or (run) in the background as a fork of it, " +
-			"its own thread or a fresh conversation, which the owner can watch, steer or go into with /loop. Every loop run ends with loop_report " +
+			"test (run the gate once without waking) or dismiss (clear what a loop's last run surfaced, once the owner says it's handled). A loop runs in the background by default, on a fork of this conversation. " +
+			"Choose thread or fresh for other background modes, or foreground explicitly to run in this conversation. The owner can watch, steer or go into background runs with /loop. Every loop run ends with loop_report " +
 			"(findings or not; optionally when to run next, or stop), so a self-paced loop (every: auto) chooses its own next time. Loops made here " +
 			"end after 7 days unless for/until says otherwise. " +
 			"`every` is a fixed interval (default 10m) or auto; `at` is a daily HH:MM wall-clock " +
 			"time that follows daylight saving in the loop's zone. A gate is a script in the project that runs when the loop is due and " +
-			"prints JSON deciding skip, wake or defer, so a frequent check wakes the model only when needed. A due loop waits while the " +
-			"session is busy and fires once when it is free (highest priority first), never stacking. A loop can have its own folder " +
+			"prints JSON deciding skip, wake or defer, so a frequent check wakes the model only when needed. An explicit foreground loop waits while the " +
+			"session is busy and fires once when it is free (highest priority first), never stacking. Background loops run beside the conversation. A loop can have its own folder " +
 			"(dir) holding its gate, prompt template and context files. Loops can also be declared in .pi/loop.json files (see the " +
 			"pi-loop skill). Loops persist across restarts and fire only while a Pi session is open in this project.",
 		promptSnippet: "Schedule recurring prompts in this session (/loop): create, list, delete, pause, resume, run, gate, test, dismiss",
 		promptGuidelines: [
 			"Use loop_manage when the user wants something done periodically or daily in this session; reply with the loop id and next fire time. Run loop_manage list first and change an existing loop rather than adding a duplicate.",
-			"For loop_manage loops, put the instructions in a prompt template (.pi/prompts/<name>.md) and make the loop prompt /<name>, saying where results go; a loop turn's output stays in this session otherwise.",
+			"For loop_manage loops, put the instructions in a prompt template (.pi/prompts/<name>.md) and make the loop prompt /<name>, saying where results go. Loops default to background forks; use foreground only when the user explicitly asks for checks in the conversation.",
 			"Give loop_manage loops that run more often than hourly a gate so most fires cost no model turn; read the pi-loop skill before writing a gate or a loop like that.",
 			"loop_manage loops fire only while a Pi session is open here; for a run that must never be missed, suggest the system scheduler (cron, launchd, systemd) instead.",
 		],
@@ -2094,7 +2115,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			priority: Type.Optional(Type.Number({ description: "create: when several loops wait for the session to be free, higher goes first (default 0)." })),
 			dir: Type.Optional(Type.String({ description: "create: the loop's own folder inside the project (e.g. services/api). Its gate, prompt template (/name from <dir>/.pi/prompts) and state are found there." })),
 			context: Type.Optional(Type.Array(Type.String(), { description: "create: files in the loop's folder attached to each of its turns, e.g. [\"AGENTS.md\"]." })),
-			run: Type.Optional(Type.String({ description: "create: where each turn runs. Omit to run in this conversation. In the background: fork (a copy of this conversation as it is then), thread (the loop's own conversation, continued each run) or fresh (a new conversation each run). Background runs report through loop_report and stay quiet unless they find something." })),
+			run: Type.Optional(Type.String({ description: "create: where each turn runs. Default fork: a background copy of this conversation as it is then. Other background modes: thread (the loop's own continued conversation) or fresh (a new conversation each run). Set foreground explicitly to run in this conversation. Background runs report through loop_report and stay quiet unless they find something." })),
 			for: Type.Optional(Type.String({ description: "create: how long the loop lives, e.g. 2h, 3d (default 7d; loops that must last belong in .pi/loop.json)." })),
 			until: Type.Optional(Type.String({ description: "create: when the loop ends, an ISO time with offset. Use either for or until." })),
 		}),
@@ -2113,7 +2134,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 						if (readOnly) return `loops are owned by pid ${ownerPid()}`;
 						const l = find(p.id ?? ""); if (!l) return `no loop "${p.id}"`;
 						const err = fire(l, "manual"); if (err) throw new Error(err);
-						return `fired ${l.id}; its prompt runs after this turn`;
+						return background(l) ? `fired ${l.id} in the background` : `fired ${l.id}; its prompt runs after this turn`;
 					}
 					case "gate": {
 						if (!p.id) throw new Error("id is required");
@@ -2136,19 +2157,19 @@ export default function loopExtension(pi: ExtensionAPI) {
 								schedule = { kind: "every", ms };
 							}
 						}
-						if (p.run !== undefined && !RUN_MODES.includes(p.run as RunMode)) throw new Error("run must be fork, thread or fresh (or omitted, to run in this conversation)");
+						const run = executionMode(p.run);
 						const ends = parseLifetime({ for: p.for, until: p.until }, Date.now());
 						if (typeof ends === "string") throw new Error(ends);
 						const dir = insideDir(ctx!.cwd, p.dir?.trim());
 						if (p.priority !== undefined && !Number.isFinite(p.priority)) throw new Error("priority must be a number");
-						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p, dir) : undefined, { priority: p.priority, dir, context: contextFiles(p.context), run: p.run as RunMode | undefined, expiresAt: ends });
+						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p, dir) : undefined, { priority: p.priority, dir, context: contextFiles(p.context), run, expiresAt: ends });
 						if (typeof r === "string") throw new Error(r);
 						const hints: string[] = [];
 						const twins = loops.filter(l => l !== r && l.prompt === r.prompt);
 						if (twins.length) hints.push(`loop ${twins.map(l => l.id).join(", ")} already sends this prompt; delete one unless both are intended`);
 						if (!r.gate && r.schedule.kind === "every" && r.schedule.ms < 3_600_000) hints.push("no gate: every fire is a full model turn; for a frequent check, add one with action gate (see the pi-loop skill)");
 						if (!r.prompt.startsWith("/")) hints.push("tip: a prompt template (.pi/prompts/<name>.md, prompt /<name>) keeps the instructions editable between fires");
-						return `created loop ${r.id}: ${desc(r)}${r.run ? `, runs in the background (${r.run})` : ""}, next fire ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}, catch-up ${r.catchUp}${r.gate ? `; ${gateText(r)}` : ""}${hints.map(h => `\n- ${h}`).join("")}`;
+						return `created loop ${r.id}: ${desc(r)}${background(r) ? `, runs in the background (${r.run})` : ", runs in this conversation (foreground)"}, next fire ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}, catch-up ${r.catchUp}${r.gate ? `; ${gateText(r)}` : ""}${hints.map(h => `\n- ${h}`).join("")}`;
 					}
 				}
 			})();
