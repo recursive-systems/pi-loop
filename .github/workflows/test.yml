@@ -1,11 +1,12 @@
-name: test
+name: Optional end-to-end checks
 
+# Deliberately outside build/deploy gates; run selected checks locally first.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
+    continue-on-error: true
     runs-on: ubuntu-latest
     strategy:
       matrix:

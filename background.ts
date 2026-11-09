@@ -15,6 +15,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import type { LoopOrigin } from "./lifecycle.ts";
 import { LIVENESS_STATUS_KEY } from "./liveness.ts";
 
 declare const __filename: string | undefined;
@@ -38,6 +40,9 @@ export type Surface = "needs_you" | "worth_knowing" | "routine";
 
 /** A run as remembered in .pi/loops.json (the live process is not). */
 export interface RunRecord {
+	/** A new id for every startup/resume attempt, even when the fire number is reused. */
+	attemptId?: string;
+	acceptance?: "accepted" | "not_accepted" | "unknown";
 	fire: number;
 	mode: RunMode;
 	status: RunStatus;
@@ -152,6 +157,15 @@ const COMPACTION_ACK_WAIT_MS = 10 * 60_000;
 
 /** One live background run. */
 export class Run {
+	readonly attemptId: string;
+	origin?: LoopOrigin;
+	promptAccepted = false;
+	promptDispatched = false;
+	/** A failed prompt response can follow command effects too. Never automatically retry it. */
+	promptUncertain = false;
+	private extensionFailed = false;
+	private modelFailure?: "model_error" | "model_aborted";
+	get executionError() { return this.extensionFailed ? "extension_error" : this.modelFailure; }
 	proc?: ChildProcessWithoutNullStreams;
 	sessionFile?: string;
 	lines: string[] = [];
@@ -185,8 +199,8 @@ export class Run {
 		readonly loopId: string,
 		readonly fire: number,
 		readonly mode: RunMode,
-		private readonly opts: { cwd: string; sessionArgs: string[]; extra?: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv },
-	) {}
+		private readonly opts: { cwd: string; sessionArgs: string[]; extra?: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv; attemptId?: string },
+	) { this.attemptId = opts.attemptId ?? randomUUID(); }
 
 	private compactionTime(now: number) {
 		return this.compactedMs + (this.compactionStartedAt === undefined ? 0 : now - this.compactionStartedAt);
@@ -219,20 +233,25 @@ export class Run {
 			}
 		});
 		proc.stderr.on("data", () => { /* Pi's own diagnostics; not part of the run */ });
-		proc.on("exit", () => {
+		const gone = () => {
+			if (this.exited) return;
 			this.exited = true; this.working = false;
 			for (const w of this.waiting.values()) w({ success: false, error: "the run's Pi exited" });
 			this.waiting.clear();
 			for (const w of this.exitWaiters.splice(0)) w();
 			for (const w of this.idleWaiters.splice(0)) w();
 			this.changed();
-		});
-		proc.on("error", () => { /* exit follows */ });
+		};
+		proc.on("exit", gone);
+		// A failed spawn emits error/close, NOT exit. Settle RPC and stop waiters there too.
+		proc.on("error", gone);
+		proc.stdin.on("error", () => { /* EPIPE during exit is handled by RPC/exit, not an uncaught process error. */ });
 		const state = await this.send({ type: "get_state" }, 60_000);
 		if (!state?.success) throw new Error(state?.error ?? "the run's Pi did not start");
 		this.sessionFile = state.data?.sessionFile;
 		if (!this.livenessReady) throw new Error("The run did not load its background-work liveness companion");
 		if (this.livenessError) throw new Error(this.livenessError);
+		if (this.executionError) throw new Error("The run reported an extension error during startup");
 	}
 
 	private handle(msg: any) {
@@ -264,6 +283,18 @@ export class Run {
 				for (const check of this.compactionWaiters) check();
 			}
 			return;
+		}
+		if (msg.type === "extension_error") {
+			// RPC can acknowledge a handled command successfully and emit its failure separately.
+			// Keep only the fact, never an extension path or credential-bearing error message.
+			this.extensionFailed = true;
+			this.changed();
+			return;
+		}
+		if (msg.type === "message_end" && msg.message?.role === "assistant") {
+			const stop = msg.message.stopReason;
+			// An automatic model retry may recover: only the latest assistant outcome is final.
+			this.modelFailure = stop === "error" ? "model_error" : stop === "aborted" ? "model_aborted" : undefined;
 		}
 		if (msg.type === "agent_start") { this.starts++; this.working = true; this.changed(); return; }
 		if (msg.type === "agent_settled") { this.settle(); return; }
@@ -311,8 +342,16 @@ export class Run {
 	async prompt(text: string): Promise<void> {
 		this.working = true;
 		const before = this.starts;
+		this.promptDispatched = true;
 		const r = await this.send({ type: "prompt", message: text });
-		if (!r?.success) { this.working = false; throw new Error(r?.error ?? "the run's Pi refused the prompt"); }
+		if (!r?.success) {
+			// A negative response is not a rollback guarantee. Only failures before dispatch
+			// are known to be unaccepted; do not infer effect-free refusal from error text.
+			this.promptUncertain = true;
+			this.working = false;
+			throw new Error(r?.error ?? "the run's Pi refused the prompt");
+		}
+		this.promptAccepted = true;
 		this.push([`› ${text.split("\n")[0].slice(0, 200)}`]);
 		// An extension command is handled without a turn: there will be no agent_settled, unless the command
 		// started one itself (before or shortly after its answer).

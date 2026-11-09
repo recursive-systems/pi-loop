@@ -32,6 +32,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { randomUUID } from "node:crypto";
+import { LifecycleHost, type LifecycleData, type LoopOrigin } from "./lifecycle.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -60,7 +62,7 @@ const CONTINUE_NOTE = "[loop] The owner stepped out. Carry on from where you are
 const MAX_NEXT_MS = 7 * 24 * 60 * 60_000;
 
 /** Process-wide: background runs and the folder lock outlive one extension instance (Pi rebuilds extensions on /new, /resume and session switches). */
-interface Away { id: string; file: string; home: string; homeId?: string; fire: number; mode: RunMode; report: string; /** It was running when you went in (not just opened to read). */ live?: boolean }
+interface Away { id: string; file: string; home: string; homeId?: string; fire: number; mode: RunMode; report: string; attemptId?: string; origin?: LoopOrigin; /** It was running when you went in (not just opened to read). */ live?: boolean }
 interface Note { content: string; details: Record<string, unknown> }
 /** What a finished run came to, collected before it is recorded. */
 interface Outcome { status: RunRecord["status"]; summary: string; findings: boolean; rep?: Report }
@@ -79,6 +81,8 @@ interface Shared {
 	notes: Note[];
 	/** The live extension instance: finished runs report to it, whichever instance started them. */
 	current?: Instance;
+	/** Local metadata writers, retained across session switches and reloads. */
+	lifecycleHosts?: Map<string, LifecycleHost>;
 	/** Run events that came while no instance was live (Pi rebuilding extensions on a switch): the next one takes them. */
 	pending: ((cur: Instance) => void | Promise<void>)[];
 }
@@ -88,7 +92,7 @@ interface Instance {
 	afterLeave(a: Away, finish: boolean): Promise<void>;
 	runStarted(id: string, run: Run, note?: string, meta?: RunMeta): void;
 	runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision): void;
-	judged(id: string, fire: number, verdict: Verdict): void;
+	judged(id: string, fire: number, verdict: Verdict, attemptId?: string, incarnation?: number): void;
 }
 /** The judge's decision about one run's report. */
 interface Verdict { surface: Surface; ask?: string; by: string }
@@ -153,6 +157,8 @@ interface Loop {
 	expiresAt?: number;
 	/** Its latest background run. */
 	lastRun?: RunRecord;
+	/** A foreground dispatch awaiting settlement; retained so a crash is visible too. */
+	foregroundAttempt?: { attemptId: string; fire: number; startedAt: number; running?: boolean };
 	/** Background runs that couldn't start in a row (retried soon, up to 3 times). */
 	startFailures?: number;
 	/** What was put in front of the owner lately (newest last), so the judge can tell a repeat from news. */
@@ -542,6 +548,51 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Background loops waiting for a slot (to say so, rather than "waiting for this session"). */
 	const slotWait = new Set<string>();
 	const reportFileOf = (l: Loop, fire: number) => path.join(stateDirOf(l), `report-${fire}.json`);
+	const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed, judged };
+	let lifecycle: LifecycleHost | undefined;
+	let reportingWarning: string | undefined;
+	function originOf(l: Loop): LoopOrigin {
+		const root = lifecycle?.schedulerCwd ?? ctx!.cwd;
+		const folder = l.source ? path.dirname(path.dirname(path.resolve(root, l.source))) : root;
+		return { id: l.id, incarnation: l.createdAt, revision: l.rev ?? 0, folder, workDir: path.resolve(root, l.dir ?? ".") };
+	}
+	function reportingHealth() {
+		const error = lifecycle?.error;
+		if (error && error !== reportingWarning) {
+			reportingWarning = error;
+			notify(`pi-loop lifecycle reporting is partial (${error}); inspect the local host registration`, "warning");
+			pi.events.emit("loop:lifecycle:error", { v: 1, hostId: lifecycle!.id, code: error });
+		}
+	}
+	function registerHost(state?: "switching" | "stopped") {
+		if (!ctx || !lifecycle) return;
+		const owning = !readOnly && !!folderLock?.mine();
+		lifecycle.update({ sessionId: ctx.sessionManager.getSessionId?.(), state: state ?? (owning ? "owner" : "readonly"),
+			untrackedActive: [...shared.runs.values()].filter(run => !run.attemptId).length,
+			loops: loops.map(l => ({ ...originOf(l), owned: owning && heldFor(l), paused: l.paused, mode: l.run, nextAt: l.nextAt, ...(l.expiresAt ? { expiresAt: l.expiresAt } : {}) })) });
+		reportingHealth();
+	}
+	function trace(data: LifecycleData) {
+		if (!lifecycle) return;
+		lifecycle.append(data);
+		reportingHealth();
+	}
+	function traceRun(run: Run, event: "attempt" | "accepted" | "terminal" | "handoff" | "interruption", extra: Pick<LifecycleData, "by" | "status" | "session" | "findings" | "hasAsk" | "needsPermission" | "error"> = {}) {
+		if (!run.origin || !run.attemptId) return; // Already-active older code has no invented history.
+		trace({ event, loop: run.origin, attemptId: run.attemptId, fire: run.fire, mode: run.mode,
+			acceptance: run.promptAccepted ? "accepted" : run.promptDispatched ? "unknown" : "not_accepted", ...extra });
+	}
+	/** Every acquisition path must attach callbacks and drain events, including a late retry. */
+	function activateOwner(reload = true) {
+		if (reload) loops = load();
+		declaredSeen = undefined;
+		syncDeclared(); reconcile();
+		if (!holding()) return;
+		shared.current = self;
+		drain();
+		interrupted();
+		refreshStatus();
+	}
 
 	/**
 	 * Re-derive future zoned fire times (`at`, whole-day intervals) from the current zone, so a changed
@@ -583,6 +634,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		fs.writeFileSync(tmp, JSON.stringify(loops, null, 2), { mode: 0o600 });
 		fs.renameSync(tmp, file);
 		migratedModes = false;
+		registerHost();
 	}
 	/** One owner per project: an OS-held lock (lock.ts). Taking it is asynchronous; until then this session is read-only. */
 	let folderLock: FolderLock | undefined;
@@ -625,6 +677,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (readOnly) return;
 		releaseFolderLocks();
 		readOnly = true;
+		if (shared.current === self) shared.current = undefined;
 		notify("pi-loop lost its lock on this folder's loops; this session is read-only until it can take it back", "warning");
 		refreshStatus();
 	}
@@ -703,6 +756,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function refreshStatus() {
 		if (!ctx) return;
 		publishState();
+		registerHost();
 		if (!loops.length) {
 			if (barMode) pi.events.emit("statusbar:remove", { id: "loops" }); else ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
@@ -847,6 +901,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	 */
 	function gateThen(l: Loop, reason: Reason) {
 		const started = Date.now();
+		const evaluationId = randomUUID(), origin = originOf(l);
 		const rev = l.rev ?? 0, act = activity;
 		l.nextAt = nextFor(l, started);
 		gating.add(l.id);
@@ -857,6 +912,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const done = run
 			.catch((e): GateDecision => ({ action: l.gate!.onError, reason: `gate error: ${(e as Error)?.message ?? e}`, error: true }))
 			.then(raw => {
+				trace({ event: "gate", loop: origin, evaluationId, action: raw.action, error: !!raw.error });
 				gating.delete(l.id);
 				if (!ctx || readOnly || !loops.includes(l)) return;
 				// The loop was redefined while its gate ran: this answer is about the old one. Its schedule stands.
@@ -926,7 +982,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function fire(l: Loop, reason: Reason, gate?: GateDecision): string | undefined {
 		if (!holding()) return `loops are owned by pid ${ownerPid()}`;
 		if (!heldFor(l)) return `${l.id}'s folder is held by another session (its .pi/loops.lock), or this one is still taking it`;
-		try { home(l); } catch (e) { const msg = `loop ${l.id}: ${(e as Error).message}; not fired`; notify(msg, "warning"); return msg; }
+		try { home(l); } catch (e) {
+			trace({ event: "dispatch_blocked", loop: originOf(l), fire: l.fires + 1, mode: l.run, status: "invalid_folder", error: true });
+			const msg = `loop ${l.id}: ${(e as Error).message}; not fired`; notify(msg, "warning"); return msg;
+		}
 		// A mode edit must not start a second copy of a foreground turn still in progress.
 		if (phase?.id === l.id && background(l)) return `loop ${l.id} waits for its current foreground turn to finish`;
 		if (background(l)) return fireBackground(l, reason, gate);
@@ -938,9 +997,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			save(); refreshStatus();
 			return `you are in ${shared.away.id}'s run; ${l.id} runs when you are back`;
 		}
-		// The occurrence is recorded as sent only after it is handed over (below): a crash in between
-		// sends it again with the same fire number, which a host recognises as the same occurrence.
+		// Retain dispatch intent before handing it over. A crash/exception is not an effect-free refusal.
+		const attemptId = randomUUID();
+		trace({ event: "attempt", loop: originOf(l), attemptId, fire: l.fires + 1, mode: "foreground", by: runMeta(l, l.fires + 1, reason, gate, "conversation").by });
 		const before = { fires: l.fires, lastFiredAt: l.lastFiredAt, lastWokeAt: l.lastWokeAt, nextAt: l.nextAt, pendingWake: l.pendingWake, waited: waited.get(l.id) };
+		l.foregroundAttempt = { attemptId, fire: l.fires + 1, startedAt: Date.now() };
+		save(); // Intent is durable, but do not count the host's fire before sendUserMessage returns.
 		l.fires += 1;
 		l.lastFiredAt = Date.now();
 		l.lastWokeAt = l.lastFiredAt;
@@ -957,19 +1019,24 @@ export default function loopExtension(pi: ExtensionAPI) {
 		let commands: CommandInfo[] = [];
 		try { commands = (pi as any).getCommands?.() ?? []; } catch { /* older Pi */ }
 		const { text, expand } = compose(l.prompt, header + where, evidence + `\n\n${REPORT_HINT}`, home(l), commands, !!l.dir);
-		inConversation = { id: l.id, report: reportFileOf(l, l.fires) };
+		inConversation = { id: l.id, report: reportFileOf(l, l.fires), attemptId, fire: l.fires, origin: originOf(l) };
 		try { fs.rmSync(inConversation.report, { force: true }); } catch { /* none */ }
 		try {
 			// `loop` names the occurrence for a host (Pi ignores it): the same id and fire mean the same turn.
 			pi.sendUserMessage(text, { deliverAs: "followUp", expandPromptTemplates: expand, loop: { id: l.id, fire: l.fires, rev: l.rev ?? 0, since: l.createdAt } } as any);
 		} catch (e) {
+			trace({ event: "terminal", loop: originOf(l), attemptId, fire: l.fires, mode: "foreground", status: "send_failed", acceptance: "unknown", error: true });
+			inConversation = undefined;
 			Object.assign(l, { fires: before.fires, lastFiredAt: before.lastFiredAt, lastWokeAt: before.lastWokeAt, nextAt: before.nextAt });
-			// A gate may have recorded that it reported this: keep its wake rather than ask it again.
-			if (gate) { l.pendingWake = keptWake(gate, Date.now(), l.rev ?? 0); save(); }
-			const msg = `loop ${l.id}: couldn't send its turn (${(e as Error).message}); it is kept and sent again`;
+			// Preserve evidence without authorizing another potentially duplicate dispatch.
+			l.paused = true;
+			if (gate) l.pendingWake = keptWake(gate, Date.now(), l.rev ?? 0);
+			save();
+			const msg = `loop ${l.id}: couldn't confirm its turn (${(e as Error).message}); paused pending reconciliation`;
 			notify(msg, "warning"); refreshStatus();
 			return msg;
 		}
+		trace({ event: "foreground_queued", loop: originOf(l), attemptId, fire: l.fires, mode: "foreground", acceptance: "unknown", session: ctx?.sessionManager.getSessionFile?.() });
 		const meta = runMeta(l, l.fires, reason, gate, "conversation");
 		try { (pi as any).appendEntry?.(RUN_ENTRY, meta); } catch { /* a record must not stop the turn */ }
 		logFired(meta, ctx?.sessionManager?.getSessionFile?.());
@@ -982,7 +1049,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	/** The loop whose turn is running in this conversation now, and where its loop_report goes. */
-	let inConversation: { id: string; report: string } | undefined;
+	let inConversation: { id: string; report: string; attemptId: string; fire: number; origin: LoopOrigin } | undefined;
 
 	function runMeta(l: Loop, fireNo: number, reason: Reason, gate: GateDecision | undefined, mode: RunMeta["mode"]): RunMeta {
 		const by: RunMeta["by"] = reason === "manual" ? "manual" : !gate ? "schedule" : gate.heartbeat ? "heartbeat" : "gate";
@@ -1116,35 +1183,38 @@ export default function loopExtension(pi: ExtensionAPI) {
 			return `loop ${l.id} waits for a background slot (loop.maxBackground ${maxBackground})`;
 		}
 		slotWait.delete(l.id);
-		const fireNo = l.fires + 1;
-		// In the loop's own folder, so Pi gives the run that folder's settings, tools (.pi/mcp.json), prompts, data class
-		// and AGENTS.md; pi-loop itself comes along for loop_report when that folder isn't this project.
-		let place: ReturnType<typeof runPlace>;
-		try { place = runPlace(l); } catch (e) {
+		const fireNo = l.fires + 1, attemptId = randomUUID(), origin = originOf(l);
+		const by = runMeta(l, fireNo, reason, gate, l.run).by;
+		trace({ event: "attempt", loop: origin, attemptId, fire: fireNo, mode: l.run, by });
+		// Preparation itself can fail (session directory, template or context), before a child exists.
+		let place: ReturnType<typeof runPlace>, s: ReturnType<typeof sessionArgsFor>, report: string, text: string, meta: RunMeta;
+		try {
+			place = runPlace(l);
+			s = sessionArgsFor(l, l.run);
+			report = reportFileOf(l, fireNo);
+			try { fs.rmSync(report, { force: true }); } catch { /* none */ }
+			const composed = runText(l, fireNo, reason, gate, s.mode);
+			// Commands must be their own message; skills allow a header after the name.
+			const head = `[loop ${l.id} · ${desc(l)} · fire #${fireNo} · background ${s.mode}${reason === "due" ? "" : ` · ${reason}`}${gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : ""}]`;
+			const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
+			text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
+				: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
+			meta = runMeta(l, fireNo, reason, gate, s.mode);
+		} catch (e) {
 			const msg = (e as Error).message;
 			l.nextAt = nextFor(l, now);
-			l.lastRun = { fire: fireNo, mode: l.run!, status: "failed", startedAt: now, endedAt: now, host: process.pid, result: msg.slice(0, 2000), findings: true, unread: true };
+			l.lastRun = { attemptId, acceptance: "not_accepted", fire: fireNo, mode: l.run, status: "failed", startedAt: now, endedAt: now, host: process.pid, result: msg.slice(0, 2000), findings: true, unread: true };
+			trace({ event: "terminal", loop: origin, attemptId, fire: fireNo, mode: l.run, status: "failed", acceptance: "not_accepted", error: true });
 			save(); refreshStatus();
 			deliver({ content: `[loop ${l.id} · background ${l.run} · couldn't start] ${msg}`, details: { id: l.id, status: "failed" } });
 			return `${l.id}: ${msg}`;
 		}
-		const s = sessionArgsFor(l, l.run!);
-		const report = reportFileOf(l, fireNo);
-		try { fs.rmSync(report, { force: true }); } catch { /* none */ }
-		const composed = runText(l, fireNo, reason, gate, s.mode);
-		// A command (not a prompt template here) runs only as its own message: Pi doesn't read "/cmd" followed by the
-		// header on new lines as that command. It then has no header or report hint; what it does is its own.
-		// A skill (/skill:name) reads its name up to the first space, so the header can follow on the same line.
-		const head = `[loop ${l.id} · ${desc(l)} · fire #${fireNo} · background ${s.mode}${reason === "due" ? "" : ` · ${reason}`}${gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : ""}]`;
-		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
-		const text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
-			: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
-		const meta = runMeta(l, fireNo, reason, gate, s.mode);
-		const run = new Run(l.id, fireNo, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, report, meta) });
+		const run = new Run(l.id, fireNo, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, report, meta), attemptId });
+		run.origin = origin;
 		shared.runs.set(l.id, run);
 		if (reason !== "manual" || l.nextAt <= now) l.nextAt = nextFor(l, now);
 		waited.delete(l.id);
-		l.lastRun = { fire: fireNo, mode: s.mode, status: "starting", startedAt: now, host: process.pid };
+		l.lastRun = { attemptId, acceptance: "unknown", fire: fireNo, mode: s.mode, status: "starting", startedAt: now, host: process.pid };
 		save(); refreshStatus();
 		void (async () => {
 			try {
@@ -1166,33 +1236,47 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return undefined;
 	}
 
+	function sameRun(l: Loop, run: Run): boolean {
+		if (run.attemptId && l.lastRun?.attemptId !== run.attemptId) return false;
+		return run.origin ? l.createdAt === run.origin.incarnation
+			: !!run.sessionFile && l.lastRun?.session === run.sessionFile && l.lastRun?.fire === run.fire;
+	}
+
 	function runStarted(id: string, run: Run, note?: string, meta?: RunMeta) {
 		const cur = loops.find(x => x.id === id);
-		if (!cur || run.handedOver) return;
+		traceRun(run, "accepted", { session: run.sessionFile });
+		if (!cur || run.handedOver || !sameRun(cur, run)) return;
 		delete cur.startFailures;
 		cur.fires = Math.max(cur.fires, run.fire);
 		cur.lastFiredAt = cur.lastWokeAt = Date.now();
 		delete cur.pendingWake;
-		cur.lastRun = { ...(cur.lastRun ?? { fire: run.fire, mode: run.mode, startedAt: Date.now() }), status: "running", session: run.sessionFile, host: process.pid };
+		cur.lastRun = { ...(cur.lastRun ?? { fire: run.fire, mode: run.mode, startedAt: Date.now() }), status: "running", acceptance: "accepted", session: run.sessionFile, host: process.pid };
 		if (meta) logFired(meta, run.sessionFile);
 		save(); refreshStatus();
 		if (note) notify(`loop ${id}: ${note}`, "info");
 	}
 
 	function runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision) {
+		if (run.handedOver || run.recorded) return;
 		const cur = loops.find(x => x.id === id);
-		if (!cur) return;
+		const uncertain = run.promptUncertain || run.promptDispatched === undefined; // Older active code has no dispatch proof.
+		traceRun(run, "terminal", { status: "failed", error: true, session: run.sessionFile });
+		if (!cur || !sameRun(cur, run)) return;
+		// A failed/missing acknowledgement can follow effects. Stop retries until reconciled.
+		if (uncertain) { cur.paused = true; delete cur.pendingWake; }
 		// A gate may have recorded that it reported this: keep its wake rather than ask it again. Otherwise try
 		// this occurrence again soon, a few times, before leaving it to the schedule.
 		cur.startFailures = (cur.startFailures ?? 0) + 1;
-		const retry = cur.startFailures <= 3;
-		if (gate) cur.pendingWake = keptWake(gate, Date.now(), cur.rev ?? 0);
-		else if (retry) cur.nextAt = Math.min(cur.nextAt, Date.now() + 2 * 60_000);
+		const retry = !uncertain && cur.startFailures <= 3;
+		if (gate && !uncertain) {
+			cur.pendingWake = keptWake(gate, Date.now(), cur.rev ?? 0);
+			if (!retry) cur.paused = true; // Keep the wake without an unbounded 15-second startup storm.
+		} else if (retry) cur.nextAt = Math.min(cur.nextAt, Date.now() + 2 * 60_000);
 		// A run started again on its own conversation (leave, steer) keeps that conversation: it can still be opened.
 		const session = run.sessionFile ?? (cur.lastRun?.fire === run.fire ? cur.lastRun?.session : undefined);
-		cur.lastRun = { fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid, ...(session ? { session } : {}) };
+		cur.lastRun = { attemptId: run.attemptId, acceptance: uncertain ? "unknown" : "not_accepted", fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid, ...(session ? { session } : {}) };
 		save(); refreshStatus();
-		notify(`loop ${id}: its background run couldn't start (${why}); ${gate || retry ? "it is tried again soon" : "it runs again at its next time"}`, "warning");
+		notify(`loop ${id}: its background run couldn't start (${why}); ${uncertain ? "acceptance is unknown; the loop is paused pending reconciliation, not retried" : gate && !retry ? "startup retries exhausted; its wake is kept and the loop is paused" : gate || retry ? "it is tried again soon" : "it runs again at its next time"}`, "warning");
 	}
 
 	/** Wait until a run has really finished (idle and staying idle), then hand it to the live instance. */
@@ -1224,9 +1308,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 		await run.stop();
 		if (run.handedOver) return;
 		const rep = readReport(report);
-		const status = run.cancelled ? "cancelled" : crashed ? "failed" : "done";
+		const failure = crashed ? (run.livenessError ?? "its Pi exited before the run finished")
+			: run.executionError ? `its Pi reported ${run.executionError.replaceAll("_", " ")}` : undefined;
+		const status = run.cancelled ? "cancelled" : failure ? "failed" : "done";
 		const findings = status === "failed" || !!run.needsYou || (rep ? rep.findings : true);
-		const summary = (crashed ? (run.livenessError ?? "its Pi exited before the run finished") : rep?.summary) ?? text?.split("\n").find(x => x.trim())?.trim() ?? "(no answer)";
+		const summary = (failure ?? rep?.summary) ?? text?.split("\n").find(x => x.trim())?.trim() ?? "(no answer)";
 		live(cur => cur.recordRun(id, run, { status, summary, findings, rep }));
 	}
 
@@ -1235,13 +1321,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (run.recorded || run.handedOver) return;
 		run.recorded = true;
 		if (shared.runs.get(id) === run) shared.runs.delete(id);
-		const l = loops.find(x => x.id === id);
+		const candidate = loops.find(x => x.id === id);
+		const l = candidate && sameRun(candidate, run) ? candidate : undefined;
 		const ask = o.rep?.ask?.trim() || undefined;
-		const rec: RunRecord = { fire: run.fire, mode: run.mode, status: o.status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
+		traceRun(run, "terminal", { status: o.status, session: run.sessionFile, findings: o.findings, hasAsk: !!ask, needsPermission: !!run.needsYou, error: o.status === "failed" });
+		const rec: RunRecord = { attemptId: run.attemptId, acceptance: run.promptAccepted ? "accepted" : "unknown", fire: run.fire, mode: run.mode, status: o.status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
 			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), ...(ask ? { ask } : {}), unread: false };
 		if (l) {
 			l.lastRun = rec;
-			if (o.status === "done" && o.rep) applyReport(l, o.rep);
+			if (o.status === "done" && o.rep && (!run.origin || (l.rev ?? 0) === run.origin.revision)) applyReport(l, o.rep);
 			// Due again while it ran: once more now, unless the run chose its own next time (or the loop paces itself).
 			const again = shared.again.delete(id) && !o.rep?.next && l.schedule.kind !== "auto";
 			if (again && loops.includes(l) && !l.paused) l.nextAt = Math.min(l.nextAt, Date.now());
@@ -1249,11 +1337,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		// What reaches the owner is decided after the run is recorded: a failure or a question for them always,
 		// anything else it reported only when the judge says it needs them.
-		if (o.status === "cancelled") return;
-		if (o.status === "failed" || run.needsYou) { judged(id, run.fire, { surface: "needs_you", ask: run.needsYou || `${id}: run failed`, by: "fact" }); return; }
+		if (!l || o.status === "cancelled") return;
+		if (o.status === "failed" || run.needsYou) { judged(id, run.fire, { surface: "needs_you", ask: run.needsYou || `${id}: run failed`, by: "fact" }, run.attemptId, l.createdAt); return; }
 		if (!o.findings && !ask) return;
-		const loop = l;
-		void judge(loop, o.summary, ask).then(v => live(cur => cur.judged(id, run.fire, v)));
+		const incarnation = l.createdAt;
+		void judge(l, o.summary, ask).then(v => live(cur => cur.judged(id, run.fire, v, run.attemptId, incarnation)));
 	}
 
 	/** Ask the classifier whether this report should interrupt the owner; the run's own ask decides without one. */
@@ -1281,10 +1369,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	/** Record the judge's decision on a run, and put it in front of the owner when it needs them. */
-	function judged(id: string, fire: number, v: Verdict) {
+	function judged(id: string, fire: number, v: Verdict, attemptId?: string, incarnation?: number) {
 		const l = loops.find(x => x.id === id);
 		const rec = l?.lastRun;
-		if (!l || !rec || rec.fire !== fire || readOnly) return;
+		if (!l || !rec || rec.fire !== fire || readOnly || (rec.attemptId && rec.attemptId !== attemptId) || (incarnation !== undefined && l.createdAt !== incarnation)) return;
 		rec.surface = v.surface;
 		rec.judgedBy = v.by;
 		if (v.surface === "routine") { save(); refreshStatus(); return; }
@@ -1372,8 +1460,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		const prev = l.lastRun;
 		l.lastRun = { ...(l.lastRun ?? { fire: fireNo, mode: background(l) ? l.run : "fresh", startedAt: Date.now() }), status: "away", session: file, unread: false, host: process.pid };
-		const away: Away = { id: l.id, file, home: homeFile, homeId: ctx!.sessionManager.getSessionId?.(), fire: fireNo, mode: l.lastRun.mode, report: reportFileOf(l, fireNo), live: !!run };
+		const away: Away = { id: l.id, file, home: homeFile, attemptId: run?.attemptId ?? l.lastRun?.attemptId, origin: run?.origin ?? originOf(l), homeId: ctx!.sessionManager.getSessionId?.(), fire: fireNo, mode: l.lastRun.mode, report: reportFileOf(l, fireNo), live: !!run };
 		shared.away = away;
+		if (run) traceRun(run, "handoff", { status: "away", session: file });
 		save(); refreshStatus();
 		let res: any;
 		try {
@@ -1420,9 +1509,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (finish || !l) {
 			const text = lastAssistantText(a.file);
 			const rep = readReport(a.report);
-			const rec: RunRecord = { fire: a.fire, mode: a.mode, status: "done", startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: a.file, host: process.pid,
+			const rec: RunRecord = { attemptId: a.attemptId, fire: a.fire, mode: a.mode, status: "done", startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: a.file, host: process.pid,
 				result: (rep?.summary ?? text?.split("\n").find(x => x.trim())?.trim() ?? "(no answer)").slice(0, 2000), findings: false, unread: false };
-			if (l) { l.lastRun = rec; if (rep) applyReport(l, rep); save(); }
+			if (a.origin) trace({ event: "terminal", loop: a.origin, attemptId: a.attemptId, fire: a.fire, mode: a.mode, status: "done", session: a.file, findings: !!rep?.findings, hasAsk: !!rep?.ask });
+			if (l && (!a.origin || l.createdAt === a.origin.incarnation)) { l.lastRun = rec; if (rep) applyReport(l, rep); save(); }
 			flushNotes(); refreshStatus();
 			return;
 		}
@@ -1430,8 +1520,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		let place: ReturnType<typeof runPlace>;
 		try { place = runPlace(l); } catch (e) { notify(`${l.id}: ${(e as Error).message}`, "warning"); return; }
 		const run = new Run(l.id, a.fire, a.mode, { ...place, sessionArgs: ["--session", a.file], env: childEnv(l, a.report) });
+		run.origin = originOf(l);
+		traceRun(run, "attempt", { by: "leave" });
 		shared.runs.set(l.id, run);
-		l.lastRun = { ...(l.lastRun ?? { fire: a.fire, mode: a.mode, startedAt: Date.now() }), status: "running", session: a.file, host: process.pid };
+		l.lastRun = { ...(l.lastRun ?? { fire: a.fire, mode: a.mode, startedAt: Date.now() }), attemptId: run.attemptId, acceptance: "unknown", status: "starting", session: a.file, host: process.pid };
 		save(); refreshStatus(); flushNotes();
 		try { await run.start(); if (!run.handedOver) await run.prompt(CONTINUE_NOTE); }
 		catch (e) {
@@ -1441,6 +1533,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			return;
 		}
 		if (run.handedOver) return;
+		traceRun(run, "accepted", { session: run.sessionFile });
+		if (l.lastRun?.attemptId === run.attemptId) { l.lastRun.status = "running"; l.lastRun.acceptance = "accepted"; save(); refreshStatus(); }
 		void watchRun(run, a.report);
 	}
 
@@ -1483,8 +1577,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		let place: ReturnType<typeof runPlace>;
 		try { place = runPlace(l); } catch (e) { return `${l.id}: ${(e as Error).message}`; }
 		const run = new Run(l.id, r.fire, r.mode, { ...place, sessionArgs: ["--session", r.session!], env: childEnv(l, report) });
+		run.origin = originOf(l);
+		traceRun(run, "attempt", { by: "resume" });
 		shared.runs.set(l.id, run);
-		l.lastRun = { ...r, status: "running", unread: false, host: process.pid };
+		l.lastRun = { ...r, attemptId: run.attemptId, acceptance: "unknown", status: "starting", unread: false, host: process.pid };
 		save(); refreshStatus();
 		try { await run.start(); if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · the owner's words]\n${text}\n\n${REPORT_HINT}`); }
 		catch (e) {
@@ -1494,6 +1590,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			return `couldn't start ${l.id}'s run again: ${(e as Error).message}`;
 		}
 		if (run.handedOver) return `${l.id}'s run is yours now`;
+		traceRun(run, "accepted", { session: run.sessionFile });
+		if (l.lastRun?.attemptId === run.attemptId) { l.lastRun.status = "running"; l.lastRun.acceptance = "accepted"; save(); refreshStatus(); }
 		void watchRun(run, report);
 		return `${l.id}'s run #${r.fire} carries on in the background with your words`;
 	}
@@ -1752,13 +1850,21 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function tick() {
 		if (!ctx) return;
 		if (readOnly) {
-			claimLock(() => { loops = load(); declaredSeen = undefined; syncDeclared(); reconcile(); refreshStatus(); });
+			claimLock(() => activateOwner());
 			return;
 		}
 		const now = Date.now();
 		// One loop per tick: a burst after sleep should not queue five turns at once.
 		// A fired prompt that never reached the transcript (dropped queue) must not read "queued" forever.
-		if (phase?.state === "queued" && now - phaseAt > 2 * TICK_MS && ctx.isIdle?.() && !ctx.hasPendingMessages?.()) phase = undefined;
+		if (phase?.state === "queued" && now - phaseAt > 2 * TICK_MS && ctx.isIdle?.() && !ctx.hasPendingMessages?.()) {
+			const l = find(phase.id);
+			if (l?.foregroundAttempt) {
+				trace({ event: "interruption", loop: originOf(l), attemptId: l.foregroundAttempt.attemptId, fire: l.foregroundAttempt.fire, mode: "foreground", status: "unobserved_dispatch", acceptance: "unknown" });
+				delete l.foregroundAttempt; save();
+			}
+			inConversation = undefined;
+			phase = undefined;
+		}
 		syncDeclared();
 		expire(now);
 		for (const id of waited.keys()) if (!loops.some(l => l.id === id && !l.paused)) waited.delete(id);
@@ -1814,6 +1920,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		try { home(due); } catch (e) {
 			// Its folder is gone or outside the project: skip this occurrence, say so, keep the others running.
 			notify(`loop ${due.id}: ${(e as Error).message}; skipped`, "warning");
+			trace({ event: "dispatch_blocked", loop: originOf(due), fire: due.fires + 1, mode: due.run, status: "invalid_folder", error: true });
 			logDecision(gateLog, { ts: new Date(now).toISOString(), id: due.id, action: "skip", reason: (e as Error).message, ms: 0, error: true });
 			waited.delete(due.id); due.nextAt = nextFor(due, now); save(); refreshStatus();
 			return;
@@ -1859,7 +1966,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 		loops = load();
 		maxBackground = configuredMaxBackground(c.cwd);
 		waited.clear(); declaredSeen = undefined; declaredErrors.clear();
-		const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed, judged };
+		const hosts = shared.lifecycleHosts ??= new Map();
+		let version = "unknown";
+		try { version = JSON.parse(fs.readFileSync(path.join(path.dirname(selfPath()!), "package.json"), "utf8")).version; } catch { /* explicitly unknown */ }
+		const hostKey = fs.realpathSync(c.cwd) + "\0" + version;
+		lifecycle = hosts.get(hostKey);
+		if (!lifecycle) { lifecycle = new LifecycleHost(path.join(agentDir(), "loop-hosts"), fs.realpathSync(c.cwd), version); hosts.set(hostKey, lifecycle); }
+		registerHost();
 		// Run events go to this instance only once it holds the folder's lock (until then they wait in shared.pending).
 		if (shared.current?.finishRun !== finishRun) shared.current = undefined;
 		// The same process switching sessions (/new, /resume, going into a loop's run) keeps the folder's lock:
@@ -1877,9 +1990,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (kept) {
 			folderLock = kept;
 			readOnly = false;
-			syncDeclared(); reconcile();
-			shared.current = self;
-			drain();
+			activateOwner(false);
 		} else {
 			// A claim the previous instance still had going would otherwise hold the lock for nobody.
 			releaseFolderLocks();
@@ -1887,7 +1998,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			folderLock = new FolderLock(lock, {}, () => lostLock());
 			shared.lock = folderLock; shared.lockPath = lock;
 			readOnly = true;
-			claimLock(() => { loops = load(); syncDeclared(); reconcile(); interrupted(); refreshStatus(); shared.current = self; drain(); });
+			claimLock(() => activateOwner());
 		}
 		if (timer) clearInterval(timer);
 		timer = setInterval(tick, TICK_MS);
@@ -1904,9 +2015,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function interrupted() {
 		let changed = false;
 		for (const l of loops) {
+			if (l.foregroundAttempt && inConversation?.attemptId !== l.foregroundAttempt.attemptId) {
+				trace({ event: "interruption", loop: originOf(l), attemptId: l.foregroundAttempt.attemptId, fire: l.foregroundAttempt.fire, mode: "foreground", status: "interrupted", acceptance: l.foregroundAttempt.running ? "accepted" : "unknown" });
+				if (l.fires < l.foregroundAttempt.fire) l.paused = true;
+				delete l.foregroundAttempt; changed = true;
+			}
 			const r = l.lastRun;
 			if (!r || !["starting", "running", "away"].includes(r.status) || shared.runs.has(l.id)) continue;
 			if (r.host === process.pid && shared.away?.id === l.id) continue;
+			// A crash before the accepted callback can hide an executed prompt with the SAME fire number.
+			if (r.status === "starting" || r.acceptance === "unknown") l.paused = true;
+			trace({ event: "interruption", loop: originOf(l), attemptId: r.attemptId, fire: r.fire, mode: r.mode, status: "interrupted", acceptance: r.acceptance ?? "unknown", session: r.session });
 			l.lastRun = { ...r, status: "interrupted", endedAt: Date.now(), findings: true, unread: true, result: r.result ?? "the Pi running it stopped before it finished" };
 			changed = true;
 		}
@@ -1922,6 +2041,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			: Array.isArray(m.content) ? m.content.map(c => (c as { text?: string }).text ?? "").join("") : "";
 		if (!text.includes(`[loop ${phase.id} \u00b7`)) return;
 		phase = { state: "running", id: phase.id };
+		const l = find(phase.id);
+		if (l?.foregroundAttempt) {
+			l.foregroundAttempt.running = true;
+			trace({ event: "foreground_running", loop: originOf(l), attemptId: l.foregroundAttempt.attemptId, fire: l.foregroundAttempt.fire, mode: "foreground", acceptance: "accepted", session: ctx?.sessionManager.getSessionFile?.() });
+			save();
+		}
 		refreshStatus();
 	});
 
@@ -1930,7 +2055,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// The loop's turn is over once Pi settles, even if a compaction starts right after: busy() still
 	// sees the compaction through isIdle(), and Pi sends no second agent_settled when it ends.
-	pi.on("agent_settled", () => {
+	pi.on("agent_settled", (event) => {
 		if (phase?.state !== "running") return;
 		phase = undefined;
 		// An in-conversation loop's report: its next time, or that it is done.
@@ -1938,7 +2063,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		inConversation = undefined;
 		const l = ic && loops.find(x => x.id === ic.id);
 		const r = ic && readReport(ic.report);
-		if (l && r && !readOnly) { applyReport(l, r); save(); }
+		if (ic) trace({ event: "terminal", loop: ic.origin, attemptId: ic.attemptId, fire: ic.fire, mode: "foreground", status: event.aborted ? "cancelled" : "settled", acceptance: "accepted", findings: !!r?.findings, hasAsk: !!r?.ask, session: ctx?.sessionManager.getSessionFile?.() });
+		if (l && l.createdAt === ic?.origin.incarnation && !readOnly) { delete l.foregroundAttempt; if (r) applyReport(l, r); save(); }
 		refreshStatus();
 	});
 
@@ -1959,8 +2085,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!event?.reason || event.reason === "quit") {
 			const stopping = [...shared.runs].map(([id, run]) => {
 				run.handedOver = true;
+				traceRun(run, "interruption", { status: "interrupted", session: run.sessionFile });
 				const l = loops.find(x => x.id === id);
-				if (l?.lastRun && !readOnly) l.lastRun = { ...l.lastRun, status: "interrupted", endedAt: Date.now(), findings: true, unread: true, result: "Pi quit before the run finished" };
+				if (l?.lastRun && !readOnly && sameRun(l, run)) {
+					if (l.lastRun.status === "starting" || l.lastRun.acceptance === "unknown") l.paused = true;
+					l.lastRun = { ...l.lastRun, status: "interrupted", endedAt: Date.now(), findings: true, unread: true, result: "Pi quit before the run finished" };
+				}
 				return run.stop(2_000);
 			});
 			await Promise.all(stopping);
@@ -1971,6 +2101,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			shared.lock = undefined; shared.lockPath = undefined;
 			releaseFolderLocks();
 		}
+		registerHost(!event?.reason || event.reason === "quit" ? "stopped" : "switching");
 		folderLock = undefined;
 		ctx = undefined;
 	});

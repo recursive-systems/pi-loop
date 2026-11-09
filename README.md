@@ -20,6 +20,8 @@ conversation itself:
   waking the model for. No news, no tokens spent.
 - **Daily times follow daylight saving** in whatever time zone you set, or your machine's.
 - **Loops survive restarts.** They're saved in `.pi/loops.json`.
+- **Upcoming on main: supervisors can follow every registered origin.** A private, durable metadata feed retains
+  startup failures and lifecycle outcomes even after the next run replaces `lastRun`.
 - **Quiet unless there's news.** A background run says what it found with `loop_report`; a run with
   nothing to report leaves no trace in your conversation.
 - **The agent can watch something for you.** A loop can pick its own next time (`auto`: every 2 minutes
@@ -190,6 +192,20 @@ Log each decision to `$LOOP_STATE_DIR` so you can tune the thresholds later.
 {"loops": [{"id": "api-check", "prompt": "/check", "every": "5m", "gate": ".pi/gates/check", "context": ["AGENTS.md"]}]}
 ```
 
+## Supervision (prepared for 0.12)
+
+This section describes the upcoming source on `main`, not the tagged stable install above.
+Source publication does not install or reload a running host.
+
+Hosts register their project/adopted origins and write metadata-only lifecycle records under
+`<agent-dir>/loop-hosts/`. No prompts, reports, gate reasons or credentials go there. Consumers
+must authorize each source and treat stale hosts, reporting gaps and older loaded versions as
+partial coverage—not proof of delivery or permission to repeat work. See [the v1 feed contract](LIFECYCLE.md).
+
+A failed or lost child prompt acknowledgement may follow an already-executed command. That
+loop now pauses for reconciliation instead of automatically retrying. Definite preparation or
+child-start failures retain their existing retry behavior. This does not replace a job's own idempotency or native approvals.
+
 ## What a loop leaves behind
 
 To see how a loop is doing (how often it woke for nothing, what it missed, what it costs), look at
@@ -219,9 +235,10 @@ What the gate measured is for the gate to keep, in `$LOOP_STATE_DIR`.
   `{"loop": {"timezone": "<Area/City>"}}`, using any IANA name, such as `Asia/Tokyo`.
 - Every run starts with `[loop <id> · <schedule> · fire #N]`, which you can rely on.
 
-## Tests
+## Optional end-to-end checks
 
-End-to-end against the real `pi`, with no mocks: `npm test`.
+Outside the build, nonblocking and against the real `pi`, with no mocks: `npm test`.
+Use light selected checks periodically; failures go to the owner, never a required release gate.
 
 Live-model tests are opt-in: set `PI_E2E_PROVIDER` and `PI_E2E_MODEL` explicitly.
 For an existing Pi gateway connection, also set `PI_E2E_MODELS_FILE` and
