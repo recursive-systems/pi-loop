@@ -16,8 +16,8 @@ import * as path from "node:path";
 
 export type ModelSpec = string | string[];
 
-/** A model held back after it failed, by its provider/id: until when, and how many holds in a row. */
-export interface Hold { until: number; tries: number }
+/** A model held back after it failed, by its provider/id: until when, how many holds in a row, and why. */
+export interface Hold { until: number; tries: number; why?: string }
 export type Holds = Record<string, Hold>;
 
 /** What a check command knows: models it says are unavailable, and models it says are fine. Others it doesn't track. */
@@ -67,6 +67,18 @@ export function heldNow(key: string, holds: Holds, now: number, check?: CheckAns
 }
 
 /**
+ * The models a pick of `picked` passed over without trying them (earlier in `chain`, not tried yet), and why:
+ * the check said unavailable, or a hold (until when, and its own reason) that the check didn't override.
+ */
+export function skippedFor(chain: string[], picked: string, holds: Holds, now: number, tried: string[] = [], check?: CheckAnswer): { model: string; why: string; until?: string; after?: string }[] {
+	return chain.slice(0, chain.indexOf(picked)).filter(c => !tried.includes(c)).map(modelKey).flatMap(key => {
+		if (check?.unavailable.has(key)) return [{ model: key, why: "check_unavailable" }];
+		const h = holds[key];
+		return heldNow(key, holds, now, check) && h ? [{ model: key, why: "held", until: new Date(h.until).toISOString(), ...(h.why ? { after: h.why } : {}) }] : [];
+	});
+}
+
+/**
  * The model a run uses: the first one not tried yet in this fire and not held back. When every
  * model is held back, a fire's first attempt still runs, on its first choice; later attempts stop.
  */
@@ -76,13 +88,13 @@ export function pickModel(chain: string[], holds: Holds, now: number, tried: str
 }
 
 /** Hold a model back after a failure; `started` when this begins a new hold (it wasn't held a moment ago). */
-export function holdModel(holds: Holds, key: string, now: number, backoffMs: number): { hold: Hold; started: boolean } {
+export function holdModel(holds: Holds, key: string, now: number, backoffMs: number, why: string): { hold: Hold; started: boolean } {
 	const prev = holds[key];
 	// Failing again during a hold (another loop's run that had started already) changes nothing; failing
 	// again after it ended doubles the next one.
 	if (prev && prev.until > now) return { hold: prev, started: false };
 	const tries = (prev?.tries ?? 0) + 1;
-	const hold = { until: now + backoffMs * Math.min(2 ** (tries - 1), MAX_BACKOFF_FACTOR), tries };
+	const hold = { until: now + backoffMs * Math.min(2 ** (tries - 1), MAX_BACKOFF_FACTOR), tries, why };
 	holds[key] = hold;
 	return { hold, started: true };
 }
@@ -93,7 +105,7 @@ export function readHolds(file: string, now: number, maxMs: number): Holds {
 		const raw = JSON.parse(fs.readFileSync(file, "utf8"))?.models;
 		const out: Holds = {};
 		for (const [k, h] of Object.entries(raw ?? {}) as [string, any][]) {
-			if (Number.isFinite(h?.until) && Number.isFinite(h?.tries)) out[k] = { until: Math.min(h.until, now + maxMs), tries: h.tries };
+			if (Number.isFinite(h?.until) && Number.isFinite(h?.tries)) out[k] = { until: Math.min(h.until, now + maxMs), tries: h.tries, ...(typeof h.why === "string" ? { why: h.why } : {}) };
 		}
 		return out;
 	} catch { return {}; }

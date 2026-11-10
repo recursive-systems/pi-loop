@@ -68,8 +68,11 @@ export interface RunRecord {
 	model?: string;
 	/** Its model isn't the loop's first choice: that one was held back, or failed this fire. */
 	fallback?: true;
-	/** Earlier attempts of this fire that moved on to another model: which model, why, and their session if they had one. */
-	passedOver?: { model: string; why: string; session?: string }[];
+	/**
+	 * Models this fire passed over: which, and why. An attempt that failed has its session; a model skipped
+	 * without an attempt has none ("held" adds until when, and `after` the hold's own reason).
+	 */
+	passedOver?: { model: string; why: string; session?: string; until?: string; after?: string }[];
 }
 
 /** Pi's folder name for a cwd's sessions, with a suffix: --home-u-project-loop-check-- */

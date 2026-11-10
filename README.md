@@ -33,7 +33,7 @@ conversation itself:
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.11.1
+pi install git:github.com/recursive-systems/pi-loop@v0.13.1
 ```
 
 Add `-l` to install it for one project only.

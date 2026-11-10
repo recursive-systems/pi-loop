@@ -45,7 +45,7 @@ import { Run, RUN_MODES, extensionFlags, lastAssistantText, sessionFolder, trans
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
-import { DEFAULT_MODEL_BACKOFF_MS, MAX_BACKOFF_FACTOR, checkModels, holdModel, modelKey, modelList, parseModels, pickModel, readHolds, splitModel, writeHolds, type CheckAnswer, type Holds, type ModelSpec } from "./models.ts";
+import { DEFAULT_MODEL_BACKOFF_MS, MAX_BACKOFF_FACTOR, checkModels, holdModel, modelKey, modelList, parseModels, pickModel, readHolds, skippedFor, splitModel, writeHolds, type CheckAnswer, type Holds, type ModelSpec } from "./models.ts";
 import { LoopsView, GLYPH, type Dot, type LoopRow, type ViewAction } from "./view.ts";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
@@ -877,8 +877,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!on?.model) return "";
 		if (!on.fallback) return `on ${on.model}`;
 		const first = modelKey(chainOf(l)[0]!), hold = holds[first];
-		const passed = (on.passedOver ?? []).map(p => `${p.model}: ${UNAVAILABLE[p.why as Unavailable] ?? p.why}`);
-		const next = hold && hold.until > Date.now() ? `${first} tried again ${fmtTime(hold.until, zoneOf(l))}` : `${first} tried again next run`;
+		const passed = (on.passedOver ?? []).map(p => `${p.model}: ${p.why === "held" ? `held back${p.after ? ` (${UNAVAILABLE[p.after as Unavailable] ?? p.after})` : ""}` : UNAVAILABLE[p.why as Unavailable] ?? p.why}`);
+		const next = hold && hold.until > Date.now() ? `${first} tried again ${fmtTime(hold.until, zoneOf(l))}`
+			: on.passedOver?.some(p => p.model === first && p.why === "check_unavailable") ? `the check is asked about ${first} again next run` : `${first} tried again next run`;
 		return `on ${on.model} (fallback; ${[...passed, next].join("; ")})`;
 	}
 
@@ -1144,9 +1145,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	/** The gate log's line for a run that started: links a wake (the line before it) to the run's session. */
-	function logFired(m: RunMeta, session?: string, on?: Pick<RunRecord, "model" | "fallback">) {
+	function logFired(m: RunMeta, session?: string, on?: Pick<RunRecord, "model" | "fallback" | "passedOver">) {
 		logDecision(gateLog, { ts: new Date().toISOString(), id: m.loop, action: "fired", fire: m.fire, by: m.by, mode: m.mode, ...(m.late ? { late: m.late } : {}), ...(session ? { session } : {}),
-			...(on?.model ? { model: on.model } : {}), ...(on?.fallback ? { fallback: true } : {}) });
+			...(on?.model ? { model: on.model } : {}), ...(on?.fallback ? { fallback: true } : {}), ...(on?.passedOver?.length ? { passedOver: on.passedOver } : {}) });
 	}
 
 	/** The prompt a loop's run gets: its header, folder, gate context and the report hint. */
@@ -1315,9 +1316,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 					if (!a.tried.length) {
 						const check = await checkNow(l.id, a.chain);
 						if (check) a.check = { unavailable: [...check.unavailable], available: [...check.available] };
-						const picked = pickModel(a.chain, holds, Date.now(), [], check);
+						const now = Date.now(), picked = pickModel(a.chain, holds, now, [], check);
 						if (picked && picked !== choice) { const m = splitModel(picked); run.useModel(m.model, m.thinking); }
 						choice = picked;
+						if (picked) a.passedOver.push(...skippedFor(a.chain, picked, holds, now, [], check));
 					}
 					a.tried.push(choice!);
 				}
@@ -1359,11 +1361,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (why === "gave_up_retrying" || why === "check_unavailable") holdFor(l, failed, run.fire, why);
 		else if (why === "not_started") a.unstarted.push(failed);
 		if (l.paused || !background(l) || !loops.includes(l)) return false;
-		const next = pickModel(a.chain, holds, Date.now(), a.tried, checkOf(a));
+		const now = Date.now(), next = pickModel(a.chain, holds, now, a.tried, checkOf(a));
 		if (!next) return false;
 		let place: ReturnType<typeof runPlace>, s: ReturnType<typeof sessionArgsFor>;
 		try { place = runPlace(l, next); s = sessionArgsFor(l, run.mode); } catch { return false; }
-		a.passedOver.push({ model: failed, why, ...(run.sessionFile ? { session: run.sessionFile } : {}) });
+		a.passedOver.push({ model: failed, why, ...(run.sessionFile ? { session: run.sessionFile } : {}) },
+			...skippedFor(a.chain, next, holds, now, a.tried, checkOf(a)).filter(p => !a.passedOver.some(x => x.model === p.model)));
 		logDecision(gateLog, { ts: new Date().toISOString(), id: l.id, action: "fallback", fire: run.fire, from: failed, to: modelKey(next), why, ...(run.sessionFile ? { session: run.sessionFile } : {}) });
 		// Said once per fire, by its first run. A thread run starts again on its own conversation, which then
 		// holds this fire's prompt twice, the first with no answer (Pi doesn't replay failed answers to the model).
@@ -1400,7 +1403,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** Hold a model back for this folder's loops; each new hold is said, with why. */
 	function holdFor(l: Loop, key: string, fire: number, why: Unavailable) {
-		const { hold, started } = holdModel(holds, key, Date.now(), modelSettings.backoffMs);
+		const { hold, started } = holdModel(holds, key, Date.now(), modelSettings.backoffMs, why);
 		saveHolds();
 		logDecision(gateLog, { ts: new Date().toISOString(), id: l.id, action: "model-unavailable", fire, model: key, why, until: new Date(hold.until).toISOString(), tries: hold.tries });
 		if (started) notify(`model ${key} is held back (${UNAVAILABLE[why]}); loops that list another model use it, and try ${key} again ${fmtTime(hold.until, zone.tz)}`, "warning");
