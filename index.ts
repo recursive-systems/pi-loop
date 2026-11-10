@@ -45,6 +45,7 @@ import { Run, RUN_MODES, extensionFlags, lastAssistantText, sessionFolder, trans
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
+import { DEFAULT_MODEL_BACKOFF_MS, MAX_BACKOFF_FACTOR, checkModels, holdModel, modelKey, modelList, parseModels, pickModel, readHolds, splitModel, writeHolds, type CheckAnswer, type Holds, type ModelSpec } from "./models.ts";
 import { LoopsView, GLYPH, type Dot, type LoopRow, type ViewAction } from "./view.ts";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
@@ -65,7 +66,7 @@ const MAX_NEXT_MS = 7 * 24 * 60 * 60_000;
 interface Away { id: string; file: string; home: string; homeId?: string; fire: number; mode: RunMode; report: string; attemptId?: string; origin?: LoopOrigin; /** It was running when you went in (not just opened to read). */ live?: boolean }
 interface Note { content: string; details: Record<string, unknown> }
 /** What a finished run came to, collected before it is recorded. */
-interface Outcome { status: RunRecord["status"]; summary: string; findings: boolean; rep?: Report }
+interface Outcome { status: RunRecord["status"]; summary: string; findings: boolean; rep?: Report; /** It did nothing because its model was unavailable: why. */ unavailable?: Unavailable }
 interface Shared {
 	lock?: FolderLock; lockPath?: string;
 	/** Locks on the folders whose declared loops this session runs (adopted ones), by folder. */
@@ -83,6 +84,8 @@ interface Shared {
 	current?: Instance;
 	/** Local metadata writers, retained across session switches and reloads. */
 	lifecycleHosts?: Map<string, LifecycleHost>;
+	/** What each live run was started with, so a run whose model failed before doing anything can start again on the next. */
+	launches?: WeakMap<Run, Launch>;
 	/** Run events that came while no instance was live (Pi rebuilding extensions on a switch): the next one takes them. */
 	pending: ((cur: Instance) => void | Promise<void>)[];
 }
@@ -93,6 +96,35 @@ interface Instance {
 	runStarted(id: string, run: Run, note?: string, meta?: RunMeta): void;
 	runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision): void;
 	judged(id: string, fire: number, verdict: Verdict, attemptId?: string, incarnation?: number): void;
+}
+/**
+ * Why a run of a loop with fallback models is taken to have done nothing for want of its model. Only these
+ * move a fire on to the next model; any other failure is recorded as it always was.
+ *   gave_up_retrying   every answer was a model error with no content, no tool ran, and Pi judged the last one
+ *                      transient (overloaded, rate limited, a server or connection error), retried, and gave up
+ *   check_unavailable  the same, for any model error, and the check command then lists the model as unavailable
+ *   no_credentials     Pi lists no credentials for its provider, so the prompt was never sent
+ *   not_started        its Pi didn't start, so the prompt was never sent
+ */
+type Unavailable = "gave_up_retrying" | "check_unavailable" | "no_credentials" | "not_started";
+const UNAVAILABLE: Record<Unavailable, string> = {
+	gave_up_retrying: "Pi gave up retrying a transient model error", check_unavailable: "the check command lists it as unavailable",
+	no_credentials: "Pi lists no credentials for it", not_started: "a run on it didn't start, and one on another model did",
+};
+/** One fire of a background loop, as its runs are started: on its first available model, then the next ones. */
+interface Launch {
+	text: string; report: string; meta: RunMeta; gate?: GateDecision; note?: string; startedAt: number;
+	/** The loop's models in order (more than one: it can fall back). */
+	chain: string[];
+	/** Models this fire has tried, in order; `unstarted` are those whose Pi didn't start, held back once another does. */
+	tried: string[];
+	unstarted: string[];
+	/** The attempts this fire moved on from, for the run's record. */
+	passedOver: NonNullable<RunRecord["passedOver"]>;
+	/** The latest attempt stopped because Pi lists no credentials for its model. */
+	noCredentials?: boolean;
+	/** What the check command said when the fire started. */
+	check?: { unavailable: string[]; available: string[] };
 }
 /** The judge's decision about one run's report. */
 interface Verdict { surface: Surface; ask?: string; by: string }
@@ -151,8 +183,8 @@ interface Loop {
 	pendingWake?: { reason: string; context?: string; at: number; rev: number; heartbeat?: true; error?: true };
 	/** Where its turn runs. Omitted legacy modes migrate to a background fork; foreground is explicit. */
 	run: LoopMode;
-	/** A background run's model, provider/id[:thinking]; absent = this session's. */
-	model?: string;
+	/** A background run's model, provider/id[:thinking], or a list to fall back through (first choice first); absent = this session's. */
+	model?: ModelSpec;
 	/** It ends then: ad hoc loops after 7 days unless they say otherwise; absent = never. */
 	expiresAt?: number;
 	/** Its latest background run. */
@@ -203,7 +235,7 @@ interface Declared {
 	id: string; prompt: string; every?: string; at?: string; timezone?: string;
 	gate?: string; maxSleep?: string; gateTimeout?: string; gateOnError?: string;
 	priority?: number; context?: string[]; paused?: boolean;
-	run?: string; for?: string; until?: string; model?: string;
+	run?: string; for?: string; until?: string; model?: ModelSpec;
 }
 
 // ------------------------------------------------------------ settings --
@@ -329,6 +361,34 @@ export function configuredJudge(cwd: string): string | undefined {
 	return undefined;
 }
 
+/**
+ * Model fallback settings in the project's or agent's settings.json (the project's first):
+ *   loop.modelBackoff    how long a model that failed is held back before runs try it again (doubling while it keeps failing)
+ *   loop.modelCheck      an executable (a path, no arguments) that says which models are unavailable or available now (see models.ts)
+ *   loop.fallbackModels  models a background loop that names none falls back to after this session's (false or [] opts out)
+ */
+export function configuredModelFallback(cwd: string): { backoffMs: number; check?: string; fallbacks: string[]; warning?: string } {
+	const out: { backoffMs: number; check?: string; fallbacks: string[]; warning?: string } = { backoffMs: DEFAULT_MODEL_BACKOFF_MS, fallbacks: [] };
+	let backoffSet = false, fallbacksSet = false;
+	// A relative check path is found in the project for its settings, in the agent dir for the agent's.
+	for (const [file, base] of [[path.join(cwd, ".pi", "settings.json"), cwd], [path.join(agentDir(), "settings.json"), agentDir()]]) {
+		let raw: { modelBackoff?: unknown; modelCheck?: unknown; fallbackModels?: unknown } | undefined;
+		try { raw = (JSON.parse(fs.readFileSync(file, "utf8")) as { loop?: typeof raw }).loop; } catch { continue; }
+		const ms = typeof raw?.modelBackoff === "string" ? parseInterval(raw.modelBackoff.trim()) : undefined;
+		if (!backoffSet && ms !== undefined && ms >= MIN_INTERVAL_MS) { out.backoffMs = ms; backoffSet = true; }
+		if (!out.check && typeof raw?.modelCheck === "string" && raw.modelCheck.trim()) out.check = path.resolve(base, raw.modelCheck.trim());
+		if (!fallbacksSet && raw?.fallbackModels !== undefined) {
+			fallbacksSet = true;
+			// false or [] (in a project) opts out of a list the agent's settings give.
+			const v = raw.fallbackModels;
+			if (v !== false && !(Array.isArray(v) && !v.length)) {
+				try { out.fallbacks = modelList(parseModels(v)); } catch (e) { out.warning = `loop.fallbackModels in ${file}: ${(e as Error).message}; ignored`; }
+			}
+		}
+	}
+	return out;
+}
+
 /** The question the judge answers about a report (a classifier "choice"), tuned on real loop reports. */
 const JUDGE_QUESTION = {
 	type: "choice" as const,
@@ -439,7 +499,7 @@ function parseAdd(args: string): { schedule: Schedule; prompt: string; tz?: stri
 		}
 	}
 	const prompt = rest.join(" ").trim();
-	if (!prompt) return { error: "usage: /loop [10m|2h|1d|auto|at HH:MM [Area/City]] [--fork|--thread|--fresh] [--for 2d|--until <time>] <prompt>" };
+	if (!prompt) return { error: "usage: /loop [10m|2h|1d|auto|at HH:MM [Area/City]] [--fork|--thread|--fresh] [--model provider/id[,provider/id]] [--for 2d|--until <time>] <prompt>" };
 	return { schedule, prompt, tz };
 }
 
@@ -544,6 +604,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Busy: a run, compaction or queued prompt, or a loop turn of ours not finished yet. */
 	const busy = () => { if (shared.away || shared.leaving) return true; try { return !ctx!.isIdle() || !!ctx!.hasPendingMessages?.() || !!phase; } catch { return true; } };
 	let maxBackground = 0;
+	/** Models held back for this folder's loops after they failed (.pi/loop-models.json; see models.ts). */
+	let holds: Holds = {};
+	let holdsFile = "";
+	/** loop.modelBackoff / modelCheck / fallbackModels, read again every tick. */
+	let modelSettings: ReturnType<typeof configuredModelFallback> = { backoffMs: DEFAULT_MODEL_BACKOFF_MS, fallbacks: [] };
+	const loadHolds = () => readHolds(holdsFile, Date.now(), modelSettings.backoffMs * MAX_BACKOFF_FACTOR);
+	function refreshModelSettings() {
+		const warning = modelSettings.warning;
+		modelSettings = configuredModelFallback(ctx!.cwd);
+		if (modelSettings.warning && modelSettings.warning !== warning) notify(modelSettings.warning, "warning");
+	}
 	const overLimit = () => maxBackground > 0 && shared.runs.size >= maxBackground;
 	/** Background loops waiting for a slot (to say so, rather than "waiting for this session"). */
 	const slotWait = new Set<string>();
@@ -584,7 +655,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 	/** Every acquisition path must attach callbacks and drain events, including a late retry. */
 	function activateOwner(reload = true) {
-		if (reload) loops = load();
+		if (reload) { loops = load(); holds = loadHolds(); }
 		declaredSeen = undefined;
 		syncDeclared(); reconcile();
 		if (!holding()) return;
@@ -789,12 +860,26 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const live = shared.runs.get(l.id);
 			const state = live ? `running in background (${live.mode}, ${live.working ? "working" : "idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
 			const p = l.prompt.length > 70 ? `${l.prompt.slice(0, 67)}…` : l.prompt;
-			const extra = [background(l) ? `runs in background: ${l.run}` : "runs in this conversation (foreground)", l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "",
+			const extra = [background(l) ? `runs in background: ${l.run}` : "runs in this conversation (foreground)", modelText(l), l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "",
 				l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "", slotWait.has(l.id) ? `waiting for a background slot (loop.maxBackground ${maxBackground})` : waited.has(l.id) ? "waiting for this session to be free" : ""].filter(Boolean);
 			const r = l.lastRun;
 			const last = r && !live ? `\n    last run #${r.fire} ${r.status}${r.endedAt ? ` ${countdown(Math.max(0, Date.now() - r.endedAt))} ago` : ""}${r.unread ? " (new)" : ""}${r.result ? `: ${r.result.split("\n")[0].slice(0, 120)}` : ""}${r.needsYou ? ` · needs you: ${r.needsYou}` : ""}` : "";
 			return `${l.id}  ${desc(l)}  ${state}  ×${l.fires}\n    ${p}${extra.length ? `\n    ${extra.join(" · ")}` : ""}${l.gate ? `\n    ${gateText(l)}` : ""}${last}`;
 		}).join("\n") + `\n${zoneLine}`;
+	}
+
+	/**
+	 * The model a loop's current (or last) run is on, and when that isn't its first choice, why: "on p/b (fallback;
+	 * p/a unavailable, tried again 14:30)". Empty before its first run.
+	 */
+	function modelText(l: Loop): string {
+		const run = shared.runs.get(l.id), on = run ? modelOf(l, run) : l.lastRun;
+		if (!on?.model) return "";
+		if (!on.fallback) return `on ${on.model}`;
+		const first = modelKey(chainOf(l)[0]!), hold = holds[first];
+		const passed = (on.passedOver ?? []).map(p => `${p.model}: ${UNAVAILABLE[p.why as Unavailable] ?? p.why}`);
+		const next = hold && hold.until > Date.now() ? `${first} tried again ${fmtTime(hold.until, zoneOf(l))}` : `${first} tried again next run`;
+		return `on ${on.model} (fallback; ${[...passed, next].join("; ")})`;
 	}
 
 	function gateText(l: Loop): string {
@@ -812,7 +897,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// -------------------------------------------------------------- actions --
 
-	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Partial<Pick<Loop, "priority" | "dir" | "context" | "run" | "expiresAt">> = {}): Loop | string {
+	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Partial<Pick<Loop, "priority" | "dir" | "context" | "run" | "model" | "expiresAt">> = {}): Loop | string {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}; manage them from that session`;
 		const run = executionMode(more.run);
 		if (more.dir && run === "foreground") {
@@ -836,6 +921,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			...(more.priority ? { priority: more.priority } : {}),
 			...(more.dir ? { dir: more.dir } : {}),
 			...(more.context?.length ? { context: more.context } : {}),
+			...(more.model ? { model: more.model } : {}),
 		};
 		loop.nextAt = nextFor(loop, now);
 		loops.push(loop);
@@ -1058,8 +1144,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	/** The gate log's line for a run that started: links a wake (the line before it) to the run's session. */
-	function logFired(m: RunMeta, session?: string) {
-		logDecision(gateLog, { ts: new Date().toISOString(), id: m.loop, action: "fired", fire: m.fire, by: m.by, mode: m.mode, ...(m.late ? { late: m.late } : {}), ...(session ? { session } : {}) });
+	function logFired(m: RunMeta, session?: string, on?: Pick<RunRecord, "model" | "fallback">) {
+		logDecision(gateLog, { ts: new Date().toISOString(), id: m.loop, action: "fired", fire: m.fire, by: m.by, mode: m.mode, ...(m.late ? { late: m.late } : {}), ...(session ? { session } : {}),
+			...(on?.model ? { model: on.model } : {}), ...(on?.fallback ? { fallback: true } : {}) });
 	}
 
 	/** The prompt a loop's run gets: its header, folder, gate context and the report hint. */
@@ -1136,10 +1223,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return me ? ["-e", me] : [];
 	}
 
-	/** Where a run of `l` works and what it is given there: its folder, pi-loop for loop_report, its model. */
-	function runPlace(l: Loop): { cwd: string; extra: string[]; model?: string; thinking?: string } {
+	/** Where a run of `l` works and what it is given there: its folder, pi-loop for loop_report, its model (`choice`, else its first available one). */
+	function runPlace(l: Loop, choice = pickModel(chainOf(l), holds, Date.now())): { cwd: string; extra: string[]; model?: string; thinking?: string } {
 		const where = home(l);
-		return { cwd: where, extra: runExtra(where), ...modelArgs(l) };
+		return { cwd: where, extra: runExtra(where), ...modelArgs(choice) };
 	}
 
 	/** A run's Pi environment; `meta` only for a new run (its Pi records it in the run's session), not one carried on. */
@@ -1154,12 +1241,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return env;
 	}
 
-	function modelArgs(l?: Loop): { model?: string; thinking?: string } {
-		if (l?.model) {
-			const i = l.model.lastIndexOf(":");
-			const lvl = i > 0 ? l.model.slice(i + 1) : "";
-			return /^(off|minimal|low|medium|high|xhigh|max)$/.test(lvl) ? { model: l.model.slice(0, i), thinking: lvl } : { model: l.model };
-		}
+	/** A loop's chosen model (provider/id[:thinking]) as Pi's --model and --thinking; none chosen: this session's. */
+	function modelArgs(choice: string | undefined): { model?: string; thinking?: string } {
+		if (choice) return splitModel(choice);
 		const m = ctx?.model;
 		let thinking: string | undefined;
 		try { thinking = (pi as any).getThinkingLevel?.(); } catch { /* older Pi */ }
@@ -1186,10 +1270,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const fireNo = l.fires + 1, attemptId = randomUUID(), origin = originOf(l);
 		const by = runMeta(l, fireNo, reason, gate, l.run).by;
 		trace({ event: "attempt", loop: origin, attemptId, fire: fireNo, mode: l.run, by });
+		const chain = chainOf(l), choice = pickModel(chain, holds, now);
 		// Preparation itself can fail (session directory, template or context), before a child exists.
 		let place: ReturnType<typeof runPlace>, s: ReturnType<typeof sessionArgsFor>, report: string, text: string, meta: RunMeta;
 		try {
-			place = runPlace(l);
+			place = runPlace(l, choice);
 			s = sessionArgsFor(l, l.run);
 			report = reportFileOf(l, fireNo);
 			try { fs.rmSync(report, { force: true }); } catch { /* none */ }
@@ -1209,31 +1294,142 @@ export default function loopExtension(pi: ExtensionAPI) {
 			deliver({ content: `[loop ${l.id} · background ${l.run} · couldn't start] ${msg}`, details: { id: l.id, status: "failed" } });
 			return `${l.id}: ${msg}`;
 		}
-		const run = new Run(l.id, fireNo, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, report, meta), attemptId });
-		run.origin = origin;
-		shared.runs.set(l.id, run);
 		if (reason !== "manual" || l.nextAt <= now) l.nextAt = nextFor(l, now);
 		waited.delete(l.id);
-		l.lastRun = { attemptId, acceptance: "unknown", fire: fireNo, mode: s.mode, status: "starting", startedAt: now, host: process.pid };
+		launch(l, { text, report, meta, gate, note: s.note, startedAt: now, chain, tried: [], unstarted: [], passedOver: [] }, place, choice, s, attemptId);
+		return undefined;
+	}
+
+	/** Start one run of a fire: on `choice`, or with a fallback list, on the first model the holds and a check (if any) allow. */
+	function launch(l: Loop, a: Launch, place: ReturnType<typeof runPlace>, choice: string | undefined, s: { args: string[]; mode: RunMode }, attemptId: string) {
+		const run = new Run(l.id, a.meta.fire, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, a.report, a.meta), attemptId });
+		run.origin = originOf(l);
+		(shared.launches ??= new WeakMap()).set(run, a);
+		shared.runs.set(l.id, run);
+		l.lastRun = { attemptId, acceptance: "unknown", fire: a.meta.fire, mode: s.mode, status: "starting", startedAt: a.startedAt, host: process.pid, ...modelOf(l, run, a) };
 		save(); refreshStatus();
+		a.noCredentials = false;
 		void (async () => {
 			try {
+				if (a.chain.length > 1) {
+					if (!a.tried.length) {
+						const check = await checkNow(l.id, a.chain);
+						if (check) a.check = { unavailable: [...check.unavailable], available: [...check.available] };
+						const picked = pickModel(a.chain, holds, Date.now(), [], check);
+						if (picked && picked !== choice) { const m = splitModel(picked); run.useModel(m.model, m.thinking); }
+						choice = picked;
+					}
+					a.tried.push(choice!);
+				}
 				await run.start();
 				if (run.handedOver) return; // taken over while starting: the run is yours now
-				await run.prompt(text);
+				// Pi refuses a prompt without credentials, and a refused prompt can't be told from one that ran: ask first.
+				if (a.chain.length > 1 && !(await run.listsCredentials())) {
+					a.noCredentials = true;
+					if (!noCredentialsSaid.has(run.model!)) { noCredentialsSaid.add(run.model!); notify(`Pi lists no credentials for ${run.model}; loops that list another model use it this fire, and ask again next fire`, "warning"); }
+					throw new Error(`Pi lists no credentials for ${run.model}`);
+				}
+				if (run.handedOver) return;
+				await run.prompt(a.text);
 			} catch (e) {
 				if (run.handedOver) return;
 				await run.stop();
 				if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
 				// Recorded by whichever instance is live now (a session switch may have replaced this one).
-				live(cur => cur.runFailed(l.id, run, (e as Error).message, now, gate));
+				live(cur => cur.runFailed(l.id, run, (e as Error).message, a.startedAt, a.gate));
 				return;
 			}
 			if (run.handedOver) return;
-			live(cur => cur.runStarted(l.id, run, s.note, meta));
-			await watchRun(run, report);
+			live(cur => cur.runStarted(l.id, run, a.note, a.meta));
+			await watchRun(run, a.report);
 		})();
-		return undefined;
+	}
+
+	/**
+	 * A run of a loop with fallback models couldn't use its model, and did nothing (see Unavailable): hold
+	 * the model back where that is evidence against it, and start the same fire again on the next model.
+	 * Nothing ran, so nothing is repeated. Returns false when there is no next model to start.
+	 */
+	function fallBack(l: Loop, run: Run, why: Unavailable): boolean {
+		const a = shared.launches?.get(run);
+		if (!a || a.chain.length < 2) return false;
+		const failed = modelKey(a.tried[a.tried.length - 1]!);
+		// A Pi that didn't start may have failed for a reason of its own: held back only once another one starts.
+		// Credentials Pi doesn't list may only be late: never held, so the next fire asks again.
+		if (why === "gave_up_retrying" || why === "check_unavailable") holdFor(l, failed, run.fire, why);
+		else if (why === "not_started") a.unstarted.push(failed);
+		if (l.paused || !background(l) || !loops.includes(l)) return false;
+		const next = pickModel(a.chain, holds, Date.now(), a.tried, checkOf(a));
+		if (!next) return false;
+		let place: ReturnType<typeof runPlace>, s: ReturnType<typeof sessionArgsFor>;
+		try { place = runPlace(l, next); s = sessionArgsFor(l, run.mode); } catch { return false; }
+		a.passedOver.push({ model: failed, why, ...(run.sessionFile ? { session: run.sessionFile } : {}) });
+		logDecision(gateLog, { ts: new Date().toISOString(), id: l.id, action: "fallback", fire: run.fire, from: failed, to: modelKey(next), why, ...(run.sessionFile ? { session: run.sessionFile } : {}) });
+		// Said once per fire, by its first run. A thread run starts again on its own conversation, which then
+		// holds this fire's prompt twice, the first with no answer (Pi doesn't replay failed answers to the model).
+		a.note = undefined;
+		const attemptId = randomUUID();
+		trace({ event: "attempt", loop: originOf(l), attemptId, fire: run.fire, mode: s.mode, by: a.meta.by });
+		launch(l, a, place, next, s, attemptId);
+		return true;
+	}
+
+	/** The model a run of `l` uses, for its record, whether that is a fallback (not its first choice), and what this fire passed over. */
+	function modelOf(l: Loop, run: Run, a = shared.launches?.get(run)): Pick<RunRecord, "model" | "fallback" | "passedOver"> {
+		const model = run.reportedModel ?? run.model, chain = chainOf(l);
+		return { ...(model ? { model } : {}), ...(chain.length > 1 && run.model && modelKey(chain[0]!) !== run.model ? { fallback: true as const } : {}),
+			...(a?.passedOver.length ? { passedOver: [...a.passedOver] } : {}) };
+	}
+
+	const checkOf = (a: Launch): CheckAnswer | undefined => a.check && { unavailable: new Set(a.check.unavailable), available: new Set(a.check.available) };
+
+	/** What the check command says about `chain` now (cached for a minute unless `fresh`); undefined without a check, or when it fails. */
+	async function checkNow(id: string, chain: string[], fresh = false): Promise<CheckAnswer | undefined> {
+		const check = modelSettings.check;
+		if (!check || !ctx) return undefined;
+		const keys = chain.map(modelKey), args = JSON.stringify([check, keys]), now = Date.now();
+		if (!fresh && lastCheck?.args === args && now - lastCheck.at < 60_000) return lastCheck.answer;
+		const answer = await checkModels(check, ctx.cwd, keys);
+		lastCheck = { args, at: now, answer };
+		if (!answer) logDecision(gateLog, { ts: new Date().toISOString(), id, action: "model-check", error: true, reason: `${check} failed or printed no {"unavailable": [...], "available": [...]}; models are chosen by their holds` });
+		return answer;
+	}
+	let lastCheck: { args: string; at: number; answer?: CheckAnswer } | undefined;
+	/** Models already said to have no credentials (once per session: it is asked again every fire, at a few seconds' cost). */
+	const noCredentialsSaid = new Set<string>();
+
+	/** Hold a model back for this folder's loops; each new hold is said, with why. */
+	function holdFor(l: Loop, key: string, fire: number, why: Unavailable) {
+		const { hold, started } = holdModel(holds, key, Date.now(), modelSettings.backoffMs);
+		saveHolds();
+		logDecision(gateLog, { ts: new Date().toISOString(), id: l.id, action: "model-unavailable", fire, model: key, why, until: new Date(hold.until).toISOString(), tries: hold.tries });
+		if (started) notify(`model ${key} is held back (${UNAVAILABLE[why]}); loops that list another model use it, and try ${key} again ${fmtTime(hold.until, zone.tz)}`, "warning");
+	}
+
+	/** A model served a run: it is available again. */
+	function releaseModel(l: Loop, key: string) {
+		if (!holds[key]) return;
+		delete holds[key];
+		saveHolds();
+		logDecision(gateLog, { ts: new Date().toISOString(), id: l.id, action: "model-available", model: key });
+		notify(`model ${key} is available again; loops that prefer it use it again`, "info");
+	}
+
+	/** Holds are only ever an optimisation: failing to save them must not stop a run from being recorded. */
+	function saveHolds() {
+		if (!holding()) return;
+		try { writeHolds(holdsFile, holds); }
+		catch (e) { notify(`pi-loop couldn't save held-back models (${(e as NodeJS.ErrnoException).code ?? "error"}); they apply until this session ends`, "warning"); }
+	}
+
+	/** Its models in order: its own; for a loop that names none, this session's, then loop.fallbackModels. */
+	function chainOf(l: Loop): string[] {
+		// A loop that names its model keeps exactly that (one may be pinned on purpose, e.g. for data reasons).
+		if (l.model !== undefined || !background(l) || !modelSettings.fallbacks.length) return modelList(l.model);
+		// Without a session model to start from, Pi's own default runs, as before: it can't be named first.
+		const { model, thinking } = modelArgs(undefined);
+		if (!model) return [];
+		return [thinking ? `${model}:${thinking}` : model, ...modelSettings.fallbacks.filter(m => modelKey(m) !== model)];
 	}
 
 	function sameRun(l: Loop, run: Run): boolean {
@@ -1250,8 +1446,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		cur.fires = Math.max(cur.fires, run.fire);
 		cur.lastFiredAt = cur.lastWokeAt = Date.now();
 		delete cur.pendingWake;
-		cur.lastRun = { ...(cur.lastRun ?? { fire: run.fire, mode: run.mode, startedAt: Date.now() }), status: "running", acceptance: "accepted", session: run.sessionFile, host: process.pid };
-		if (meta) logFired(meta, run.sessionFile);
+		cur.lastRun = { ...(cur.lastRun ?? { fire: run.fire, mode: run.mode, startedAt: Date.now() }), status: "running", acceptance: "accepted", session: run.sessionFile, host: process.pid, ...modelOf(cur, run) };
+		// Models this fire passed over because their Pi didn't start: another one did, so it was them.
+		for (const key of shared.launches?.get(run)?.unstarted.splice(0) ?? []) holdFor(cur, key, run.fire, "not_started");
+		if (meta) logFired(meta, run.sessionFile, cur.lastRun);
 		save(); refreshStatus();
 		if (note) notify(`loop ${id}: ${note}`, "info");
 	}
@@ -1262,6 +1460,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const uncertain = run.promptUncertain || run.promptDispatched === undefined; // Older active code has no dispatch proof.
 		traceRun(run, "terminal", { status: "failed", error: true, session: run.sessionFile });
 		if (!cur || !sameRun(cur, run)) return;
+		// Nothing was sent: the next model on the loop's list can take this fire.
+		if (!uncertain && !run.promptDispatched && fallBack(cur, run, shared.launches?.get(run)?.noCredentials ? "no_credentials" : "not_started")) return;
 		// A failed/missing acknowledgement can follow effects. Stop retries until reconciled.
 		if (uncertain) { cur.paused = true; delete cur.pendingWake; }
 		// A gate may have recorded that it reported this: keep its wake rather than ask it again. Otherwise try
@@ -1274,7 +1474,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		} else if (retry) cur.nextAt = Math.min(cur.nextAt, Date.now() + 2 * 60_000);
 		// A run started again on its own conversation (leave, steer) keeps that conversation: it can still be opened.
 		const session = run.sessionFile ?? (cur.lastRun?.fire === run.fire ? cur.lastRun?.session : undefined);
-		cur.lastRun = { attemptId: run.attemptId, acceptance: uncertain ? "unknown" : "not_accepted", fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid, ...(session ? { session } : {}) };
+		cur.lastRun = { attemptId: run.attemptId, acceptance: uncertain ? "unknown" : "not_accepted", fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid, ...(session ? { session } : {}), ...modelOf(cur, run) };
 		save(); refreshStatus();
 		notify(`loop ${id}: its background run couldn't start (${why}); ${uncertain ? "acceptance is unknown; the loop is paused pending reconciliation, not retried" : gate && !retry ? "startup retries exhausted; its wake is kept and the loop is paused" : gate || retry ? "it is tried again soon" : "it runs again at its next time"}`, "warning");
 	}
@@ -1313,7 +1513,22 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const status = run.cancelled ? "cancelled" : failure ? "failed" : "done";
 		const findings = status === "failed" || !!run.needsYou || (rep ? rep.findings : true);
 		const summary = (failure ?? rep?.summary) ?? text?.split("\n").find(x => x.trim())?.trim() ?? "(no answer)";
-		live(cur => cur.recordRun(id, run, { status, summary, findings, rep }));
+		let unavailable: Unavailable | undefined;
+		const chain = shared.launches?.get(run)?.chain ?? [];
+		// Only a run that did nothing, of a loop that can fall back, and only for want of its model: Pi gave up
+		// retrying a transient error, or the check command (asked afresh) lists the model. A quota error Pi
+		// doesn't retry is only known through a check.
+		if (status === "failed" && !crashed && run.failedBeforeWork && chain.length > 1 && run.model) {
+			if (run.gaveUpRetrying) unavailable = "gave_up_retrying";
+			else {
+				const check = await checkNow(id, chain, true), a = shared.launches?.get(run);
+				// The fresh answer also chooses the next model.
+				if (check && a) a.check = { unavailable: [...check.unavailable], available: [...check.available] };
+				if (check?.unavailable.has(run.model)) unavailable = "check_unavailable";
+			}
+		}
+		if (run.handedOver) return;
+		live(cur => cur.recordRun(id, run, { status, summary, findings, rep, unavailable }));
 	}
 
 	/** Record a finished run once: its record, what it reported, again, and a note only if it found something. */
@@ -1325,8 +1540,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const l = candidate && sameRun(candidate, run) ? candidate : undefined;
 		const ask = o.rep?.ask?.trim() || undefined;
 		traceRun(run, "terminal", { status: o.status, session: run.sessionFile, findings: o.findings, hasAsk: !!ask, needsPermission: !!run.needsYou, error: o.status === "failed" });
+		// A model that served a run is available. One that couldn't, for want of it, is held back and the fire
+		// goes on on the next model; that attempt leaves no record of its own (the next run's passedOver has it).
+		if (l && run.model && o.status === "done") releaseModel(l, run.model);
+		if (l && o.unavailable && fallBack(l, run, o.unavailable)) return;
 		const rec: RunRecord = { attemptId: run.attemptId, acceptance: run.promptAccepted ? "accepted" : "unknown", fire: run.fire, mode: run.mode, status: o.status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
-			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), ...(ask ? { ask } : {}), unread: false };
+			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), ...(ask ? { ask } : {}), unread: false, ...(l ? modelOf(l, run) : {}) };
 		if (l) {
 			l.lastRun = rec;
 			if (o.status === "done" && o.rep && (!run.origin || (l.rev ?? 0) === run.origin.revision)) applyReport(l, o.rep);
@@ -1602,7 +1821,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const live = shared.runs.get(l.id);
 			const r = l.lastRun;
 			const state = live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
-			const detail = [desc(l), background(l) ? `background ${l.run}` : "in conversation (foreground)", l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
+			const detail = [desc(l), background(l) ? `background ${l.run}` : "in conversation (foreground)", modelText(l), l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
 				r && !live ? `last #${r.fire} ${r.status}${r.result ? `: ${r.result.split("\n")[0]}` : ""}${r.needsYou ? ` · needs you` : ""}` : ""].filter(Boolean).join(" · ");
 			const dot = loopDot(l, Date.now());
 			const why = sayDot(l, dot);
@@ -1817,8 +2036,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 		}
 		const run = executionMode(d.run);
-		if (d.model !== undefined && (typeof d.model !== "string" || !/^[^\s/]+\/[^\s]+$/.test(d.model))) throw new Error("model must look like provider/id or provider/id:thinking");
-		if (d.model && run === "foreground") throw new Error("model applies to a background loop (run: fork, thread or fresh); a loop in this conversation uses its model");
+		const model = backgroundModel(d.model, run);
 		const tz = d.timezone ? validZone(d.timezone) : undefined;
 		if (d.timezone && !tz) throw new Error(`unknown time zone "${d.timezone}"`);
 		if (tz && !zoned(schedule)) throw new Error("a time zone applies only to at loops and whole-day intervals");
@@ -1835,7 +2053,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (typeof ends === "string") throw new Error(ends);
 		return { id: d.id, prompt: d.prompt.trim(), schedule, ...(tz ? { tz } : {}), ...(gate ? { gate } : {}),
 			...(d.priority ? { priority: d.priority } : {}), ...(dir ? { dir } : {}), ...(context ? { context } : {}),
-			run, ...(d.model ? { model: d.model } : {}), ...(ends ? { expiresAt: ends } : {}) };
+			run, ...(model ? { model } : {}), ...(ends ? { expiresAt: ends } : {}) };
+	}
+
+	/** A loop's `model` (one, or a list to fall back through), which only a background loop can have. Throws with what is wrong. */
+	function backgroundModel(v: unknown, run: LoopMode): ModelSpec | undefined {
+		const model = parseModels(v);
+		if (model && run === "foreground") throw new Error("model applies to a background loop (run: fork, thread or fresh); a loop in this conversation uses its model");
+		return model;
 	}
 
 	function contextFiles(v: unknown): string[] | undefined {
@@ -1866,6 +2091,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			phase = undefined;
 		}
 		syncDeclared();
+		refreshModelSettings();
 		expire(now);
 		for (const id of waited.keys()) if (!loops.some(l => l.id === id && !l.paused)) waited.delete(id);
 		for (const id of slotWait) if (!loops.some(l => l.id === id && !l.paused)) slotWait.delete(id);
@@ -1960,6 +2186,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		file = path.join(c.cwd, ".pi", "loops.json");
 		lock = path.join(c.cwd, ".pi", "loops.lock");
 		gateLog = path.join(c.cwd, ".pi", "loops.log.jsonl");
+		holdsFile = path.join(c.cwd, ".pi", "loop-models.json");
+		refreshModelSettings();
+		holds = loadHolds();
 		gating.clear();
 		zone = configuredZone(c.cwd);
 		if (zone.warning) notify(zone.warning, "warning");
@@ -2156,16 +2385,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 					}
 				}
 			}
-			// --fork / --thread / --fresh / --foreground and --for <duration> / --until <time>, among the schedule
+			// --fork / --thread / --fresh / --foreground, --model <provider/id[,provider/id]> and --for <duration> / --until <time>, among the schedule
 			// words before the prompt; from the prompt's first word on, everything is the prompt.
 			const words = trimmed.split(/\s+/);
-			let run: LoopMode = "fork"; const life: { for?: string; until?: string } = {};
+			let run: LoopMode = "fork", models: string[] | undefined; const life: { for?: string; until?: string } = {};
 			const kept: string[] = [];
 			let i = 0;
 			for (; i < words.length; i++) {
 				const w = words[i];
 				if (/^--(fork|thread|fresh|foreground)$/.test(w)) { run = w.slice(2) as LoopMode; continue; }
 				if ((w === "--for" || w === "--until") && words[i + 1]) { life[w.slice(2) as "for" | "until"] = words[++i]; continue; }
+				if (w === "--model" && words[i + 1]) { models = words[++i].split(",").filter(Boolean); continue; }
 				const first = !kept.length;
 				if (first && (parseInterval(w) !== undefined || w.toLowerCase() === "auto")) { kept.push(w); continue; }
 				if (first && w.toLowerCase() === "at" && words[i + 1]) {
@@ -2180,7 +2410,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if ("error" in parsed) { notify(parsed.error, "warning"); return; }
 			const ends = parseLifetime(life, Date.now());
 			if (typeof ends === "string") { notify(ends, "warning"); return; }
-			const r = add(parsed.schedule, parsed.prompt, undefined, parsed.tz, undefined, { run, expiresAt: ends });
+			let model: ModelSpec | undefined;
+			try { model = backgroundModel(models, run); } catch (e) { notify((e as Error).message, "warning"); return; }
+			const r = add(parsed.schedule, parsed.prompt, undefined, parsed.tz, undefined, { run, model, expiresAt: ends });
 			if (typeof r === "string") { notify(r, "warning"); return; }
 			notify(`loop ${r.id}: ${desc(r)}${background(r) ? `, in the background (${r.run})` : ", in this conversation (foreground)"}, next ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}. /loop rm ${r.id} to stop.`);
 		},
@@ -2219,7 +2451,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			"`every` is a fixed interval (default 10m) or auto; `at` is a daily HH:MM wall-clock " +
 			"time that follows daylight saving in the loop's zone. A gate is a script in the project that runs when the loop is due and " +
 			"prints JSON deciding skip, wake or defer, so a frequent check wakes the model only when needed. An explicit foreground loop waits while the " +
-			"session is busy and fires once when it is free (highest priority first), never stacking. Background loops run beside the conversation. A loop can have its own folder " +
+			"session is busy and fires once when it is free (highest priority first), never stacking. Background loops run beside the conversation; their model can be a list " +
+			"(first choice first): a run that did nothing because a model couldn't serve it moves on to the next, and loops return to the first once it is back. A loop can have its own folder " +
 			"(dir) holding its gate, prompt template and context files. Loops can also be declared in .pi/loop.json files (see the " +
 			"pi-loop skill). Loops persist across restarts and fire only while a Pi session is open in this project.",
 		promptSnippet: "Schedule recurring prompts in this session (/loop): create, list, delete, pause, resume, run, gate, test, dismiss",
@@ -2247,6 +2480,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			dir: Type.Optional(Type.String({ description: "create: the loop's own folder inside the project (e.g. services/api). Its gate, prompt template (/name from <dir>/.pi/prompts) and state are found there." })),
 			context: Type.Optional(Type.Array(Type.String(), { description: "create: files in the loop's folder attached to each of its turns, e.g. [\"AGENTS.md\"]." })),
 			run: Type.Optional(Type.String({ description: "create: where each turn runs. Default fork: a background copy of this conversation as it is then. Other background modes: thread (the loop's own continued conversation) or fresh (a new conversation each run). Set foreground explicitly to run in this conversation. Background runs report through loop_report and stay quiet unless they find something." })),
+			model: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "create, background only: the model its runs use, provider/id or provider/id:thinking; default this session's. A list (first choice first) moves a run that did nothing on to the next model when one can't serve it (Pi gave up retrying a transient error, no credentials, or the folder's model check says so), and returns to the first once it is back; other failures are reported as before." })),
 			for: Type.Optional(Type.String({ description: "create: how long the loop lives, e.g. 2h, 3d (default 7d; loops that must last belong in .pi/loop.json)." })),
 			until: Type.Optional(Type.String({ description: "create: when the loop ends, an ISO time with offset. Use either for or until." })),
 		}),
@@ -2289,18 +2523,19 @@ export default function loopExtension(pi: ExtensionAPI) {
 							}
 						}
 						const run = executionMode(p.run);
+						const model = backgroundModel(p.model, run);
 						const ends = parseLifetime({ for: p.for, until: p.until }, Date.now());
 						if (typeof ends === "string") throw new Error(ends);
 						const dir = insideDir(ctx!.cwd, p.dir?.trim());
 						if (p.priority !== undefined && !Number.isFinite(p.priority)) throw new Error("priority must be a number");
-						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p, dir) : undefined, { priority: p.priority, dir, context: contextFiles(p.context), run, expiresAt: ends });
+						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p, dir) : undefined, { priority: p.priority, dir, context: contextFiles(p.context), run, model, expiresAt: ends });
 						if (typeof r === "string") throw new Error(r);
 						const hints: string[] = [];
 						const twins = loops.filter(l => l !== r && l.prompt === r.prompt);
 						if (twins.length) hints.push(`loop ${twins.map(l => l.id).join(", ")} already sends this prompt; delete one unless both are intended`);
 						if (!r.gate && r.schedule.kind === "every" && r.schedule.ms < 3_600_000) hints.push("no gate: every fire is a full model turn; for a frequent check, add one with action gate (see the pi-loop skill)");
 						if (!r.prompt.startsWith("/")) hints.push("tip: a prompt template (.pi/prompts/<name>.md, prompt /<name>) keeps the instructions editable between fires");
-						return `created loop ${r.id}: ${desc(r)}${background(r) ? `, runs in the background (${r.run})` : ", runs in this conversation (foreground)"}, next fire ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}, catch-up ${r.catchUp}${r.gate ? `; ${gateText(r)}` : ""}${hints.map(h => `\n- ${h}`).join("")}`;
+						return `created loop ${r.id}: ${desc(r)}${background(r) ? `, runs in the background (${r.run})` : ", runs in this conversation (foreground)"}${r.model ? ` on ${modelList(r.model).join(", falling back to ")}` : ""}, next fire ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}, catch-up ${r.catchUp}${r.gate ? `; ${gateText(r)}` : ""}${hints.map(h => `\n- ${h}`).join("")}`;
 					}
 				}
 			})();

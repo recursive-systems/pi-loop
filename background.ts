@@ -64,6 +64,12 @@ export interface RunRecord {
 	judgedBy?: string;
 	/** The owner dismissed what this run surfaced. */
 	dismissed?: boolean;
+	/** The model it ran on (provider/id), as Pi reported it once it answered. */
+	model?: string;
+	/** Its model isn't the loop's first choice: that one was held back, or failed this fire. */
+	fallback?: true;
+	/** Earlier attempts of this fire that moved on to another model: which model, why, and their session if they had one. */
+	passedOver?: { model: string; why: string; session?: string }[];
 }
 
 /** Pi's folder name for a cwd's sessions, with a suffix: --home-u-project-loop-check-- */
@@ -166,6 +172,29 @@ export class Run {
 	private extensionFailed = false;
 	private modelFailure?: "model_error" | "model_aborted";
 	get executionError() { return this.extensionFailed ? "extension_error" : this.modelFailure; }
+	/** How Pi took the prompt: "started" a run of its own, or "handled" by an extension command (which may act by itself). */
+	private disposition?: string;
+	/** Anything that may have had an effect: assistant output, a tool call, the owner's words. */
+	private didWork = false;
+	/** The model Pi last answered with (provider/id). */
+	reportedModel?: string;
+	/**
+	 * Its last answer was a model error that Pi judged transient (overloaded, rate limited, a server or
+	 * connection error; never a context overflow or a bad request), retried, and gave up on. Pi says it gave
+	 * up (auto_retry_end, success false) after any run that retried at all, whatever the last error was, so
+	 * that error must also be one Pi retried: Pi's verdict depends only on the error (for one model), and it
+	 * named each error it retried (auto_retry_start). Kept only in memory, never recorded.
+	 */
+	gaveUpRetrying = false;
+	private retriedErrors = new Set<string>();
+	private lastError?: string;
+	/**
+	 * It failed on its model before doing anything: Pi started its prompt, every answer was a model error
+	 * with no content, and no tool ran. Running the same prompt again on another model repeats nothing.
+	 */
+	get failedBeforeWork(): boolean {
+		return this.modelFailure === "model_error" && !this.extensionFailed && !this.didWork && this.disposition === "started";
+	}
 	proc?: ChildProcessWithoutNullStreams;
 	sessionFile?: string;
 	lines: string[] = [];
@@ -201,6 +230,34 @@ export class Run {
 		readonly mode: RunMode,
 		private readonly opts: { cwd: string; sessionArgs: string[]; extra?: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv; attemptId?: string },
 	) { this.attemptId = opts.attemptId ?? randomUUID(); }
+
+	/** The model it asks Pi for (provider/id); absent = Pi's default. */
+	get model() { return this.opts.model; }
+	/** Change the model before it starts (a check found the planned one unavailable). */
+	useModel(model: string, thinking?: string) {
+		if (this.proc) throw new Error("the run has started");
+		this.opts.model = model;
+		this.opts.thinking = thinking;
+	}
+
+	/**
+	 * Pi lists a model of its provider among its available ones. Asked before the prompt, since Pi refuses a
+	 * prompt without credentials, and a refused prompt can't be told from one that ran. Pi fills that list in
+	 * the background (and checks credentials again itself at the prompt), so a missing provider is asked about
+	 * once more after a moment; "no" is then only a reason to try another model, not proof.
+	 */
+	async listsCredentials(): Promise<boolean> {
+		const model = this.opts.model ?? "", slash = model.indexOf("/");
+		if (slash <= 0) return true;
+		const provider = model.slice(0, slash);
+		for (let ask = 0; ask < 2; ask++) {
+			if (ask) await new Promise(r => setTimeout(r, 2_000));
+			const r = await this.send({ type: "get_available_models" });
+			if (!r?.success || !Array.isArray(r.data?.models)) return true; // can't tell: Pi decides
+			if (r.data.models.some((m: any) => m?.provider === provider)) return true;
+		}
+		return false;
+	}
 
 	private compactionTime(now: number) {
 		return this.compactedMs + (this.compactionStartedAt === undefined ? 0 : now - this.compactionStartedAt);
@@ -292,9 +349,19 @@ export class Run {
 			return;
 		}
 		if (msg.type === "message_end" && msg.message?.role === "assistant") {
-			const stop = msg.message.stopReason;
+			const m = msg.message, stop = m.stopReason;
 			// An automatic model retry may recover: only the latest assistant outcome is final.
 			this.modelFailure = stop === "error" ? "model_error" : stop === "aborted" ? "model_aborted" : undefined;
+			if (typeof m.provider === "string" && typeof m.model === "string") this.reportedModel = `${m.provider}/${m.model}`;
+			this.gaveUpRetrying = false; // a later answer: Pi's verdict on the earlier one no longer applies
+			this.lastError = stop === "error" ? m.errorMessage || "Unknown error" : undefined;
+			if ((m.content ?? []).some((c: any) => c?.type === "toolCall" || (c?.type === "text" && c.text?.trim()) || (c?.type === "thinking" && c.thinking?.trim()))) this.didWork = true;
+		}
+		if (msg.type === "tool_execution_start") this.didWork = true;
+		if (msg.type === "auto_retry_start") { this.retriedErrors.add(String(msg.errorMessage)); return; }
+		if (msg.type === "auto_retry_end") {
+			this.gaveUpRetrying = msg.success === false && this.modelFailure === "model_error" && this.lastError !== undefined && this.retriedErrors.has(this.lastError);
+			return;
 		}
 		if (msg.type === "agent_start") { this.starts++; this.working = true; this.changed(); return; }
 		if (msg.type === "agent_settled") { this.settle(); return; }
@@ -352,6 +419,7 @@ export class Run {
 			throw new Error(r?.error ?? "the run's Pi refused the prompt");
 		}
 		this.promptAccepted = true;
+		this.disposition = r.data?.disposition;
 		this.push([`› ${text.split("\n")[0].slice(0, 200)}`]);
 		// An extension command is handled without a turn: there will be no agent_settled, unless the command
 		// started one itself (before or shortly after its answer).
@@ -375,6 +443,7 @@ export class Run {
 	async steer(text: string): Promise<string | undefined> {
 		const steering = this.working;
 		const before = this.starts;
+		this.didWork = true; // the owner's words are work of their own
 		if (!steering) this.working = true;
 		// While it is working (or a handled command may still start a turn), a prompt that steers: steered into a
 		// running turn, or a turn of its own if none is running (a bare steer would wait in the queue for a turn

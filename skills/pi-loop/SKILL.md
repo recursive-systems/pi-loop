@@ -107,7 +107,13 @@ One session can carry several responsibilities, each a loop:
   steers and steps into background runs from `/loop`.
 - **A background run works in its loop's own folder**, so that folder's `.pi/mcp.json`, settings,
   prompts, data class and AGENTS.md apply (no need for `context` then); a `fork` copies your
-  conversation but acts from there too. `"model": "provider/id:thinking"` gives it its own model.
+  conversation but acts from there too. `"model": "provider/id:thinking"` gives it its own model; a
+  list (`["provider-a/big:high", "provider-b/other"]`, first choice first) moves a run that did nothing
+  on to the next model when the first can't serve it (Pi gave up retrying a transient error, no
+  credentials, or the folder's `loop.modelCheck` says so) and returns to the first once it is back.
+  Other failures are reported as before. A quota error Pi doesn't retry is only caught through
+  `loop.modelCheck`. `loop.fallbackModels` in settings adds fallbacks to background loops that name
+  no model; a loop that names one keeps exactly that.
   Stepping into a run from another folder isn't possible from here (Pi would move your session
   there): watch and steer it instead.
 - **One agent for several folders:** `loop.folders` in the project's settings adopts sibling folders

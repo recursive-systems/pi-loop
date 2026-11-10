@@ -6,7 +6,8 @@ no mode migrate to forks on load. Optional gates decide whether a due loop wakes
 
 - `index.ts` holds the extension: commands, the tool, the tick and persistence. `lock.ts` is the
   one-owner-per-folder lock (an OS lock held by a small Perl helper; hosts use it too). `schedule.ts`
-  holds intervals, daily times and DST. `gate.ts` runs gates. `prompt.ts` builds a fire's
+  holds intervals, daily times and DST. `gate.ts` runs gates. `models.ts` holds model fallback
+  (lists, held-back models, the optional check command). `prompt.ts` builds a fire's
   message. `background.ts` runs a loop's turn in a child Pi over RPC (fork, thread or fresh) and
   `view.ts` is the loops view. `liveness.ts` is explicitly loaded in each RPC child: it implements the
   optional session-liveness v1 host contract and sends only busy/idle/error, so a settled turn with
@@ -37,7 +38,10 @@ no mode migrate to forks on load. Optional gates decide whether a due loop wakes
   with `mode: "host"`, its own `isIdle`/`hasPendingMessages`, and runs the turns it is sent through
   `sendUserMessage`, whose options carry `loop: { id, fire, rev }` (Pi ignores it). Intent is saved
   before dispatch, but the counter is committed only after `sendUserMessage` returns. An ambiguous
-  exception/crash before that commit now pauses rather than automatically repeating it. If explicitly
+  exception/crash before that commit now pauses rather than automatically repeating it. A fire moves
+  on to a fallback model only when the failed attempt provably did nothing (`Run.failedBeforeWork`, or
+  a child that never got the prompt) and failed for want of its model (`Unavailable` in `index.ts`);
+  keep both strict. Other failures must stay visible as failures. If explicitly
   retried after reconciliation, a host must treat the same id/fire as the same occurrence. Preserve
   that contract, folder locks, kept wakes and draining gates at shutdown.
 - The `[loop <id> · … ]` header line is a public contract. Change it only in a major version. So are

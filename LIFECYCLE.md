@@ -53,7 +53,10 @@ The example omits the common envelope fields. Optional fields depend on the even
 | `foreground_running` | Matching loop message entered the foreground transcript |
 
 `by` is `schedule | gate | heartbeat | manual | resume | leave`. A proposed fire can be reused
-after a definite startup refusal, so **fire number alone is not an attempt identity**. A manual
+after a definite startup refusal, so **fire number alone is not an attempt identity**. A loop with
+fallback models also reuses it after an accepted attempt that provably did nothing (every answer a
+model error with no content, no tool run) because its model was unavailable: that attempt's
+`terminal` is `failed`, then a new `attempt` follows for the same fire on the next model. A manual
 resume/leave gets a new attempt id even on the same conversation/fire. Old records without
 attempt ids remain explicitly older/untracked evidence, never reconstructed as new attempts.
 Gate events preserve the evaluated definition even if it changed meanwhile. `LOOP_TEST`/manual

@@ -44,6 +44,7 @@ Add `-l` to install it for one project only.
 /loop [5m|2h|1d|auto] <prompt>        repeat every interval (default 10m), or when each run says
 /loop at 07:30 [Area/City] <prompt>   daily, in that zone or your default
       --fork | --thread | --fresh     background mode (default: fork)
+      --model a/x[,b/y]              its model, then fallbacks (default: yours)
       --foreground                   run in this conversation instead
       --for 2d | --until <time>       how long it lives (default 7 days)
 /loop                         the loops view: every loop, its runs, watch and steer them
@@ -122,6 +123,39 @@ loop's folder too. You can't step into a run that works in another folder (Pi wo
 there); watch and steer it instead. Trust each folder a run works in (a background run can't answer Pi's
 trust question), and keep the machine's own pi-loop at 0.5 or later: an older one would run the folder's
 loops itself, so such a run doesn't start.
+
+**Fallback models.** Give `model` a list, first choice first, and a fire moves on to the next model
+when one can't serve it:
+
+```json
+{"id": "triage", "prompt": "/triage", "at": "09:00", "run": "fresh", "model": ["provider-a/big:high", "provider-b/other"]}
+```
+
+A fire moves on only when its run did nothing (Pi started the prompt, every answer was a model error
+with nothing in it, no tool ran) and the failure was about the model's availability: Pi judged the
+error transient (overloaded, rate limited, a server or connection error), retried, and gave up; or
+your check command lists the model. It also moves on, before sending anything, when the run's Pi
+didn't start or lists no credentials for the provider. Any other failure, such as a context overflow
+or a bad request, is recorded as failed as always. A quota error that Pi doesn't retry is only caught
+through a check command.
+
+A model that failed that way is held back for the folder's loops for 30 minutes (`loop.modelBackoff`),
+doubling while it keeps failing (up to 8 times that), then tried first again: loops return to their
+first choice on their own. The loops view, `/loop` and each run's record show its model, mark a
+fallback and say why. `loop.fallbackModels` (a list) gives every background loop that names no model
+fallbacks after yours, so a whole folder (or, in the agent's settings, a machine) can opt in at once;
+a loop that names a model keeps exactly what it names, and `false` or `[]` in a project's settings
+opts it out of the agent's list.
+
+For a quota meter of your own, set `loop.modelCheck` to the path of an executable (no arguments in the
+setting). It is called with the models as arguments and prints
+`{"unavailable": ["provider/id"], "available": ["provider/id"]}`. A listed-unavailable model is skipped;
+a listed-available one is tried even while held back; a model in neither list is one it doesn't track,
+and its hold decides.
+
+Before going back to a release without fallback, change model lists back to single strings: older
+releases refuse a list declared in `.pi/loop.json`, and pass one saved by `loop_manage` to Pi as a
+single comma-joined value, which fails.
 
 Each run ends with `loop_report`: whether it found something, one line, and optionally when to run
 next or to stop. Only reports that need you enter the conversation; other results stay in the loops
@@ -217,7 +251,8 @@ what Pi already keeps, plus three things only pi-loop knows:
   `by` is `schedule`, `gate`, `heartbeat` (its `maxSleep`) or `manual`. Background runs are named
   `loop <id> #<fire>` in `/resume`.
 - **`.pi/loops.log.jsonl`** has every gate decision, and a `fired` line for each run that started,
-  with the run's session file.
+  with the run's session file and model; `fallback`, `model-unavailable` and `model-available` lines
+  say when a run moved on to another model and why. Held-back models are in `.pi/loop-models.json`.
 - **At a heartbeat** the model wakes without asking the gate. pi-loop asks the gate anyway, as a test,
   and logs its answer as a `shadow` line. A `skip` there followed by a run that found something is a
   miss the gate made.
