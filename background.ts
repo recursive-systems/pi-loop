@@ -38,6 +38,18 @@ export interface Report { findings: boolean; summary?: string; next?: string; st
 /** Whether a run's report interrupts the owner: only "needs_you" lights the status line and posts in the conversation. */
 export type Surface = "needs_you" | "worth_knowing" | "routine";
 
+/**
+ * A successful report interrupts only with its own ask. A classifier choice, a missing choice,
+ * or the report text never becomes that ask. Callers pass native permission text or an explicit
+ * report ask separately; they must not pass a summary sentence.
+ */
+export function groundAttention(choice: string | undefined, ask?: string): { surface: Surface; ask?: string } {
+	const grounded = ask?.trim() || undefined;
+	if (choice === "needs_you") return grounded ? { surface: "needs_you", ask: grounded } : { surface: "worth_knowing" };
+	if (choice === "worth_knowing" || choice === "routine") return { surface: choice, ...(choice === "worth_knowing" && grounded ? { ask: grounded } : {}) };
+	return grounded ? { surface: "needs_you", ask: grounded } : { surface: "worth_knowing" };
+}
+
 /** A run as remembered in .pi/loops.json (the live process is not). */
 export interface RunRecord {
 	/** A new id for every startup/resume attempt, even when the fire number is reused. */

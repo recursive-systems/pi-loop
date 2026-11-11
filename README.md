@@ -64,7 +64,9 @@ front of you before, and decides:
 - **worth knowing**: shown, muted, in the loops view only.
 - **routine**: recorded, nothing more.
 
-A failed run, or one that asked you something, always needs you. To dismiss what a loop surfaced,
+A failed run, or one that asked you something, always needs you. A successful report does not:
+the classifier cannot turn its text into an ask. Without the run's own `ask`, it is worth knowing
+at most. To dismiss what a loop surfaced,
 press `d` in the loops view, run `/loop dismiss <id>`, or tell the agent it's handled (it calls
 `loop_manage` `dismiss`); the judge then treats a repeat of it as routine. Set the judge in settings
 with `{"loop": {"judge": "<provider>/<id>"}}`, or `"off"`; without one, a run's own `ask` decides.

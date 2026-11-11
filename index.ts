@@ -41,7 +41,7 @@ import {
 	type Schedule,
 } from "./schedule.ts";
 import { fileURLToPath } from "node:url";
-import { Run, RUN_MODES, extensionFlags, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord, type Surface } from "./background.ts";
+import { Run, RUN_MODES, extensionFlags, groundAttention, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord, type Surface } from "./background.ts";
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
@@ -1568,7 +1568,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** Ask the classifier whether this report should interrupt the owner; the run's own ask decides without one. */
 	async function judge(l: Loop | undefined, summary: string, ask: string | undefined): Promise<Verdict> {
-		const fallback: Verdict = { surface: ask ? "needs_you" : "worth_knowing", ...(ask ? { ask } : {}), by: "fallback" };
+		const fb = groundAttention(undefined, ask);
+		const fallback: Verdict = { surface: fb.surface, ...(fb.ask ? { ask: fb.ask } : {}), by: "fallback" };
 		const choice = configuredJudge(ctx?.cwd ?? process.cwd()) ?? "typesafe/jev-latest";
 		if (choice === "off" || !l) return fallback;
 		const slash = choice.indexOf("/");
@@ -1586,7 +1587,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			});
 			const c = r?.stopReason === "stop" ? r.answers?.surface?.choice : undefined;
 			if (c !== "needs_you" && c !== "worth_knowing" && c !== "routine") return fallback;
-			return { surface: c, ...(ask ? { ask } : {}), by: choice };
+			const grounded = groundAttention(c, ask);
+			return { surface: grounded.surface, ...(grounded.ask ? { ask: grounded.ask } : {}), by: choice };
 		} catch { return fallback; }
 	}
 
@@ -1600,7 +1602,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (v.surface === "routine") { save(); refreshStatus(); return; }
 		rec.unread = true;
 		if (v.surface === "needs_you") {
-			rec.ask = v.ask || rec.ask || firstSentence(rec.result ?? id);
+			// Native permission text and an explicit report ask are evidence. A summary sentence is not.
+			const grounded = groundAttention("needs_you", v.ask || rec.ask || rec.needsYou);
+			if (grounded.surface !== "needs_you" || !grounded.ask) {
+				rec.surface = "worth_knowing";
+				rec.unread = true;
+				save(); refreshStatus();
+				return;
+			}
+			rec.ask = grounded.ask;
 			l.surfaced = [...(l.surfaced ?? []), { at: Date.now(), ask: rec.ask }].slice(-10);
 			deliver({ content: `[loop ${id} · background ${rec.mode} · run #${fire} · ${rec.status}] needs you: ${rec.ask}\n${rec.result ?? ""}${rec.session ? `\n(/loop open ${id} to go into it)` : ""}`,
 				details: { id, fire, mode: rec.mode, status: rec.status, session: rec.session } });
