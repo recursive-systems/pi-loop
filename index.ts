@@ -2064,7 +2064,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const dot = loopDot(l, Date.now());
 			const why = sayDot(l, dot);
 			// Worth knowing, not yet seen: a muted line in the view only (never the status line).
-			const news = dot !== "needs" && r?.unread && !r.dismissed && r.result ? `new: ${firstSentence(r.result)}`
+			const news = dot !== "needs" && r?.unread && !r.dismissed && r.result ? `new: ${firstSentence(r.result)}${r.judgedBy?.includes("not deep-judged") ? " (not deep-judged)" : ""}`
 				: l.held?.length ? `held: ${l.held[l.held.length - 1]!.reason}${l.held.length > 1 ? ` (+${l.held.length - 1})` : ""}` : "";
 			return { id: l.id, state, detail, running: !!live, hasRun: !!r?.session, unread: !!r?.unread, paused: l.paused, dot, ...(why ? { why } : {}), ...(news ? { news } : {}) };
 		});
