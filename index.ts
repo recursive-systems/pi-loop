@@ -361,6 +361,69 @@ export function configuredJudge(cwd: string): string | undefined {
 	return undefined;
 }
 
+/** How long a deep judge may take by default. */
+const DEFAULT_DEEP_JUDGE_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * loop.deepJudge in the project's or agent's settings.json (the project's first): "off" (or false, or { off: true }),
+ * or { model: "provider/id[:thinking]" (default: this session's), prompt: a template file (relative to the project for
+ * its settings, the agent dir for the agent's; "{{item}}" marks where the item goes, else it is appended), timeout: "10m" }.
+ */
+export function configuredDeepJudge(cwd: string): { off: boolean; model?: string; prompt?: string; timeoutMs: number } {
+	for (const [file, base] of [[path.join(cwd, ".pi", "settings.json"), cwd], [path.join(agentDir(), "settings.json"), agentDir()]]) {
+		let raw: unknown;
+		try { raw = (JSON.parse(fs.readFileSync(file, "utf8")) as { loop?: { deepJudge?: unknown } }).loop?.deepJudge; } catch { continue; }
+		if (raw === undefined) continue;
+		if (raw === "off" || raw === false) return { off: true, timeoutMs: DEFAULT_DEEP_JUDGE_TIMEOUT_MS };
+		if (!raw || typeof raw !== "object") continue;
+		const o = raw as { off?: unknown; model?: unknown; prompt?: unknown; timeout?: unknown };
+		const ms = typeof o.timeout === "string" ? parseInterval(o.timeout.trim()) : undefined;
+		return {
+			off: o.off === true,
+			...(typeof o.model === "string" && o.model.trim() ? { model: o.model.trim() } : {}),
+			...(typeof o.prompt === "string" && o.prompt.trim() ? { prompt: path.resolve(base, o.prompt.trim()) } : {}),
+			timeoutMs: ms !== undefined && ms >= MIN_INTERVAL_MS ? ms : DEFAULT_DEEP_JUDGE_TIMEOUT_MS,
+		};
+	}
+	return { off: false, timeoutMs: DEFAULT_DEEP_JUDGE_TIMEOUT_MS };
+}
+
+/** What the deep judge is asked, unless loop.deepJudge.prompt names a template of the owner's. */
+const DEEP_JUDGE_PROMPT = "You are pi-loop's deep judge. A scheduled background job (a loop) produced the item below; you decide what happens " +
+	"to it before it may interrupt its owner. Research before deciding: the run's session, the owner's conversation (how they answered " +
+	"similar asks before), what was already put in front of them, other loops' open asks, and whatever else this setup gives you.\n\n" +
+	"Then call loop_verdict once:\n" +
+	"- surface: something new or changed that only the owner can act on (decide, approve, sign in, pay); rewrite the ask as one clear, short imperative.\n" +
+	"- return: the loop can handle it itself; give it the answer (the owner already answered this, or the fix is clear).\n" +
+	"- hold: worth the owner knowing, not worth interrupting them; it rides along with the next item that reaches them.\n" +
+	"- drop: nothing for anyone (a repeat, already handled, noise).\n\n" +
+	"If the fix is plain and within what the loop's job already allows, you may make it yourself, then return or drop saying so. " +
+	"Don't contact the owner or anyone else, and change nothing beyond the loop's authority.\n\n{{item}}";
+
+/** loop_verdict: how a deep judge ends. Writes its verdict to `file`. */
+function registerVerdictTool(pi: ExtensionAPI, file: string) {
+	pi.registerTool({
+		name: "loop_verdict",
+		label: "Loop verdict",
+		description: "End this deep judgement of a loop's item, once: surface it to the owner (with the ask rewritten clearly), return it to the loop (with the answer), hold it (rides along with the next item that reaches the owner) or drop it, and why in one line.",
+		promptSnippet: "End a deep judgement: surface, return, hold or drop, with a one-line reason",
+		parameters: Type.Object({
+			verdict: Type.Union([Type.Literal("surface"), Type.Literal("return"), Type.Literal("hold"), Type.Literal("drop")]),
+			reason: Type.String({ description: "One line: why." }),
+			ask: Type.Optional(Type.String({ description: "surface: the one thing the owner must do, a short imperative of a few words. Shown to them as is." })),
+			answer: Type.Optional(Type.String({ description: "return: what the loop is told, so it can carry on without the owner." })),
+		}),
+		async execute(_id, p) {
+			if (p.verdict === "surface" && !p.ask?.trim()) return { content: [{ type: "text", text: "surface needs ask: the one thing the owner must do." }], details: {} };
+			if (p.verdict === "return" && !p.answer?.trim()) return { content: [{ type: "text", text: "return needs answer: what the loop is told." }], details: {} };
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, JSON.stringify({ verdict: p.verdict, reason: String(p.reason).split("\n")[0]!.slice(0, 200),
+				...(p.verdict === "surface" ? { ask: p.ask!.trim().slice(0, 120) } : {}), ...(p.verdict === "return" ? { answer: p.answer!.trim().slice(0, 4000) } : {}) }));
+			return { content: [{ type: "text", text: "Recorded." }], details: {} };
+		},
+	});
+}
+
 /**
  * Model fallback settings in the project's or agent's settings.json (the project's first):
  *   loop.modelBackoff    how long a model that failed is held back before runs try it again (doubling while it keeps failing)
@@ -541,6 +604,11 @@ function insideDir(cwd: string, dir: string | undefined): string | undefined {
 export default function loopExtension(pi: ExtensionAPI) {
 	let ctx: ExtensionContext | undefined;
 	// A loop's background run: no loops of its own here (they belong to the session that started it), only loop_report.
+	if (process.env.PI_LOOP_CHILD === "1" && process.env.PI_LOOP_VERDICT) {
+		// A loop's deep judge: it ends with loop_verdict, not loop_report.
+		registerVerdictTool(pi, process.env.PI_LOOP_VERDICT);
+		return;
+	}
 	if (process.env.PI_LOOP_CHILD === "1") {
 		registerReportTool(pi, () => process.env.PI_LOOP_REPORT || undefined, process.env.PI_LOOP_ID || "this");
 		pi.on("session_start", (_e, c) => { ctx = c; markRun(pi, c); });
