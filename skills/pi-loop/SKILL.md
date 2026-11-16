@@ -134,8 +134,10 @@ result where it says, and keep "nothing to do" turns to one line. End with `loop
 true only if there is something the owner should see (a background run with no findings stays
 quiet), a one-line summary, `ask` only when the owner must do something only they can (the one
 thing, a few words: "Reconnect Stripe in Executor"; it is shown to them as is), and `next` or `stop`
-when the timing should change. A classifier decides from the report and what the owner was already
-told whether it interrupts them; anything else waits in the loops view. When the owner says what a
+when the timing should change. A classifier, then a deep judge (a background Pi that looks
+at the owner's past answers and other loops' asks), decide whether it interrupts the owner; the deep
+judge may instead hold it, drop it, or return an answer to the loop. A message or prompt section
+saying your last report was answered without the owner is that answer: act on it. When the owner says what a
 loop surfaced is handled, clear it with `loop_manage` `dismiss` (never on your own judgment). To stop
 or change the loop, use `loop_manage` (`pause`, `delete`, `gate`), or edit its `.pi/loop.json` if it
 is declared there. Don't just ignore the loop.

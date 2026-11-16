@@ -80,6 +80,10 @@ interface Shared {
 	leaving?: Away;
 	/** Findings that came in while you were away, delivered when you are back. */
 	notes: Note[];
+	/** Loops whose deep judge is running (one at a time), with the item queued behind it (later ones coalesce). */
+	judging?: Map<string, { item: JudgeItem; queued?: JudgeItem; run?: Run }>;
+	/** A deep judge failed once already this process: said once. */
+	deepJudgeWarned?: true;
 	/** The live extension instance: finished runs report to it, whichever instance started them. */
 	current?: Instance;
 	/** Local metadata writers, retained across session switches and reloads. */
@@ -96,6 +100,8 @@ interface Instance {
 	runStarted(id: string, run: Run, note?: string, meta?: RunMeta): void;
 	runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision): void;
 	judged(id: string, fire: number, verdict: Verdict, attemptId?: string, incarnation?: number): void;
+	judgeDeeply(id: string, item: JudgeItem): void;
+	deepJudged(id: string, item: JudgeItem, result: Verdict | string): void;
 }
 /**
  * Why a run of a loop with fallback models is taken to have done nothing for want of its model. Only these
@@ -126,8 +132,10 @@ interface Launch {
 	/** What the check command said when the fire started. */
 	check?: { unavailable: string[]; available: string[] };
 }
-/** The judge's decision about one run's report. */
-interface Verdict { surface: Surface; ask?: string; by: string }
+/** The judge's decision about one run's report; `answer` is what a "returned" one tells the loop. */
+interface Verdict { surface: Surface; ask?: string; by: string; answer?: string; /** Shown with what reaches the owner, e.g. "not deep-judged: timed out". */ note?: string }
+/** One run's item for the deep judge: a failure, a dialog it declined, or a report stage one let through. */
+interface JudgeItem { fire: number; attemptId?: string; incarnation: number; kind: "failure" | "dialog" | "report"; summary: string; ask?: string; stageOne?: Verdict; /** Earlier items coalesced into this one. */ earlier?: string[] }
 const shared: Shared = ((globalThis as any)[Symbol.for("pi-loop.shared")] ??= { runs: new Map(), again: new Set(), notes: [], pending: [] });
 shared.pending ??= [];
 /** Hand a run event to the live instance now, or to the next one. */
@@ -195,6 +203,10 @@ interface Loop {
 	startFailures?: number;
 	/** What was put in front of the owner lately (newest last), so the judge can tell a repeat from news. */
 	surfaced?: { at: number; ask: string; dismissed?: true }[];
+	/** Items the deep judge held (newest last, a few): they ride along with the next item that reaches the owner. */
+	held?: { fire: number; at: number; what: string; reason: string }[];
+	/** The deep judge's answer for a fork or fresh loop: added to its next fire's prompt. */
+	returned?: string;
 }
 
 function executionMode(value: unknown): LoopMode {
@@ -359,6 +371,69 @@ export function configuredJudge(cwd: string): string | undefined {
 		if (typeof raw === "string" && raw.trim()) return raw.trim();
 	}
 	return undefined;
+}
+
+/** How long a deep judge may take by default. */
+const DEFAULT_DEEP_JUDGE_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * loop.deepJudge in the project's or agent's settings.json (the project's first): "off" (or false, or { off: true }),
+ * or { model: "provider/id[:thinking]" (default: this session's), prompt: a template file (relative to the project for
+ * its settings, the agent dir for the agent's; "{{item}}" marks where the item goes, else it is appended), timeout: "10m" }.
+ */
+export function configuredDeepJudge(cwd: string): { off: boolean; model?: string; prompt?: string; timeoutMs: number } {
+	for (const [file, base] of [[path.join(cwd, ".pi", "settings.json"), cwd], [path.join(agentDir(), "settings.json"), agentDir()]]) {
+		let raw: unknown;
+		try { raw = (JSON.parse(fs.readFileSync(file, "utf8")) as { loop?: { deepJudge?: unknown } }).loop?.deepJudge; } catch { continue; }
+		if (raw === undefined) continue;
+		if (raw === "off" || raw === false) return { off: true, timeoutMs: DEFAULT_DEEP_JUDGE_TIMEOUT_MS };
+		if (!raw || typeof raw !== "object") continue;
+		const o = raw as { off?: unknown; model?: unknown; prompt?: unknown; timeout?: unknown };
+		const ms = typeof o.timeout === "string" ? parseInterval(o.timeout.trim()) : undefined;
+		return {
+			off: o.off === true,
+			...(typeof o.model === "string" && o.model.trim() ? { model: o.model.trim() } : {}),
+			...(typeof o.prompt === "string" && o.prompt.trim() ? { prompt: path.resolve(base, o.prompt.trim()) } : {}),
+			timeoutMs: ms !== undefined && ms >= MIN_INTERVAL_MS ? ms : DEFAULT_DEEP_JUDGE_TIMEOUT_MS,
+		};
+	}
+	return { off: false, timeoutMs: DEFAULT_DEEP_JUDGE_TIMEOUT_MS };
+}
+
+/** What the deep judge is asked, unless loop.deepJudge.prompt names a template of the owner's. */
+const DEEP_JUDGE_PROMPT = "You are pi-loop's deep judge. A scheduled background job (a loop) produced the item below; you decide what happens " +
+	"to it before it may interrupt its owner. Research before deciding: the run's session, the owner's conversation (how they answered " +
+	"similar asks before), what was already put in front of them, other loops' open asks, and whatever else this setup gives you.\n\n" +
+	"Then call loop_verdict once:\n" +
+	"- surface: something new or changed that only the owner can act on (decide, approve, sign in, pay); rewrite the ask as one clear, short imperative.\n" +
+	"- return: the loop can handle it itself; give it the answer (the owner already answered this, or the fix is clear).\n" +
+	"- hold: worth the owner knowing, not worth interrupting them; it rides along with the next item that reaches them.\n" +
+	"- drop: nothing for anyone (a repeat, already handled, noise).\n\n" +
+	"If the fix is plain and within what the loop's job already allows, you may make it yourself, then return or drop saying so. " +
+	"Don't contact the owner or anyone else, and change nothing beyond the loop's authority.\n\n{{item}}";
+
+/** loop_verdict: how a deep judge ends. Writes its verdict to `file`. */
+function registerVerdictTool(pi: ExtensionAPI, file: string) {
+	pi.registerTool({
+		name: "loop_verdict",
+		label: "Loop verdict",
+		description: "End this deep judgement of a loop's item, once: surface it to the owner (with the ask rewritten clearly), return it to the loop (with the answer), hold it (rides along with the next item that reaches the owner) or drop it, and why in one line.",
+		promptSnippet: "End a deep judgement: surface, return, hold or drop, with a one-line reason",
+		parameters: Type.Object({
+			verdict: Type.Union([Type.Literal("surface"), Type.Literal("return"), Type.Literal("hold"), Type.Literal("drop")]),
+			reason: Type.String({ description: "One line: why." }),
+			ask: Type.Optional(Type.String({ description: "surface: the one thing the owner must do, a short imperative of a few words. Shown to them as is." })),
+			answer: Type.Optional(Type.String({ description: "return: what the loop is told, so it can carry on without the owner." })),
+		}),
+		async execute(_id, p) {
+			if (p.verdict === "surface" && !p.ask?.trim()) return { content: [{ type: "text", text: "surface needs ask: the one thing the owner must do." }], details: {} };
+			if (p.verdict === "return" && !p.answer?.trim()) return { content: [{ type: "text", text: "return needs answer: what the loop is told." }], details: {} };
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, JSON.stringify({ verdict: p.verdict, reason: String(p.reason).split("\n")[0]!.slice(0, 200),
+				...(p.verdict === "surface" ? { ask: p.ask!.trim().slice(0, 120) } : {}), ...(p.verdict === "return" ? { answer: p.answer!.trim().slice(0, 4000) } : {}) }));
+			return { content: [{ type: "text", text: "Recorded." }], details: {} };
+		},
+	});
 }
 
 /**
@@ -541,6 +616,11 @@ function insideDir(cwd: string, dir: string | undefined): string | undefined {
 export default function loopExtension(pi: ExtensionAPI) {
 	let ctx: ExtensionContext | undefined;
 	// A loop's background run: no loops of its own here (they belong to the session that started it), only loop_report.
+	if (process.env.PI_LOOP_CHILD === "1" && process.env.PI_LOOP_VERDICT) {
+		// A loop's deep judge: it ends with loop_verdict, not loop_report.
+		registerVerdictTool(pi, process.env.PI_LOOP_VERDICT);
+		return;
+	}
 	if (process.env.PI_LOOP_CHILD === "1") {
 		registerReportTool(pi, () => process.env.PI_LOOP_REPORT || undefined, process.env.PI_LOOP_ID || "this");
 		pi.on("session_start", (_e, c) => { ctx = c; markRun(pi, c); });
@@ -619,7 +699,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Background loops waiting for a slot (to say so, rather than "waiting for this session"). */
 	const slotWait = new Set<string>();
 	const reportFileOf = (l: Loop, fire: number) => path.join(stateDirOf(l), `report-${fire}.json`);
-	const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed, judged };
+	const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed, judged, judgeDeeply, deepJudged };
 	let lifecycle: LifecycleHost | undefined;
 	let reportingWarning: string | undefined;
 	function originOf(l: Loop): LoopOrigin {
@@ -769,7 +849,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const r = l.lastRun;
 		if (r?.unread && !r.dismissed && (r.status === "failed" || r.needsYou || r.surface === "needs_you")) return "needs";
 		if ((l.gateErrors ?? 0) >= GATE_FAILING) return "needs";
-		if (shared.runs.has(l.id) || phase?.id === l.id) return "running";
+		if (shared.runs.has(l.id) || shared.judging?.has(l.id) || phase?.id === l.id) return "running";
 		if (l.paused) return "paused";
 		if (waited.has(l.id) || slotWait.has(l.id) || l.pendingWake || now - l.nextAt > LATE_MS) return "late";
 		return "quiet";
@@ -858,13 +938,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const head = (readOnly ? `(read-only: loops owned by pid ${ownerPid()})\n` : "") + (shared.away ? `(you are in ${shared.away.id}'s run: /loop leave lets it carry on, /loop done finishes it)\n` : "");
 		return head + loops.map(l => {
 			const live = shared.runs.get(l.id);
-			const state = live ? `running in background (${live.mode}, ${live.working ? "working" : "idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
+			const state = live ? `running in background (${live.mode}, ${live.working ? "working" : "idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
 			const p = l.prompt.length > 70 ? `${l.prompt.slice(0, 67)}…` : l.prompt;
 			const extra = [background(l) ? `runs in background: ${l.run}` : "runs in this conversation (foreground)", modelText(l), l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "",
 				l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "", slotWait.has(l.id) ? `waiting for a background slot (loop.maxBackground ${maxBackground})` : waited.has(l.id) ? "waiting for this session to be free" : ""].filter(Boolean);
 			const r = l.lastRun;
-			const last = r && !live ? `\n    last run #${r.fire} ${r.status}${r.endedAt ? ` ${countdown(Math.max(0, Date.now() - r.endedAt))} ago` : ""}${r.unread ? " (new)" : ""}${r.result ? `: ${r.result.split("\n")[0].slice(0, 120)}` : ""}${r.needsYou ? ` · needs you: ${r.needsYou}` : ""}` : "";
-			return `${l.id}  ${desc(l)}  ${state}  ×${l.fires}\n    ${p}${extra.length ? `\n    ${extra.join(" · ")}` : ""}${l.gate ? `\n    ${gateText(l)}` : ""}${last}`;
+			const last = r && !live ? `\n    last run #${r.fire} ${r.status}${r.endedAt ? ` ${countdown(Math.max(0, Date.now() - r.endedAt))} ago` : ""}${r.unread ? " (new)" : ""}${r.result ? `: ${r.result.split("\n")[0].slice(0, 120)}` : ""}${r.needsYou ? ` · needs you: ${r.needsYou}` : ""}${r.surface && r.judgedBy?.startsWith("deep judge") ? ` · ${r.surface}: ${r.judgedBy.slice(12)}` : ""}` : "";
+			const heldText = l.held?.length ? `\n    held: ${l.held.map(x => x.reason).join("; ")}` : "";
+			return `${l.id}  ${desc(l)}  ${state}  ×${l.fires}\n    ${p}${extra.length ? `\n    ${extra.join(" · ")}` : ""}${l.gate ? `\n    ${gateText(l)}` : ""}${last}${heldText}`;
 		}).join("\n") + `\n${zoneLine}`;
 	}
 
@@ -1150,11 +1231,16 @@ export default function loopExtension(pi: ExtensionAPI) {
 			...(on?.model ? { model: on.model } : {}), ...(on?.fallback ? { fallback: true } : {}), ...(on?.passedOver?.length ? { passedOver: on.passedOver } : {}) });
 	}
 
+	/** The deep judge's answer to the loop's last report, for its next fire (a fork or fresh loop). */
+	function returnedText(l: Loop): string {
+		return l.returned ? `\n\n<loop-returned>\nYour last report was answered without the owner:\n${l.returned}\n</loop-returned>` : "";
+	}
+
 	/** The prompt a loop's run gets: its header, folder, gate context and the report hint. */
 	function runText(l: Loop, fireNo: number, reason: Reason, gate?: GateDecision, mode?: RunMode): { text: string; expand: boolean } {
 		const why = gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : "";
 		const header = `[loop ${l.id} · ${desc(l)} · fire #${fireNo}${mode ? ` · background ${mode}` : ""}${reason === "due" ? "" : ` · ${reason}`}${why}]`;
-		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
+		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${REPORT_HINT}`;
 		let commands: CommandInfo[] = [];
 		try { commands = (pi as any).getCommands?.() ?? []; } catch { /* older Pi */ }
 		return compose(l.prompt, header + loopContext(l), evidence, home(l), commands, !!l.dir);
@@ -1256,7 +1342,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 	 * The loop is rescheduled at once; the occurrence counts as fired once the child has accepted its prompt.
 	 */
 	function fireBackground(l: Loop & { run: RunMode }, reason: Reason, gate?: GateDecision): string | undefined {
-		if (shared.runs.has(l.id)) { shared.again.add(l.id); return; }
+		// Its deep judge is still deciding about its last run: the next fire waits for it.
+		if (shared.runs.has(l.id) || shared.judging?.has(l.id)) { shared.again.add(l.id); return; }
 		if ((shared.away ?? shared.leaving)?.id === l.id) { shared.again.add(l.id); return; }
 		const now = Date.now();
 		if (overLimit()) {
@@ -1282,7 +1369,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const composed = runText(l, fireNo, reason, gate, s.mode);
 			// Commands must be their own message; skills allow a header after the name.
 			const head = `[loop ${l.id} · ${desc(l)} · fire #${fireNo} · background ${s.mode}${reason === "due" ? "" : ` · ${reason}`}${gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : ""}]`;
-			const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + `\n\n${REPORT_HINT}`;
+			const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${REPORT_HINT}`;
 			text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
 				: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
 			meta = runMeta(l, fireNo, reason, gate, s.mode);
@@ -1452,7 +1539,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		cur.lastRun = { ...(cur.lastRun ?? { fire: run.fire, mode: run.mode, startedAt: Date.now() }), status: "running", acceptance: "accepted", session: run.sessionFile, host: process.pid, ...modelOf(cur, run) };
 		// Models this fire passed over because their Pi didn't start: another one did, so it was them.
 		for (const key of shared.launches?.get(run)?.unstarted.splice(0) ?? []) holdFor(cur, key, run.fire, "not_started");
-		if (meta) logFired(meta, run.sessionFile, cur.lastRun);
+		if (meta) { logFired(meta, run.sessionFile, cur.lastRun); delete cur.returned; }
 		save(); refreshStatus();
 		if (note) notify(`loop ${id}: ${note}`, "info");
 	}
@@ -1560,10 +1647,120 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// What reaches the owner is decided after the run is recorded: a failure or a question for them always,
 		// anything else it reported only when the judge says it needs them.
 		if (!l || o.status === "cancelled") return;
-		if (o.status === "failed" || run.needsYou) { judged(id, run.fire, { surface: "needs_you", ask: run.needsYou || `${id}: run failed`, by: "fact" }, run.attemptId, l.createdAt); return; }
-		if (!o.findings && !ask) return;
 		const incarnation = l.createdAt;
-		void judge(l, o.summary, ask).then(v => live(cur => cur.judged(id, run.fire, v, run.attemptId, incarnation)));
+		// A failure or a dialog goes straight to the deep judge; a report only when stage one doesn't call it routine.
+		if (o.status === "failed" || run.needsYou) {
+			judgeDeeply(id, { fire: run.fire, attemptId: run.attemptId, incarnation, kind: o.status === "failed" ? "failure" : "dialog", summary: o.summary, ask: run.needsYou || `${id}: run failed` });
+			return;
+		}
+		if (!o.findings && !ask) return;
+		void judge(l, o.summary, ask).then(v => live(cur => v.surface === "routine" ? cur.judged(id, run.fire, v, run.attemptId, incarnation)
+			: cur.judgeDeeply(id, { fire: run.fire, attemptId: run.attemptId, incarnation, kind: "report", summary: o.summary, ...(ask ? { ask } : {}), stageOne: v })));
+	}
+
+	/** What stands when the deep judge doesn't decide: stage one's verdict, or for a failure or dialog the fact. */
+	function plainVerdict(item: JudgeItem): Verdict {
+		return item.stageOne ?? { surface: "needs_you", ask: item.ask, by: "fact" };
+	}
+
+	/** Stage two: a background Pi researches the item and gives a verdict. One per loop at a time; later items coalesce. */
+	function judgeDeeply(id: string, item: JudgeItem) {
+		const l = loops.find(x => x.id === id);
+		if (!l || readOnly) return;
+		const cfg = configuredDeepJudge(ctx?.cwd ?? process.cwd());
+		const plain = plainVerdict(item);
+		if (cfg.off) { judged(id, item.fire, { ...plain, by: `${plain.by}: deep judge off` }, item.attemptId, item.incarnation); return; }
+		const judging = (shared.judging ??= new Map());
+		const now = judging.get(id);
+		if (now) { now.queued = now.queued ? { ...item, earlier: [...(now.queued.earlier ?? []), now.queued.summary].slice(-5) } : item; return; }
+		judging.set(id, { item });
+		refreshStatus();
+		void deepJudge(l, item, cfg).then(r => live(cur => cur.deepJudged(id, item, r)));
+	}
+
+	/** The deep judge is done with `item`: apply its verdict (or, failing that, the plain one), then the queued item. */
+	function deepJudged(id: string, item: JudgeItem, r: Verdict | string) {
+		const entry = shared.judging?.get(id);
+		if (entry?.item !== item) return; // stopped at shutdown, which applied the plain verdict
+		shared.judging!.delete(id);
+		if (typeof r === "string") {
+			const plain = plainVerdict(item);
+			judged(id, item.fire, { ...plain, by: `${plain.by}: not deep-judged: ${r}`, note: `not deep-judged: ${r}` }, item.attemptId, item.incarnation);
+			if (!shared.deepJudgeWarned) { shared.deepJudgeWarned = true; notify(`loop ${id}: the deep judge couldn't decide (${r}); its item reaches you as stage one decided, marked "not deep-judged"`, "warning"); }
+		} else judged(id, item.fire, r, item.attemptId, item.incarnation);
+		if (entry.queued) { judgeDeeply(id, entry.queued); return; }
+		// A fire that came due meanwhile runs now.
+		const l = loops.find(x => x.id === id);
+		if (shared.again.delete(id) && l && !l.paused) { l.nextAt = Math.min(l.nextAt, Date.now()); save(); }
+		refreshStatus();
+	}
+
+	/** The deep judge's prompt: the owner's template (loop.deepJudge.prompt) or the default, with the item in it. */
+	function deepJudgeText(l: Loop, item: JudgeItem, template?: string): string {
+		const rec = l.lastRun;
+		const owner = (shared.away ?? shared.leaving)?.home ?? ctx?.sessionManager.getSessionFile?.();
+		const ago = (at: number) => countdown(Math.max(0, Date.now() - at)) + " ago";
+		const others = loops.filter(x => x !== l && loopDot(x, Date.now()) === "needs").map(x => `- ${x.id}: ${askOf(x)}`);
+		const what = item.kind === "failure" ? `Its run #${item.fire} failed: ${item.summary}`
+			: item.kind === "dialog" ? `Its run #${item.fire} needed an answer only the owner could give (declined): ${item.ask}\nIts report: ${item.summary}`
+			: `Its run #${item.fire} reported: ${item.summary}${item.ask ? `\nIts ask for the owner: ${item.ask}` : ""}`;
+		const body = [
+			`[loop ${l.id} · deep judge · run #${item.fire}]`,
+			`The loop: ${l.id} (${desc(l)}, background ${l.run}${l.dir ? `, folder ${l.dir}/` : ""}). Its job: ${l.prompt.slice(0, 800)}`,
+			what.slice(0, 3000),
+			item.stageOne ? `A quick classifier said: ${item.stageOne.surface}.` : "",
+			item.earlier?.length ? `Earlier items of this loop that waited for you (this one supersedes them):\n${item.earlier.map(x => `- ${x.slice(0, 300)}`).join("\n")}` : "",
+			rec?.session ? `The run's conversation (Pi session file): ${rec.session}` : "",
+			owner ? `The owner's conversation (Pi session file, with their past answers): ${owner}` : "",
+			l.surfaced?.length ? `Already put in front of the owner:\n${l.surfaced.slice(-5).map(x => `- ${ago(x.at)}: ${x.ask}${x.dismissed ? " (dismissed)" : ""}`).join("\n")}` : "",
+			l.held?.length ? `Held for the owner already:\n${l.held.map(x => `- ${ago(x.at)}: ${x.what} (${x.reason})`).join("\n")}` : "",
+			others.length ? `Other loops' open asks:\n${others.join("\n")}` : "",
+			`A return goes ${l.run === "thread" ? "into the loop's own conversation, as a new turn" : "into the loop's next run's prompt"}.`,
+		].filter(Boolean).join("\n\n");
+		const t = template ? fs.readFileSync(template, "utf8") : DEEP_JUDGE_PROMPT;
+		return t.includes("{{item}}") ? t.replace("{{item}}", () => body) : `${t.trimEnd()}\n\n${body}`;
+	}
+
+	/** Run the deep judge for `item` in a background Pi: its verdict, or why there is none. */
+	async function deepJudge(l: Loop, item: JudgeItem, cfg: ReturnType<typeof configuredDeepJudge>): Promise<Verdict | string> {
+		const file = path.join(stateDirOf(l), `verdict-${item.fire}.json`);
+		let run: Run;
+		let text: string;
+		try {
+			fs.rmSync(file, { force: true });
+			text = deepJudgeText(l, item, cfg.prompt);
+			const where = home(l);
+			const main = (shared.away ?? shared.leaving)?.home ?? ctx!.sessionManager.getSessionFile?.();
+			const own = main ? path.dirname(main) : undefined;
+			const root = !own ? path.join(agentDir(), "sessions") : /^--.*--$/.test(path.basename(own)) ? path.dirname(own) : own;
+			const env: NodeJS.ProcessEnv = { ...childEnv(l, ""), PI_LOOP_VERDICT: file };
+			delete env.PI_LOOP_REPORT;
+			run = new Run(l.id, item.fire, "fresh", { cwd: where, extra: runExtra(where), ...(cfg.model ? splitModel(cfg.model) : modelArgs(undefined)),
+				sessionArgs: ["--session-dir", sessionFolder(root, fs.realpathSync(where), `-loop-${l.id}-judge`)], env });
+		} catch (e) { return (e as Error).message.slice(0, 200); }
+		const entry = shared.judging?.get(l.id);
+		if (entry?.item === item) entry.run = run;
+		const deadline = Date.now() + cfg.timeoutMs;
+		try {
+			await run.start();
+			await run.prompt(text);
+			for (;;) {
+				const left = deadline - Date.now();
+				if (left <= 0 || !(await run.waitIdle(left))) return `timed out after ${countdown(cfg.timeoutMs)}`;
+				if (run.exited || fs.existsSync(file)) break;
+				await new Promise(r => setTimeout(r, 1500));
+				if (!run.working) break;
+			}
+		} catch (e) { return (e as Error).message.slice(0, 200); }
+		finally { await run.stop(); }
+		let v: { verdict?: string; reason?: string; ask?: string; answer?: string };
+		try { v = JSON.parse(fs.readFileSync(file, "utf8")); } catch { return run.exited && !run.cancelled ? "its Pi exited without a verdict" : "it gave no verdict"; }
+		const by = `deep judge: ${v.reason ?? ""}`.trim();
+		if (v.verdict === "surface" && v.ask) return { surface: "needs_you", ask: v.ask, by };
+		if (v.verdict === "return" && v.answer) return { surface: "returned", answer: v.answer, by };
+		if (v.verdict === "hold") return { surface: "held", by };
+		if (v.verdict === "drop") return { surface: "dropped", by };
+		return "it gave no usable verdict";
 	}
 
 	/** Ask the classifier whether this report should interrupt the owner; the run's own ask decides without one. */
@@ -1599,7 +1796,29 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!l || !rec || rec.fire !== fire || readOnly || (rec.attemptId && rec.attemptId !== attemptId) || (incarnation !== undefined && l.createdAt !== incarnation)) return;
 		rec.surface = v.surface;
 		rec.judgedBy = v.by;
-		if (v.surface === "routine") { save(); refreshStatus(); return; }
+		if (v.surface === "routine" || v.surface === "dropped") { rec.unread = false; save(); refreshStatus(); return; }
+		if (v.surface === "held") {
+			rec.unread = false;
+			const reason = v.by.replace(/^deep judge:\s*/, "") || "held";
+			l.held = [...(l.held ?? []), { fire, at: Date.now(), what: rec.ask || firstSentence(rec.result ?? `run #${fire}`), reason }].slice(-5);
+			save(); refreshStatus();
+			return;
+		}
+		if (v.surface === "returned") {
+			rec.unread = false;
+			const answer = v.answer ?? "";
+			// A thread carries on in its own conversation; a fork or fresh loop finds the answer in its next fire's prompt.
+			if (rec.mode === "thread" && rec.session && loops.includes(l) && !shared.runs.has(l.id) && shared.away?.id !== l.id) {
+				save();
+				void resumeRun(l, answer, "the deep judge's answer to its report").then(m => {
+					if (m.includes("carries on")) return;
+					l.returned = answer; save(); // its next fire gets it instead
+					notify(`loop ${id}: ${m}; the deep judge's answer goes with its next run`, "warning");
+				});
+			} else { l.returned = answer; save(); }
+			refreshStatus();
+			return;
+		}
 		rec.unread = true;
 		if (v.surface === "needs_you") {
 			// Native permission text and an explicit report ask are evidence. A summary sentence is not.
@@ -1612,7 +1831,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 			rec.ask = grounded.ask;
 			l.surfaced = [...(l.surfaced ?? []), { at: Date.now(), ask: rec.ask }].slice(-10);
-			deliver({ content: `[loop ${id} · background ${rec.mode} · run #${fire} · ${rec.status}] needs you: ${rec.ask}\n${rec.result ?? ""}${rec.session ? `\n(/loop open ${id} to go into it)` : ""}`,
+			// What the deep judge held, of any loop, rides along, then counts as seen.
+			const heldBy = loops.filter(x => x.held?.length);
+			const held = heldBy.length ? `\nalso held: ${heldBy.flatMap(x => x.held!.map(h => `${x.id} #${h.fire} ${h.what} (${h.reason})`)).join("; ")}` : "";
+			for (const x of heldBy) delete x.held;
+			deliver({ content: `[loop ${id} · background ${rec.mode} · run #${fire} · ${rec.status}] needs you: ${rec.ask}${v.note ? ` (${v.note})` : ""}\n${rec.result ?? ""}${held}${rec.session ? `\n(/loop open ${id} to go into it)` : ""}`,
 				details: { id, fire, mode: rec.mode, status: rec.status, session: rec.session } });
 		}
 		save(); refreshStatus();
@@ -1624,7 +1847,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
 		const rec = l?.lastRun;
-		if (!rec?.unread) return `${l.id} has nothing to dismiss`;
+		if (!rec?.unread && !l.held?.length) return `${l.id} has nothing to dismiss`;
+		delete l.held;
+		if (!rec?.unread) { save(); refreshStatus(); return `dismissed what ${id} held`; }
 		rec.unread = false; rec.dismissed = true;
 		const last = l.surfaced?.[l.surfaced.length - 1];
 		if (last && rec.ask && last.ask === rec.ask) last.dismissed = true;
@@ -1801,7 +2026,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	/** A finished (or interrupted) run, started again in the background on its own conversation with your words. */
-	async function resumeRun(l: Loop, text: string): Promise<string> {
+	async function resumeRun(l: Loop, text: string, from = "the owner's words"): Promise<string> {
 		if (phase?.id === l.id) return `loop ${l.id} waits for its current foreground turn to finish`;
 		const r = l.lastRun!;
 		const report = reportFileOf(l, r.fire);
@@ -1814,7 +2039,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		shared.runs.set(l.id, run);
 		l.lastRun = { ...r, attemptId: run.attemptId, acceptance: "unknown", status: "starting", unread: false, host: process.pid };
 		save(); refreshStatus();
-		try { await run.start(); if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · the owner's words]\n${text}\n\n${REPORT_HINT}`); }
+		try { await run.start(); if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · ${from}]\n${text}\n\n${REPORT_HINT}`); }
 		catch (e) {
 			if (run.handedOver) return `${l.id}'s run is yours now`;
 			await run.stop(); if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
@@ -1833,13 +2058,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return loops.map(l => {
 			const live = shared.runs.get(l.id);
 			const r = l.lastRun;
-			const state = live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
+			const state = live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
 			const detail = [desc(l), background(l) ? `background ${l.run}` : "in conversation (foreground)", modelText(l), l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
 				r && !live ? `last #${r.fire} ${r.status}${r.result ? `: ${r.result.split("\n")[0]}` : ""}${r.needsYou ? ` · needs you` : ""}` : ""].filter(Boolean).join(" · ");
 			const dot = loopDot(l, Date.now());
 			const why = sayDot(l, dot);
 			// Worth knowing, not yet seen: a muted line in the view only (never the status line).
-			const news = dot !== "needs" && r?.unread && !r.dismissed && r.result ? `new: ${firstSentence(r.result)}` : "";
+			const news = dot !== "needs" && r?.unread && !r.dismissed && r.result ? `new: ${firstSentence(r.result)}${r.judgedBy?.includes("not deep-judged") ? " (not deep-judged)" : ""}`
+				: l.held?.length ? `held: ${l.held[l.held.length - 1]!.reason}${l.held.length > 1 ? ` (+${l.held.length - 1})` : ""}` : "";
 			return { id: l.id, state, detail, running: !!live, hasRun: !!r?.session, unread: !!r?.unread, paused: l.paused, dot, ...(why ? { why } : {}), ...(news ? { news } : {}) };
 		});
 	}
@@ -2116,7 +2342,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// Background loops need only a run slot: each due one starts now, or runs once more after its current run.
 		for (const l of dueNow.filter(background)) {
 			if (phase?.id === l.id) continue;
-			if (shared.runs.has(l.id)) {
+			if (shared.runs.has(l.id) || shared.judging?.has(l.id)) {
 				// Due again while it runs: once more after it (a self-paced loop's run chooses its own next time instead).
 				if (l.schedule.kind !== "auto" && !shared.again.has(l.id)) shared.again.add(l.id);
 				if (l.nextAt <= now) { l.nextAt = nextFor(l, now); save(); }
@@ -2335,6 +2561,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 				}
 				return run.stop(2_000);
 			});
+			// A deep judge stopped before it decided: its item reaches the owner as stage one (or the fact) decided.
+			for (const [id, entry] of shared.judging ?? []) {
+				shared.judging!.delete(id);
+				for (const item of [entry.item, ...(entry.queued ? [entry.queued] : [])]) {
+					const plain = plainVerdict(item);
+					judged(id, item.fire, { ...plain, by: `${plain.by}: not deep-judged: Pi quit before it decided`, note: "not deep-judged: Pi quit before it decided" }, item.attemptId, item.incarnation);
+				}
+				if (entry.run) stopping.push(entry.run.stop(2_000));
+			}
 			await Promise.all(stopping);
 			shared.pending.length = 0;
 			shared.runs.clear();
@@ -2464,7 +2699,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			"`every` is a fixed interval (default 10m) or auto; `at` is a daily HH:MM wall-clock " +
 			"time that follows daylight saving in the loop's zone. A gate is a script in the project that runs when the loop is due and " +
 			"prints JSON deciding skip, wake or defer, so a frequent check wakes the model only when needed. An explicit foreground loop waits while the " +
-			"session is busy and fires once when it is free (highest priority first), never stacking. Background loops run beside the conversation; their model can be a list " +
+			"session is busy and fires once when it is free (highest priority first), never stacking. Background loops run beside the conversation and reach the owner only through a judge (which may instead answer the loop itself); their model can be a list " +
 			"(first choice first): a run that did nothing because a model couldn't serve it moves on to the next, and loops return to the first once it is back. A loop can have its own folder " +
 			"(dir) holding its gate, prompt template and context files. Loops can also be declared in .pi/loop.json files (see the " +
 			"pi-loop skill). Loops persist across restarts and fire only while a Pi session is open in this project.",
