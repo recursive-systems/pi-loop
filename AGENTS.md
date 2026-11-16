@@ -9,7 +9,7 @@ no mode migrate to forks on load. Optional gates decide whether a due loop wakes
   holds intervals, daily times and DST. `gate.ts` runs gates. `models.ts` holds model fallback
   (lists, held-back models, the optional check command). `prompt.ts` builds a fire's
   message. `background.ts` runs a loop's turn in a child Pi over RPC (fork, thread or fresh) and
-  `view.ts` is the loops view. `liveness.ts` is explicitly loaded in each RPC child: it implements the
+  `view.ts` is the loops view and `watch.ts` a run full screen, drawn with Pi's own message components. `liveness.ts` is explicitly loaded in each RPC child: it implements the
   optional session-liveness v1 host contract and sends only busy/idle/error, so a settled turn with
   detached work or queued completions is not mistaken for a completed loop. Background runs and the folder lock live process-wide (`shared` in
   `index.ts`), because Pi rebuilds extensions on every session switch. Every folder-lock acquisition

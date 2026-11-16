@@ -3,7 +3,7 @@
  *
  *   list    one row per loop, its state as a symbol (the key is at the bottom, the same as the status line's)
  *           ↑/↓ or j/k move · d dismiss what it surfaced · Enter watch its run · t go into its run · r run now · p pause/resume · x cancel its run · Esc close
- *   watch   type to steer, Enter sends · Tab go into the run · Esc back to the list
+ *   Enter opens the run full screen (watch.ts): its conversation as Pi draws it, live
  */
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
@@ -18,7 +18,7 @@ export const GLYPH: Record<Dot, { glyph: string; color: string; meaning: string 
 };
 
 export interface LoopRow { id: string; state: string; detail: string; running: boolean; hasRun: boolean; unread: boolean; paused: boolean; dot: Dot; why?: string; news?: string }
-export type ViewAction = { action: "take" | "run" | "pause" | "resume" | "stop" | "dismiss"; id: string } | undefined;
+export type ViewAction = { action: "take" | "run" | "pause" | "resume" | "stop" | "dismiss" | "watch"; id: string } | undefined;
 
 export interface ViewDeps {
 	rows(): LoopRow[];
@@ -36,9 +36,9 @@ export class LoopsView {
 	private note = "";
 	private timer: ReturnType<typeof setInterval>;
 
-	constructor(private tui: { requestRender(): void }, private theme: any, private deps: ViewDeps, private done: (a: ViewAction) => void, watch?: string) {
+	constructor(private tui: { requestRender(): void }, private theme: any, private deps: ViewDeps, private done: (a: ViewAction) => void, select?: string) {
 		this.timer = setInterval(() => this.tui.requestRender(), 1000);
-		if (watch) this.watch(watch);
+		if (select) this.sel = Math.max(0, deps.rows().findIndex(r => r.id === select));
 	}
 
 	private finish(a: ViewAction) { clearInterval(this.timer); this.done(a); }
@@ -72,7 +72,7 @@ export class LoopsView {
 		const row = rows[this.sel];
 		if (matchesKey(data, "up") || data === "k") this.sel = Math.max(0, this.sel - 1);
 		else if (matchesKey(data, "down") || data === "j") this.sel = Math.min(rows.length - 1, this.sel + 1);
-		else if (matchesKey(data, "return")) { if (row.hasRun || row.running) this.watch(row.id); else this.note = `${row.id} has no run yet`; }
+		else if (matchesKey(data, "return")) { if (row.hasRun || row.running) { this.finish({ action: "watch", id: row.id }); return; } this.note = `${row.id} has no run yet`; }
 		else if (data === "t") { if (row.hasRun || row.running) { this.finish({ action: "take", id: row.id }); return; } this.note = `${row.id} has no run to go into`; }
 		else if (data === "r") { this.finish({ action: "run", id: row.id }); return; }
 		else if (data === "p") { this.finish({ action: row.paused ? "resume" : "pause", id: row.id }); return; }

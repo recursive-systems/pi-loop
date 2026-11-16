@@ -47,6 +47,7 @@ import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
 import { DEFAULT_MODEL_BACKOFF_MS, MAX_BACKOFF_FACTOR, checkModels, holdModel, modelKey, modelList, parseModels, pickModel, readHolds, skippedFor, splitModel, writeHolds, type CheckAnswer, type Holds, type ModelSpec } from "./models.ts";
 import { LoopsView, GLYPH, type Dot, type LoopRow, type ViewAction } from "./view.ts";
+import { RunWatch, FULL_SCREEN, type WatchAction } from "./watch.ts";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
 type Phase = { state: "queued" | "running"; id: string } | undefined;
@@ -2105,24 +2106,57 @@ export default function loopExtension(pi: ExtensionAPI) {
 		});
 	}
 
-	/** The loops view in the terminal UI; acts on what you picked once it closes. */
+	/** The loops view in the terminal UI; acts on what you picked once it closes. `watch`: open that loop's run
+	 *  full screen straight away (Esc then closes instead of going back to the list). */
 	async function openView(cctx: any, watch?: string) {
-		const action: ViewAction = await cctx.ui.custom((tui: any, theme: any, _kb: any, done: (a: ViewAction) => void) => new LoopsView(tui, theme, {
-			rows: viewRows,
-			lines: (id: string) => { const l = find(id); return l ? runLines(l) : []; },
-			steer: (id: string, text: string) => steerRun(id, text),
-			seen: (id: string) => { const l = find(id); if (l?.lastRun?.unread && !readOnly) { l.lastRun.unread = false; save(); refreshStatus(); } },
-			title: path.basename(ctx!.cwd),
-		}, done, watch), { overlay: true });
-		if (!action) return;
-		switch (action.action) {
-			case "take": { const err = await takeOver(action.id, false, cctx, true); if (err) notify(err, "warning"); return; }
-			case "run": { const l = find(action.id); if (l) { const err = fire(l, "manual"); notify(err ?? `fired ${l.id}`); } return; }
-			case "pause": notify(setPaused(action.id, true)); return;
-			case "resume": notify(setPaused(action.id, false)); return;
-			case "stop": notify(await cancelRun(action.id)); return;
-			case "dismiss": notify(dismiss(action.id)); return;
+		let select: string | undefined;
+		if (watch) {
+			const a = await watchRun(cctx, watch);
+			if (a === "take") { const err = await takeOver(watch, false, cctx, true); if (err) notify(err, "warning"); }
+			return;
 		}
+		for (;;) {
+			const action: ViewAction = await cctx.ui.custom((tui: any, theme: any, _kb: any, done: (a: ViewAction) => void) => new LoopsView(tui, theme, {
+				rows: viewRows,
+				lines: (id: string) => { const l = find(id); return l ? runLines(l) : []; },
+				steer: (id: string, text: string) => steerRun(id, text),
+				seen: (id: string) => markSeen(id),
+				title: path.basename(ctx!.cwd),
+			}, done, select), { overlay: true });
+			if (!action) return;
+			switch (action.action) {
+				case "watch": {
+					const a = await watchRun(cctx, action.id);
+					if (a === "take") { const err = await takeOver(action.id, false, cctx, true); if (err) notify(err, "warning"); return; }
+					select = action.id;
+					continue; // back to the list
+				}
+				case "take": { const err = await takeOver(action.id, false, cctx, true); if (err) notify(err, "warning"); return; }
+				case "run": { const l = find(action.id); if (l) { const err = fire(l, "manual"); notify(err ?? `fired ${l.id}`); } return; }
+				case "pause": notify(setPaused(action.id, true)); return;
+				case "resume": notify(setPaused(action.id, false)); return;
+				case "stop": notify(await cancelRun(action.id)); return;
+				case "dismiss": notify(dismiss(action.id)); return;
+			}
+		}
+	}
+
+	function markSeen(id: string) { const l = find(id); if (l?.lastRun?.unread && !readOnly) { l.lastRun.unread = false; save(); refreshStatus(); } }
+
+	/** A loop's run full screen, drawn as Pi draws a conversation and followed live; resolves with what you chose. */
+	async function watchRun(cctx: any, id: string): Promise<WatchAction> {
+		const l = find(id);
+		if (!l) { notify(`no loop "${id}"`, "warning"); return undefined; }
+		markSeen(l.id);
+		const row = () => viewRows().find(r => r.id === l.id);
+		return cctx.ui.custom((tui: any, theme: any, _kb: any, done: (a: WatchAction) => void) => new RunWatch(tui, theme, {
+			id: l.id,
+			cwd: (() => { try { return home(l); } catch { return ctx!.cwd; } })(),
+			file: () => { const cur = find(l.id); return shared.runs.get(l.id)?.sessionFile ?? cur?.lastRun?.session; },
+			live: () => shared.runs.get(l.id),
+			state: () => row()?.state ?? "gone",
+			steer: (text: string) => steerRun(l.id, text),
+		}, done), { overlay: true, overlayOptions: FULL_SCREEN });
 	}
 
 	/** The run's transcript as text: live from a running one, from its file otherwise. */
