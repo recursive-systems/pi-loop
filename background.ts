@@ -35,8 +35,12 @@ export type RunStatus = "starting" | "running" | "done" | "failed" | "cancelled"
 /** What a loop's run reports through loop_report (or what is assumed when it doesn't). */
 export interface Report { findings: boolean; summary?: string; next?: string; stop?: boolean; /** The one thing the owner must do, if anything. */ ask?: string }
 
-/** Whether a run's report interrupts the owner: only "needs_you" lights the status line and posts in the conversation. */
-export type Surface = "needs_you" | "worth_knowing" | "routine";
+/**
+ * Whether a run's report interrupts the owner: only "needs_you" lights the status line and posts in the conversation.
+ * The deep judge's other verdicts: "held" (muted in the view, rides along with the next item that reaches the owner),
+ * "returned" (sent back to the loop, never to the owner) and "dropped".
+ */
+export type Surface = "needs_you" | "worth_knowing" | "routine" | "held" | "returned" | "dropped";
 
 /**
  * A successful report interrupts only with its own ask. A classifier choice, a missing choice,
@@ -71,7 +75,7 @@ export interface RunRecord {
 	unread?: boolean;
 	/** The one thing the owner must do, from the run's loop_report (or its summary's first sentence). */
 	ask?: string;
-	/** What the judge decided about this report, and who decided ("judge" = a classifier model, "fallback" = the run's own ask). */
+	/** What the judge decided about this report, and who decided (a classifier model, "fallback" = the run's own ask, "fact" = a failure or a dialog), then ": " and the one-line reason when there is one. */
 	surface?: Surface;
 	judgedBy?: string;
 	/** The owner dismissed what this run surfaced. */
