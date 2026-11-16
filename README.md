@@ -33,7 +33,7 @@ conversation itself:
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.14.0
+pi install git:github.com/recursive-systems/pi-loop@v0.15.0
 ```
 
 Add `-l` to install it for one project only.
@@ -103,9 +103,9 @@ loops ●●✕●✕● Reconnect Stripe in Executor +1
 `●` quiet, `◉` running, `✕` needs you, `○` late or waiting, `◌` paused. The loops view (`/loop`)
 shows the same symbols, the reason beside each, and the key.
 
-A status bar extension can show this line as one of its rows: when it emits `statusbar:ready` on
-`pi.events`, pi-loop sends `statusbar:item` (`{ id: "loops", order, render(theme, width), open(ctx) }`,
-`open` shows the loops view) instead of setting a footer status.
+pi-loop bundles [pi-statusbar](https://github.com/recursive-systems/pi-statusbar), so this line gets
+its own row below the editor (`id: "loops"`, order 20; opening it shows the loops view) instead of a
+footer status. Only one bar is drawn when pi-jobs or pi-statusbar is installed too.
 
 Other extensions can follow the loops too, to show them in a terminal multiplexer's sidebar or send a
 notification, without pi-loop knowing about either. Each time the loops change, pi-loop emits

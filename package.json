@@ -1,6 +1,6 @@
 {
   "name": "pi-loop",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Recurring prompts for the Pi coding agent: /loop and loop_manage, with DST-aware daily times, script gates that decide whether to wake the model, and background runs (a fork of the conversation, its own thread, or fresh) you can watch, steer and step into.",
   "license": "MIT",
   "private": true,
@@ -19,7 +19,8 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./index.ts",
+      "node_modules/pi-statusbar/index.ts"
     ],
     "skills": [
       "./skills/pi-loop"
@@ -43,5 +44,8 @@
     "@earendil-works/pi-tui": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "pi-statusbar": "github:recursive-systems/pi-statusbar#v0.1.0"
   }
 }
