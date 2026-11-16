@@ -33,7 +33,7 @@ conversation itself:
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.16.0
+pi install git:github.com/recursive-systems/pi-loop@v0.17.0
 ```
 
 Add `-l` to install it for one project only.
@@ -106,8 +106,9 @@ shows the same symbols, the reason beside each, and the key.
 pi-loop bundles [pi-statusbar](https://github.com/recursive-systems/pi-statusbar), so this line gets
 its own row below the editor (`id: "loops"`, order 20) instead of a footer status. Only one bar is
 drawn when pi-jobs or pi-statusbar is installed too. Press ↓ from an empty editor to reach it: Enter
-opens the loops view, ←/→ pick a loop, and Enter on one goes into its run as a regular session
-(Enter on the row again, or `/loop leave`, brings you back).
+opens the loops view, ←/→ pick a loop, and Enter on one watches its run at once (nothing has to
+stop); Tab there goes into it as a regular session. Enter on the row again, or `/loop leave`, brings
+you back.
 
 Other extensions can follow the loops too, to show them in a terminal multiplexer's sidebar or send a
 notification, without pi-loop knowing about either. Each time the loops change, pi-loop emits
@@ -195,8 +196,9 @@ launching the reader. This does not make arbitrary detached shell commands durab
 side effects exactly once; cancelling a loop is not a promise to cancel its detached descendants.
 
 From the loops view (`/loop`) you can watch a run live and type to steer it, or go into it (`t`, or
-`/loop take <id>`): the run stops at its next step and your Pi switches into its conversation, a regular
-session (`/loop open <id>` does the same for a finished run). `/loop leave` brings you back and lets it
+`/loop take <id>`): this conversation's turn is interrupted if one is going, the run gets a few seconds to
+stop at a safe point and say where it is (then it is interrupted; its conversation is kept), and your Pi
+switches into its conversation, a regular session (`/loop open <id>` does the same for a finished run). `/loop leave` brings you back and lets it
 carry on in the background; `/loop done` brings you back and ends it; leaving it any other way (`/new`,
 `/resume`) counts as `/loop leave`. `loop.maxBackground` in settings limits how many run at once (default: no limit).
 

@@ -58,6 +58,8 @@ const REPORT_HINT = "When you finish, call loop_report once: findings true only 
 	"(false when all is as expected), a one-line summary, ask only if the owner must do something (the one thing, a few words), " +
 	"and optionally next (e.g. \"15m\") to choose when this loop runs again, or stop: true to end it.";
 const TAKEOVER_NOTE = "[loop] The owner is taking over this conversation now. Stop here and reply with one line saying where you are.";
+/** How long a run gets to stop on its own when you go into it, before it is interrupted (its conversation is kept). */
+const TAKEOVER_GRACE_MS = 8_000;
 const CONTINUE_NOTE = "[loop] The owner stepped out. Carry on from where you are, and call loop_report when you are done.";
 /** Longest a self-paced loop may put off its next run. */
 const MAX_NEXT_MS = 7 * 24 * 60 * 60_000;
@@ -843,6 +845,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 	// asked them something, or a gate failing 3 times in a row. A status bar extension can show the line as
 	// one of its rows ("statusbar:*" events); otherwise it's a footer status.
 	const LATE_MS = 15 * 60_000;
+	/** A takeover under way, and the step it is at (shown in the status line). */
+	let entering: { id: string; step: string } | undefined;
 	const GATE_FAILING = 3;
 	let barMode = false;
 	function loopDot(l: Loop, now: number): Dot {
@@ -868,13 +872,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const inv = (t: string) => { try { return theme ? theme.inverse(t) : t; } catch { return t; } };
 		if (readOnly) return fg("dim", `loops ${loops.length} (owned by pid ${ownerPid()})`);
 		if (shared.away) return `loops: in ${shared.away.id}'s run · /loop leave or /loop done`;
+		if (entering) return `${fg("muted", "loops")} ${fg("accent", `going into ${entering.id}'s run: ${entering.step}…`)}`;
 		const now = Date.now();
 		const dots = loops.map(l => ({ l, d: loopDot(l, now) }));
 		const strip = dots.map(({ d }, i) => { const s = fg(GLYPH[d].color, GLYPH[d].glyph); return i === pick ? inv(s) : s; }).join("");
 		const picked = pick !== undefined ? dots[pick] : undefined;
 		if (picked) {
 			const why = sayDot(picked.l, picked.d, now) || GLYPH[picked.d].meaning;
-			const go = shared.runs.has(picked.l.id) || picked.l.lastRun?.session ? "Enter go into its run" : "no run yet · Enter loops view";
+			const go = shared.runs.has(picked.l.id) ? "Enter watch its run" : picked.l.lastRun?.session ? "Enter see its last run" : "no run yet · Enter loops view";
 			return `${fg("muted", "loops")} ${strip} ${fg("accent", picked.l.id)} ${fg(GLYPH[picked.d].color === "dim" ? "muted" : GLYPH[picked.d].color, why)} ${fg("dim", `· ${go}`)}`;
 		}
 		const needs = dots.filter(x => x.d === "needs");
@@ -926,7 +931,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	/** Our row in a status bar extension: the same line. Enter on the row opens the loops view (or, while you are
-	 *  in a run, leaves it); ←/→ pick a loop, and Enter on one goes into its run (or opens it in the view). */
+	 *  in a run, leaves it); ←/→ pick a loop, and Enter on one watches its run (Tab there goes into it). */
 	function registerBarItem() {
 		const pickable = () => !readOnly && !shared.away;
 		pi.events.emit("statusbar:item", {
@@ -939,7 +944,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 				if (shared.away) return "/loop leave";
 				const l = i !== undefined ? loops[i] : undefined;
 				if (!l) return "/loop";
-				return shared.runs.has(l.id) || l.lastRun?.session ? `/loop take ${l.id}` : "/loop";
+				// Watching opens at once (nothing has to stop); Tab there goes into the run.
+				return shared.runs.has(l.id) || l.lastRun?.session ? `/loop watch ${l.id}` : "/loop";
 			},
 			open: (c: any) => openView(c),
 		});
@@ -1899,13 +1905,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function flushNotes() { for (const n of shared.notes.splice(0)) deliver(n); }
 
 	/** Go into a loop's run as a regular session: the background Pi stops at a safe point first (or now). */
-	async function takeOver(id: string, now: boolean, cctx: any): Promise<string | undefined> {
+	/** `anyway`: you picked it in the view (Tab), so a run waiting on background work is stopped too, with a warning. */
+	async function takeOver(id: string, now: boolean, cctx: any, anyway = false): Promise<string | undefined> {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}`;
 		if (shared.away) return `you are already in ${shared.away.id}'s run; /loop leave or /loop done first`;
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
 		const run = shared.runs.get(l.id);
-		if (run?.backgroundWork && !now) return `${l.id}'s run is waiting for background work it started, which reports back only to that run; watch or steer it, or /loop take ${l.id} now to stop it anyway (that work may not report back)`;
+		if (run?.backgroundWork && !now && !anyway) return `${l.id}'s run is waiting for background work it started, which reports back only to that run; watch or steer it, or /loop take ${l.id} now to stop it anyway (that work may not report back)`;
 		const file = run?.sessionFile ?? l.lastRun?.session;
 		if (!file) return `${l.id} has no run to go into`;
 		// Pi opens a conversation in the folder it was started in: going into a run from another folder would move this
@@ -1921,18 +1928,28 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// Pi writes a conversation to disk after its first exchange; before that there is nothing to come back to.
 		if (!fs.existsSync(homeFile)) return "this conversation has nothing saved yet (Pi saves it after its first exchange), so pi-loop couldn't bring you back to it; say something here first";
 		if (run?.backgroundWork) notify(`${l.id}'s background work may not report back after you take over`, "warning");
-		if (run?.working) notify(`waiting for ${l.id}'s run to stop at its next step${now ? "" : " (up to a minute)"}…`, "info");
-		await cctx.waitForIdle?.();
-		const fireNo = run?.fire ?? l.lastRun?.fire ?? l.fires;
-		if (run) {
-			run.handedOver = true;
-			if (run.working) {
-				if (now) await run.abort();
-				else { await run.steer(TAKEOVER_NOTE); if (!(await run.waitIdle(60_000))) await run.abort(); }
+		// You asked to go in: this conversation's turn is interrupted rather than waited for (it is kept as it is).
+		const step = (s: string | undefined) => { entering = s ? { id: l.id, step: s } : undefined; refreshStatus(); };
+		try {
+			if (!cctx.isIdle?.()) { step("stopping this conversation's turn"); cctx.abort?.(); }
+			await cctx.waitForIdle?.();
+			if (run) {
+				run.handedOver = true;
+				if (run.working) {
+					// A few seconds to stop at a safe point and say where it is; then it is interrupted.
+					if (now) { step("interrupting its run"); await run.abort(); }
+					else {
+						step("asking its run to stop");
+						await run.steer(TAKEOVER_NOTE);
+						if (!(await run.waitIdle(TAKEOVER_GRACE_MS))) { step("interrupting its run"); await run.abort(); }
+					}
+				}
+				step("opening its conversation");
+				await run.stop();
+				shared.runs.delete(l.id);
 			}
-			await run.stop();
-			shared.runs.delete(l.id);
-		}
+		} finally { step(undefined); }
+		const fireNo = run?.fire ?? l.lastRun?.fire ?? l.fires;
 		const prev = l.lastRun;
 		l.lastRun = { ...(l.lastRun ?? { fire: fireNo, mode: background(l) ? l.run : "fresh", startedAt: Date.now() }), status: "away", session: file, unread: false, host: process.pid };
 		const away: Away = { id: l.id, file, home: homeFile, attemptId: run?.attemptId ?? l.lastRun?.attemptId, origin: run?.origin ?? originOf(l), homeId: ctx!.sessionManager.getSessionId?.(), fire: fireNo, mode: l.lastRun.mode, report: reportFileOf(l, fireNo), live: !!run };
@@ -2099,7 +2116,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}, done, watch), { overlay: true });
 		if (!action) return;
 		switch (action.action) {
-			case "take": { const err = await takeOver(action.id, false, cctx); if (err) notify(err, "warning"); return; }
+			case "take": { const err = await takeOver(action.id, false, cctx, true); if (err) notify(err, "warning"); return; }
 			case "run": { const l = find(action.id); if (l) { const err = fire(l, "manual"); notify(err ?? `fired ${l.id}`); } return; }
 			case "pause": notify(setPaused(action.id, true)); return;
 			case "resume": notify(setPaused(action.id, false)); return;
