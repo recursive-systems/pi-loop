@@ -862,13 +862,21 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if ((l.gateErrors ?? 0) >= GATE_FAILING) return `${l.id}: gate failing`;
 		return "";
 	}
-	function statusLine(theme?: any): string {
+	/** `pick`: the loop the status bar's keyboard is on (its symbol inverted, its name and state beside the strip). */
+	function statusLine(theme?: any, pick?: number): string {
 		const fg = (c: string, t: string) => { try { return theme ? theme.fg(c, t) : t; } catch { return t; } };
+		const inv = (t: string) => { try { return theme ? theme.inverse(t) : t; } catch { return t; } };
 		if (readOnly) return fg("dim", `loops ${loops.length} (owned by pid ${ownerPid()})`);
 		if (shared.away) return `loops: in ${shared.away.id}'s run · /loop leave or /loop done`;
 		const now = Date.now();
 		const dots = loops.map(l => ({ l, d: loopDot(l, now) }));
-		const strip = dots.map(({ d }) => fg(GLYPH[d].color, GLYPH[d].glyph)).join("");
+		const strip = dots.map(({ d }, i) => { const s = fg(GLYPH[d].color, GLYPH[d].glyph); return i === pick ? inv(s) : s; }).join("");
+		const picked = pick !== undefined ? dots[pick] : undefined;
+		if (picked) {
+			const why = sayDot(picked.l, picked.d, now) || GLYPH[picked.d].meaning;
+			const go = shared.runs.has(picked.l.id) || picked.l.lastRun?.session ? "Enter go into its run" : "no run yet · Enter loops view";
+			return `${fg("muted", "loops")} ${strip} ${fg("accent", picked.l.id)} ${fg(GLYPH[picked.d].color === "dim" ? "muted" : GLYPH[picked.d].color, why)} ${fg("dim", `· ${go}`)}`;
+		}
 		const needs = dots.filter(x => x.d === "needs");
 		const words = needs.length ? " " + fg(GLYPH.needs.color, askOf(needs[0]!.l)) + (needs.length > 1 ? fg("dim", ` +${needs.length - 1}`) : "") : "";
 		return `${fg("muted", "loops")} ${strip}${words}`;
@@ -917,12 +925,22 @@ export default function loopExtension(pi: ExtensionAPI) {
 		ctx.ui.setStatus(STATUS_KEY, statusLine(theme));
 	}
 
-	/** Our row in a status bar extension: the same line, and Enter opens the loops view. */
+	/** Our row in a status bar extension: the same line. Enter on the row opens the loops view (or, while you are
+	 *  in a run, leaves it); ←/→ pick a loop, and Enter on one goes into its run (or opens it in the view). */
 	function registerBarItem() {
+		const pickable = () => !readOnly && !shared.away;
 		pi.events.emit("statusbar:item", {
 			id: "loops",
 			order: 20,
-			render: (theme: any, width: number) => (loops.length ? [truncateToWidth(` ${statusLine(theme)}`, width)] : []),
+			render: (theme: any, width: number, focus?: { item?: number }) =>
+				(loops.length ? [truncateToWidth(` ${statusLine(theme, pickable() ? focus?.item : undefined)}`, width)] : []),
+			count: () => (pickable() ? loops.length : 0),
+			command: (i?: number) => {
+				if (shared.away) return "/loop leave";
+				const l = i !== undefined ? loops[i] : undefined;
+				if (!l) return "/loop";
+				return shared.runs.has(l.id) || l.lastRun?.session ? `/loop take ${l.id}` : "/loop";
+			},
 			open: (c: any) => openView(c),
 		});
 	}
