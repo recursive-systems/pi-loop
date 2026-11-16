@@ -55,21 +55,44 @@ Add `-l` to install it for one project only.
 
 ## What reaches you
 
-A run tells you only what needs you. After a background run reports, a classifier model (TypeSafe's
-Jev by default, through Pi's model registry) reads the report, the run's `ask` and what was put in
-front of you before, and decides:
+A run tells you only what needs you. Two judges stand between a loop and you.
 
-- **needs you**: a decision, approval or action only you can take, new or changed. It lights the
-  status line with the ask itself and posts it in the conversation.
-- **worth knowing**: shown, muted, in the loops view only.
-- **routine**: recorded, nothing more.
+First a classifier model (TypeSafe's Jev by default, through Pi's model registry) reads the report,
+the run's `ask` and what was put in front of you before. Routine reports stop there.
 
-A failed run, or one that asked you something, always needs you. A successful report does not:
-the classifier cannot turn its text into an ask. Without the run's own `ask`, it is worth knowing
-at most. To dismiss what a loop surfaced,
-press `d` in the loops view, run `/loop dismiss <id>`, or tell the agent it's handled (it calls
-`loop_manage` `dismiss`); the judge then treats a repeat of it as routine. Set the judge in settings
-with `{"loop": {"judge": "<provider>/<id>"}}`, or `"off"`; without one, a run's own `ask` decides.
+Anything else, and every failed run or run that asked you something, goes to a deep judge: a
+background Pi that looks around before deciding (your past answers in this conversation, the run's
+own session, other loops' open asks, whatever your setup gives it) and ends with one verdict and a
+one-line reason, kept on the run's record:
+
+- **surface**: it needs you. The ask, rewritten clearly, lights the status line and posts in the
+  conversation.
+- **return**: the loop can handle it. The answer goes back to the loop: a `thread` loop gets it as a
+  new turn in its conversation, a `fork` or `fresh` loop in its next run's prompt. Nothing reaches you.
+- **hold**: muted in the loops view as `held: <reason>`, and listed under "also held:" with the next
+  item that does reach you.
+- **drop**: recorded, nothing more.
+
+It may fix a plain problem itself, within what the loop's job already allows. One deep judge runs per
+loop at a time; the loop's next run waits for it, and items that come in meanwhile are judged together.
+If it fails, times out or gives no verdict, nothing is held or dropped: the item reaches you as the
+classifier decided (a failure as a failure), marked "not deep-judged: <why>".
+
+A successful report never needs you without an ask: without the run's own `ask` (or the deep judge's),
+it is worth knowing at most. To dismiss what a loop surfaced (or held), press `d` in the loops view,
+run `/loop dismiss <id>`, or tell the agent it's handled (it calls `loop_manage` `dismiss`); the
+judges then treat a repeat of it as routine. In settings:
+
+```json
+{ "loop": {
+  "judge": "<provider>/<id>",
+  "deepJudge": { "model": "<provider>/<id>", "prompt": ".pi/deep-judge.md", "timeout": "10m" }
+} }
+```
+
+`judge: "off"` lets a run's own `ask` decide. `deepJudge: "off"` leaves the decision to the classifier
+(recorded as "deep judge off"). The deep judge's model defaults to this session's; `prompt` is a file
+of your own instructions for it (`{{item}}` marks where the item goes).
 
 ```
 loops ●●●●●●

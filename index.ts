@@ -2699,7 +2699,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			"`every` is a fixed interval (default 10m) or auto; `at` is a daily HH:MM wall-clock " +
 			"time that follows daylight saving in the loop's zone. A gate is a script in the project that runs when the loop is due and " +
 			"prints JSON deciding skip, wake or defer, so a frequent check wakes the model only when needed. An explicit foreground loop waits while the " +
-			"session is busy and fires once when it is free (highest priority first), never stacking. Background loops run beside the conversation; their model can be a list " +
+			"session is busy and fires once when it is free (highest priority first), never stacking. Background loops run beside the conversation and reach the owner only through a judge (which may instead answer the loop itself); their model can be a list " +
 			"(first choice first): a run that did nothing because a model couldn't serve it moves on to the next, and loops return to the first once it is back. A loop can have its own folder " +
 			"(dir) holding its gate, prompt template and context files. Loops can also be declared in .pi/loop.json files (see the " +
 			"pi-loop skill). Loops persist across restarts and fire only while a Pi session is open in this project.",
