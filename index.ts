@@ -2111,7 +2111,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	async function openView(cctx: any, watch?: string) {
 		let select: string | undefined;
 		if (watch) {
-			const a = await watchRun(cctx, watch);
+			const a = await watchView(cctx, watch);
 			if (a === "take") { const err = await takeOver(watch, false, cctx, true); if (err) notify(err, "warning"); }
 			return;
 		}
@@ -2126,7 +2126,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (!action) return;
 			switch (action.action) {
 				case "watch": {
-					const a = await watchRun(cctx, action.id);
+					const a = await watchView(cctx, action.id);
 					if (a === "take") { const err = await takeOver(action.id, false, cctx, true); if (err) notify(err, "warning"); return; }
 					select = action.id;
 					continue; // back to the list
@@ -2144,7 +2144,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function markSeen(id: string) { const l = find(id); if (l?.lastRun?.unread && !readOnly) { l.lastRun.unread = false; save(); refreshStatus(); } }
 
 	/** A loop's run full screen, drawn as Pi draws a conversation and followed live; resolves with what you chose. */
-	async function watchRun(cctx: any, id: string): Promise<WatchAction> {
+	async function watchView(cctx: any, id: string): Promise<WatchAction> {
 		const l = find(id);
 		if (!l) { notify(`no loop "${id}"`, "warning"); return undefined; }
 		markSeen(l.id);
