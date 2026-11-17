@@ -33,7 +33,7 @@ conversation itself:
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop@v0.18.0
+pi install git:github.com/recursive-systems/pi-loop@v0.19.0
 ```
 
 Add `-l` to install it for one project only.
@@ -121,6 +121,33 @@ notification, without pi-loop knowing about either. Each time the loops change, 
 `state` is a symbol's name (`quiet`, `running`, `needs`, `late`, `paused`), `ask` comes only with
 `needs`, and `nextAt` is in epoch milliseconds. A session that doesn't own the folder's loops sends
 an empty list. Emit `loop:ready` to get the current state again, for example when your extension starts.
+
+### Runs in other terminals
+
+Each model run (never a gate's skip) is announced on `pi.events` as `loop:run`, so an extension can put it
+in a terminal multiplexer, a dashboard or a notifier, without pi-loop knowing about any of them:
+
+```js
+{ v: 1, phase: "start", loop: "backup", fire: 7, attemptId: "…", mode: "fresh",
+  name: "backup-7", title: "loop backup #7", description: "/backup · every 1h · gate: 3 new files",
+  folder: "/project", project: "/project", model: "provider/id",
+  watch: { argv: [...], env: { PI_LOOP_WATCH: "…" }, cwd: "/project", command: "cd /project && PI_LOOP_WATCH=… pi …" },
+  env: {}, waitFor(promise) {} }
+```
+
+`phase` is `start` (before the run's Pi starts), `running` (it took its prompt; `session` is its file) or
+`end` (`status`: `done`, `failed`, `cancelled`, `interrupted`, or `away` when the owner took it over;
+`findings`, `ask`). At `start`, a listener may put variables in `env` for the run's Pi (not `PI_LOOP_*`)
+and pass `waitFor` a promise to finish first (at most 5 seconds).
+
+`watch` opens a live view of the run in any terminal: the same full-screen watcher as `/loop watch`, with
+steering and Tab to take the run over there. Taking over stops the run at a safe point, and that terminal
+becomes a regular Pi on its conversation; `loop_report` still reaches the loop, and quitting it finishes
+the run as `/loop done` does. The watcher reports the run's state as the terminal's program status
+(OSC 7501: working, done, error, or blocked when it needs you). It talks to the session that runs the
+loop over a private local socket under `<agent-dir>/loop-hosts/ctl/`.
+
+For Herdr, [pi-loop-herdr](https://github.com/recursive-systems/pi-loop-herdr) does this.
 
 ## Background runs
 

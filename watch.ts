@@ -25,6 +25,8 @@ export interface WatchDeps {
 	live(): { working: boolean; lines: string[] } | undefined;
 	state(): string;
 	steer(text: string): Promise<string>;
+	/** What Esc does, in the key line (default "back"). */
+	escape?: string;
 }
 
 /** Full screen, over everything (pass as the overlay's options). */
@@ -159,6 +161,12 @@ export class RunWatch {
 	}
 
 	handleInput(data: string): void {
+		// Pasted text (a person's paste, or a multiplexer sending words to this terminal) goes into the steer line.
+		const paste = /^\x1b\[200~([\s\S]*?)(?:\x1b\[201~)?(\r|\n)?$/.exec(data);
+		if (paste) {
+			this.input += paste[1].replace(/[\r\n]+/g, " ").replace(/[\x00-\x1f]/g, "");
+			if (paste[2]) data = "\r"; else { this.tui.requestRender(); return; }
+		}
 		const page = Math.max(1, this.bodyHeight() - 2);
 		if (matchesKey(data, "escape")) { this.finish("back"); return; }
 		if (matchesKey(data, "tab")) { this.finish("take"); return; }
@@ -206,7 +214,7 @@ export class RunWatch {
 		const pad = (s: string) => truncateToWidth(s, w, "", true);
 		const head = this.fg("accent", ` loop ${this.deps.id}`) + this.fg("muted", ` · ${this.deps.state()}`) +
 			(this.scroll ? this.fg("warning", ` · ${this.scroll} lines up (End follows)`) : "");
-		const hint = this.note || "Enter steer · Tab go into the run · PgUp/PgDn scroll · ctrl+o expand tools · Esc back";
+		const hint = this.note || `Enter steer · Tab go into the run · PgUp/PgDn scroll · ctrl+o expand tools · Esc ${this.deps.escape ?? "back"}`;
 		return [
 			pad(head),
 			...view.map(pad),

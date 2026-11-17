@@ -884,6 +884,48 @@ export default function (pi: any) {
 	assert.equal(run.result, "SYNC_OK");
 });
 
+test("model runs are announced on loop:run; a listener's env reaches the run, and the watch command opens a watcher", { timeout: 120_000 }, async t => {
+	const p = project(t);
+	const heard = path.join(p.cwd, "runs.jsonl"), probe = path.join(p.cwd, "probe.ts"), seen = path.join(p.cwd, "child-env.txt");
+	// Another extension: it records loop:run and adds a variable to the run's environment, after a moment.
+	fs.writeFileSync(probe, `import fs from "node:fs";
+export default function (pi: any) {
+	if (process.env.PI_LOOP_CHILD === "1") { fs.writeFileSync(${JSON.stringify(seen)}, String(process.env.PROBE_TERMINAL)); return; }
+	pi.events.on("loop:run", (e: any) => {
+		fs.appendFileSync(${JSON.stringify(heard)}, JSON.stringify({ ...e, env: undefined, waitFor: undefined }) + "\\n");
+		if (e.phase === "start") e.waitFor(new Promise(r => setTimeout(() => { e.env.PROBE_TERMINAL = "t-" + e.name; e.env.PI_LOOP_ID = "nope"; r(0); }, 300)));
+	});
+}
+`);
+	const host = new Pi(t, p, {}, { args: ["-e", probe] });
+	await host.ready();
+	await host.command("/loop 1d --fresh say ok");
+	const id = p.loops()[0].id;
+	// Gate skips are not runs: nothing is announced for a loop that hasn't run.
+	assert.equal(fs.existsSync(heard), false);
+	await host.command(`/loop run ${id}`);
+	const events = await until("start, running and end", () => {
+		try { const all = fs.readFileSync(heard, "utf8").trim().split("\n").map(l => JSON.parse(l)); return all.some(e => e.phase === "end") && all; } catch { return false; }
+	}, 60_000);
+	assert.deepEqual(events.map((e: any) => e.phase), ["start", "running", "end"]);
+	const [start, running, end] = events;
+	assert.equal(start.v, 1);
+	assert.equal(start.name, `${id}-1`);
+	assert.equal(start.title, `loop ${id} #1`);
+	assert.match(start.description, /say ok/);
+	assert.ok(running.session && fs.existsSync(running.session));
+	assert.ok(["done", "failed"].includes(end.status));
+	assert.equal(end.attemptId, start.attemptId);
+	assert.equal(fs.readFileSync(seen, "utf8"), `t-${id}-1`, "the listener's variable reached the run; its PI_LOOP_ID was not taken");
+	// The watch command starts a watcher Pi, which loads only pi-loop and reaches the session over its socket.
+	const w = start.watch;
+	assert.ok(w.argv.length && w.env.PI_LOOP_WATCH);
+	const spec = JSON.parse(w.env.PI_LOOP_WATCH);
+	assert.equal(spec.loop, id); assert.equal(spec.fire, 1);
+	assert.ok(fs.existsSync(spec.socket), "the control socket exists");
+	assert.equal(fs.statSync(spec.socket).mode & 0o077, 0, "only this user can reach it");
+});
+
 test("a stalled child without compaction keeps the ordinary prompt acknowledgement deadline", { timeout: 90_000 }, async t => {
 	const p = project(t), pi = new Pi(t, p);
 	await pi.ready();

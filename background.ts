@@ -101,6 +101,8 @@ export function sessionFolder(root: string, cwd: string, suffix: string): string
 export function piCommand(): { cmd: string; args: string[] } {
 	const script = process.argv[1];
 	const inherited = extensionFlags(process.argv.slice(2));
+	// A compiled Pi (one binary) carries its script inside: passed again, it would be read as a message.
+	if (script && /^(\/\$bunfs\/|[A-Z]:[\\/]~BUN[\\/])/.test(script)) return { cmd: process.execPath, args: inherited };
 	if (script && fs.existsSync(script) && /\.(c|m)?js$|[/\\]pi$/.test(script)) return { cmd: process.execPath, args: [script, ...inherited] };
 	return { cmd: "pi", args: inherited };
 }
@@ -247,11 +249,23 @@ export class Run {
 		readonly loopId: string,
 		readonly fire: number,
 		readonly mode: RunMode,
-		private readonly opts: { cwd: string; sessionArgs: string[]; extra?: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv; attemptId?: string },
+		private opts: { cwd: string; sessionArgs: string[]; extra?: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv; attemptId?: string },
 	) { this.attemptId = opts.attemptId ?? randomUUID(); }
 
 	/** The model it asks Pi for (provider/id); absent = Pi's default. */
 	get model() { return this.opts.model; }
+	/** The folder its Pi works in. */
+	get cwd() { return this.opts.cwd; }
+	/** Add to its environment before it starts (other extensions' additions; never pi-loop's own variables). */
+	addEnv(env: Record<string, string>) {
+		if (this.proc) throw new Error("the run has started");
+		this.opts.env = { ...this.opts.env, ...env };
+		Object.assign(this.added, env);
+	}
+	/** What other extensions added to its environment. */
+	readonly added: Record<string, string> = {};
+	/** The extension flags it was started with beyond this Pi's own (pi-loop for another folder). */
+	get extra(): string[] { return this.opts.extra ?? []; }
 	/** Change the model before it starts (a check found the planned one unavailable). */
 	useModel(model: string, thinking?: string) {
 		if (this.proc) throw new Error("the run has started");

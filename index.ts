@@ -41,13 +41,16 @@ import {
 	type Schedule,
 } from "./schedule.ts";
 import { fileURLToPath } from "node:url";
-import { Run, RUN_MODES, extensionFlags, groundAttention, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord, type Surface } from "./background.ts";
+import { Run, RUN_MODES, extensionFlags, piCommand, groundAttention, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord, type Surface } from "./background.ts";
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
 import { DEFAULT_MODEL_BACKOFF_MS, MAX_BACKOFF_FACTOR, checkModels, holdModel, modelKey, modelList, parseModels, pickModel, readHolds, skippedFor, splitModel, writeHolds, type CheckAnswer, type Holds, type ModelSpec } from "./models.ts";
 import { LoopsView, GLYPH, type Dot, type LoopRow, type ViewAction } from "./view.ts";
 import { RunWatch, FULL_SCREEN, type WatchAction } from "./watch.ts";
+import { controlPath, serve, type Peer } from "./control.ts";
+import { standaloneWatch } from "./standalone.ts";
+import type * as net from "node:net";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
 type Phase = { state: "queued" | "running"; id: string } | undefined;
@@ -58,6 +61,8 @@ const STATUS_KEY = "loop";
 const REPORT_HINT = "When you finish, call loop_report once: findings true only if there is something the owner should see " +
 	"(false when all is as expected), a one-line summary, ask only if the owner must do something (the one thing, a few words), " +
 	"and optionally next (e.g. \"15m\") to choose when this loop runs again, or stop: true to end it.";
+/** For a background run: what it starts stays visible (a generic hint; multiplexer specifics belong to their own integrations). */
+const VISIBLE_HINT = "If you start long work (another agent, a build, a server) and a terminal multiplexer is available, start it there as a named, visible agent or program, named after this loop and the job (e.g. <loop>-<what-it-does>).";
 const TAKEOVER_NOTE = "[loop] The owner is taking over this conversation now. Stop here and reply with one line saying where you are.";
 /** How long a run gets to stop on its own when you go into it, before it is interrupted (its conversation is kept). */
 const TAKEOVER_GRACE_MS = 8_000;
@@ -68,6 +73,8 @@ const MAX_NEXT_MS = 7 * 24 * 60 * 60_000;
 /** Process-wide: background runs and the folder lock outlive one extension instance (Pi rebuilds extensions on /new, /resume and session switches). */
 interface Away { id: string; file: string; home: string; homeId?: string; fire: number; mode: RunMode; report: string; attemptId?: string; origin?: LoopOrigin; /** It was running when you went in (not just opened to read). */ live?: boolean }
 interface Note { content: string; details: Record<string, unknown> }
+/** What a standalone watcher is told about a run that is no longer live. */
+interface RunInfo { session?: string; status?: string; result?: string; ask?: string; needsYou?: boolean }
 /** What a finished run came to, collected before it is recorded. */
 interface Outcome { status: RunRecord["status"]; summary: string; findings: boolean; rep?: Report; /** It did nothing because its model was unavailable: why. */ unavailable?: Unavailable }
 interface Shared {
@@ -95,6 +102,14 @@ interface Shared {
 	launches?: WeakMap<Run, Launch>;
 	/** Run events that came while no instance was live (Pi rebuilding extensions on a switch): the next one takes them. */
 	pending: ((cur: Instance) => void | Promise<void>)[];
+	/** The event bus of the instance that owns the loops now (Pi rebuilds extensions, and may rebuild the bus, on a switch). */
+	bus?: ExtensionAPI["events"];
+	/** Recent runs by `<loop>#<fire>`, for standalone watchers of runs a newer one has replaced. */
+	runInfo?: Map<string, RunInfo>;
+	/** Runs taken over from a standalone watcher in another terminal, by loop id; the watcher's Pi is in its conversation. */
+	external?: Map<string, { away: Away; peer: Peer }>;
+	/** The local control channel standalone watchers talk to (control.ts), and its socket. */
+	control?: { server: net.Server; file: string };
 }
 interface Instance {
 	finishRun(id: string, run: Run, report: string): Promise<void>;
@@ -105,6 +120,7 @@ interface Instance {
 	judged(id: string, fire: number, verdict: Verdict, attemptId?: string, incarnation?: number): void;
 	judgeDeeply(id: string, item: JudgeItem): void;
 	deepJudged(id: string, item: JudgeItem, result: Verdict | string): void;
+	control(msg: any, peer: Peer, step: (text: string) => void): Promise<object>;
 }
 /**
  * Why a run of a loop with fallback models is taken to have done nothing for want of its model. Only these
@@ -145,6 +161,58 @@ shared.pending ??= [];
 function live(fn: (cur: Instance) => void | Promise<void>) {
 	if (shared.current) void fn(shared.current);
 	else shared.pending.push(fn);
+}
+
+/**
+ * Runs on `pi.events` (`loop:run`, v1): model runs only, never a gate's skip. `start` comes before the run's Pi
+ * starts (listeners may add to its environment then), `running` once it has accepted its prompt, `end` when it is
+ * over (or handed to the owner). A fire may have several attempts (fallback models): `attemptId` tells them apart.
+ */
+export interface RunEventBase {
+	v: 1; loop: string; fire: number; attemptId: string; mode: RunMode;
+	/** Short and safe for names: lowercase letters, digits, - and _ (`<loop>-<fire>`). */
+	name: string;
+	/** For people: "loop <id> #<fire>", and what the run is for (its prompt's first line, schedule, why it ran). */
+	title: string; description: string;
+	/** The folder its Pi works in, and the model it asks for. */
+	folder: string; model?: string;
+	/** The project whose session runs the loop. */
+	project: string;
+	/** Opens a live view of the run in any terminal: steer it, or Tab to take it over there. */
+	watch: { argv: string[]; env: Record<string, string>; cwd: string; command: string };
+}
+const runEvents = new WeakMap<Run, RunEventBase>();
+/** The longest a run waits for `start` listeners' `waitFor` promises. */
+const RUN_START_WAIT_MS = 5_000;
+const OWN_ENV = /^PI_LOOP_/;
+function emitRun(data: object) { try { shared.bus?.emit("loop:run", data); } catch { /* a listener's problem, never the run's */ } }
+/** Tell listeners a run is starting; apply what they add to its environment (bounded wait). */
+async function announceStart(run: Run, base: RunEventBase): Promise<void> {
+	runEvents.set(run, base);
+	const env: Record<string, string> = {}, waits: Promise<unknown>[] = [];
+	emitRun({ ...base, phase: "start", env, waitFor: (p: Promise<unknown>) => { waits.push(Promise.resolve(p).catch(() => undefined)); } });
+	if (waits.length) {
+		let t: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([Promise.allSettled(waits), new Promise(r => { t = setTimeout(r, RUN_START_WAIT_MS); })]);
+		if (t) clearTimeout(t);
+	}
+	const add: Record<string, string> = {};
+	for (const [k, v] of Object.entries(env)) if (typeof v === "string" && !OWN_ENV.test(k)) add[k] = v;
+	if (Object.keys(add).length) run.addEnv(add);
+}
+function announceRunning(run: Run) {
+	const base = runEvents.get(run);
+	if (base) emitRun({ ...base, phase: "running", session: run.sessionFile, ...(run.reportedModel ?? run.model ? { model: run.reportedModel ?? run.model } : {}) });
+}
+/** A run is over (done, failed, cancelled, interrupted) or handed to the owner (away): once per run. */
+function endRun(run: Run, status: string, extra: { findings?: boolean; result?: string; ask?: string; needsYou?: boolean } = {}) {
+	const base = runEvents.get(run);
+	if (!base) return;
+	runEvents.delete(run);
+	const info = (shared.runInfo ??= new Map());
+	info.set(`${run.loopId}#${run.fire}`, { session: run.sessionFile, status, ...extra });
+	if (info.size > 200) info.delete(info.keys().next().value!);
+	emitRun({ ...base, phase: "end", status, session: run.sessionFile, ...(extra.findings !== undefined ? { findings: extra.findings } : {}), ...(extra.ask ? { ask: extra.ask } : {}) });
 }
 
 const catchUpOf = (s: Schedule): "latest" | "none" => s.kind !== "every" || s.ms >= CATCH_UP_MIN_MS ? "latest" : "none";
@@ -618,6 +686,8 @@ function insideDir(cwd: string, dir: string | undefined): string | undefined {
 
 export default function loopExtension(pi: ExtensionAPI) {
 	let ctx: ExtensionContext | undefined;
+	// A run's standalone watcher (the command in loop:run events' `watch`): it shows that run, nothing else.
+	if (process.env.PI_LOOP_WATCH) { standaloneWatch(pi, process.env.PI_LOOP_WATCH); return; }
 	// A loop's background run: no loops of its own here (they belong to the session that started it), only loop_report.
 	if (process.env.PI_LOOP_CHILD === "1" && process.env.PI_LOOP_VERDICT) {
 		// A loop's deep judge: it ends with loop_verdict, not loop_report.
@@ -702,7 +772,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Background loops waiting for a slot (to say so, rather than "waiting for this session"). */
 	const slotWait = new Set<string>();
 	const reportFileOf = (l: Loop, fire: number) => path.join(stateDirOf(l), `report-${fire}.json`);
-	const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed, judged, judgeDeeply, deepJudged };
+	const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed, judged, judgeDeeply, deepJudged, control };
 	let lifecycle: LifecycleHost | undefined;
 	let reportingWarning: string | undefined;
 	function originOf(l: Loop): LoopOrigin {
@@ -736,6 +806,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		trace({ event, loop: run.origin, attemptId: run.attemptId, fire: run.fire, mode: run.mode,
 			acceptance: run.promptAccepted ? "accepted" : run.promptDispatched ? "unknown" : "not_accepted", ...extra });
 	}
+	/** The control channel standalone watchers talk to: one per process, answered by the live instance. */
+	function startControl() {
+		if (shared.control) return;
+		try {
+			const file = controlPath(agentDir());
+			const server = serve(file, (msg, peer, step) => shared.current ? shared.current.control(msg, peer, step) : Promise.resolve({ error: "the session that runs this loop is switching; try again" }));
+			shared.control = { server, file };
+		} catch { /* no control channel: runs still run; their watchers say the session is unreachable */ }
+	}
 	/** Every acquisition path must attach callbacks and drain events, including a late retry. */
 	function activateOwner(reload = true) {
 		if (reload) { loops = load(); holds = loadHolds(); }
@@ -743,6 +822,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		syncDeclared(); reconcile();
 		if (!holding()) return;
 		shared.current = self;
+		shared.bus = pi.events;
+		startControl();
 		drain();
 		interrupted();
 		refreshStatus();
@@ -963,7 +1044,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const head = (readOnly ? `(read-only: loops owned by pid ${ownerPid()})\n` : "") + (shared.away ? `(you are in ${shared.away.id}'s run: /loop leave lets it carry on, /loop done finishes it)\n` : "");
 		return head + loops.map(l => {
 			const live = shared.runs.get(l.id);
-			const state = live ? `running in background (${live.mode}, ${live.working ? "working" : "idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
+			const state = live ? `running in background (${live.mode}, ${live.working ? "working" : "idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : shared.external?.has(l.id) ? "taken over in another terminal" : l.paused ? "paused" : `next ${when(l)}`;
 			const p = l.prompt.length > 70 ? `${l.prompt.slice(0, 67)}…` : l.prompt;
 			const extra = [background(l) ? `runs in background: ${l.run}` : "runs in this conversation (foreground)", modelText(l), l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "",
 				l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "", slotWait.has(l.id) ? `waiting for a background slot (loop.maxBackground ${maxBackground})` : waited.has(l.id) ? "waiting for this session to be free" : ""].filter(Boolean);
@@ -1265,7 +1346,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function runText(l: Loop, fireNo: number, reason: Reason, gate?: GateDecision, mode?: RunMode): { text: string; expand: boolean } {
 		const why = gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : "";
 		const header = `[loop ${l.id} · ${desc(l)} · fire #${fireNo}${mode ? ` · background ${mode}` : ""}${reason === "due" ? "" : ` · ${reason}`}${why}]`;
-		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${REPORT_HINT}`;
+		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${REPORT_HINT}${mode ? ` ${VISIBLE_HINT}` : ""}`;
 		let commands: CommandInfo[] = [];
 		try { commands = (pi as any).getCommands?.() ?? []; } catch { /* older Pi */ }
 		return compose(l.prompt, header + loopContext(l), evidence, home(l), commands, !!l.dir);
@@ -1369,7 +1450,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function fireBackground(l: Loop & { run: RunMode }, reason: Reason, gate?: GateDecision): string | undefined {
 		// Its deep judge is still deciding about its last run: the next fire waits for it.
 		if (shared.runs.has(l.id) || shared.judging?.has(l.id)) { shared.again.add(l.id); return; }
-		if ((shared.away ?? shared.leaving)?.id === l.id) { shared.again.add(l.id); return; }
+		if ((shared.away ?? shared.leaving)?.id === l.id || shared.external?.has(l.id)) { shared.again.add(l.id); return; }
 		const now = Date.now();
 		if (overLimit()) {
 			// Its turn waits for a slot (loop.maxBackground); a gate's wake is kept.
@@ -1394,7 +1475,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const composed = runText(l, fireNo, reason, gate, s.mode);
 			// Commands must be their own message; skills allow a header after the name.
 			const head = `[loop ${l.id} · ${desc(l)} · fire #${fireNo} · background ${s.mode}${reason === "due" ? "" : ` · ${reason}`}${gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : ""}]`;
-			const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${REPORT_HINT}`;
+			const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${REPORT_HINT} ${VISIBLE_HINT}`;
 			text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
 				: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
 			meta = runMeta(l, fireNo, reason, gate, s.mode);
@@ -1424,6 +1505,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		a.noCredentials = false;
 		void (async () => {
 			try {
+				await announceStart(run, runEvent(l, run, a.meta.by, a.gate));
 				if (a.chain.length > 1) {
 					if (!a.tried.length) {
 						const check = await checkNow(l.id, a.chain);
@@ -1454,6 +1536,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 				return;
 			}
 			if (run.handedOver) return;
+			announceRunning(run);
 			live(cur => cur.runStarted(l.id, run, a.note, a.meta));
 			await watchRun(run, a.report);
 		})();
@@ -1571,6 +1654,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	function runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision) {
 		if (run.handedOver || run.recorded) return;
+		endRun(run, "failed", { findings: true, result: `couldn't start: ${why}` });
 		const cur = loops.find(x => x.id === id);
 		const uncertain = run.promptUncertain || run.promptDispatched === undefined; // Older active code has no dispatch proof.
 		traceRun(run, "terminal", { status: "failed", error: true, session: run.sessionFile });
@@ -1655,6 +1739,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const l = candidate && sameRun(candidate, run) ? candidate : undefined;
 		const ask = o.rep?.ask?.trim() || undefined;
 		traceRun(run, "terminal", { status: o.status, session: run.sessionFile, findings: o.findings, hasAsk: !!ask, needsPermission: !!run.needsYou, error: o.status === "failed" });
+		endRun(run, o.status, { findings: o.findings, result: o.summary.slice(0, 500), ...(ask ? { ask } : {}), ...(run.needsYou ? { needsYou: true } : {}) });
 		// A model that served a run is available. One that couldn't, for want of it, is held back and the fire
 		// goes on on the next model; that attempt leaves no record of its own (the next run's passedOver has it).
 		if (l && run.model && o.status === "done") releaseModel(l, run.model);
@@ -1910,6 +1995,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	async function takeOver(id: string, now: boolean, cctx: any, anyway = false): Promise<string | undefined> {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}`;
 		if (shared.away) return `you are already in ${shared.away.id}'s run; /loop leave or /loop done first`;
+		if (shared.external?.has(id) || shared.external?.has(find(id)?.id ?? "")) return `${id}'s run has been taken over in another terminal`;
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
 		const run = shared.runs.get(l.id);
@@ -1934,21 +2020,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		try {
 			if (!cctx.isIdle?.()) { step("stopping this conversation's turn"); cctx.abort?.(); }
 			await cctx.waitForIdle?.();
-			if (run) {
-				run.handedOver = true;
-				if (run.working) {
-					// A few seconds to stop at a safe point and say where it is; then it is interrupted.
-					if (now) { step("interrupting its run"); await run.abort(); }
-					else {
-						step("asking its run to stop");
-						await run.steer(TAKEOVER_NOTE);
-						if (!(await run.waitIdle(TAKEOVER_GRACE_MS))) { step("interrupting its run"); await run.abort(); }
-					}
-				}
-				step("opening its conversation");
-				await run.stop();
-				shared.runs.delete(l.id);
-			}
+			if (run) await stopForTakeover(l, run, now, step);
 		} finally { step(undefined); }
 		const fireNo = run?.fire ?? l.lastRun?.fire ?? l.fires;
 		const prev = l.lastRun;
@@ -1972,6 +2044,110 @@ export default function loopExtension(pi: ExtensionAPI) {
 			return "couldn't switch into the run";
 		}
 		return undefined;
+	}
+
+	/** What `loop:run` says about a run of `l` (see RunEventBase). */
+	function runEvent(l: Loop, run: Run, by: string, gate?: GateDecision): RunEventBase {
+		const first = l.prompt.split("\n").find(x => x.trim())?.trim().slice(0, 160) ?? l.id;
+		const why = gate ? `${by}: ${gate.reason.replace(/\s+/g, " ").trim().slice(0, 160)}` : by;
+		const me = selfPath();
+		// This Pi's own program (and script, when it runs as one), with only pi-loop: the watcher needs nothing else.
+		const { cmd, args } = piCommand();
+		const script = args[0] && !args[0].startsWith("-") ? [args[0]] : [];
+		const bin = cmd;
+		const argv = [bin, ...script, "-ne", ...(me ? ["-e", me] : []), "--no-session"];
+		// The watcher reports the run's state as its program status, instead of its own Pi's.
+		const env: Record<string, string> = { PI_LOOP_WATCH: JSON.stringify({ socket: shared.control?.file ?? "", loop: l.id, fire: run.fire }), PI_PROGRAM_STATUS: "0" };
+		if (process.env.PI_CODING_AGENT_DIR) env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
+		const q = (s: string) => /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+		return {
+			v: 1, loop: l.id, fire: run.fire, attemptId: run.attemptId, mode: run.mode,
+			name: `${l.id}-${run.fire}`.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
+			title: `loop ${l.id} #${run.fire}`,
+			description: `${first} · ${desc(l)} · ${why}`,
+			folder: run.cwd, ...(run.model ? { model: run.model } : {}), project: ctx?.cwd ?? run.cwd,
+			watch: { argv, env, cwd: run.cwd, command: `cd ${q(run.cwd)} && ${Object.entries(env).map(([k, v]) => `${k}=${q(v)}`).join(" ")} ${argv.map(q).join(" ")}` },
+		};
+	}
+
+	/** A standalone watcher's request, over the control channel (control.ts). */
+	async function control(msg: any, peer: Peer, step: (text: string) => void): Promise<object> {
+		const l = typeof msg?.loop === "string" ? loops.find(x => x.id === msg.loop) : undefined;
+		const fireNo = Number(msg?.fire);
+		if (!l) return { error: `no loop "${msg?.loop}" here any more` };
+		const run = shared.runs.get(l.id);
+		const mine = run && run.fire === fireNo ? run : undefined;
+		const ext = shared.external?.get(l.id);
+		switch (msg.op) {
+			case "state": {
+				const newer = l.lastRun && l.lastRun.fire > fireNo ? { newer: l.lastRun.fire } : {};
+				if (mine) return { live: true, session: mine.sessionFile, working: mine.working, backgroundWork: mine.backgroundWork, status: "running" };
+				if (shared.away?.id === l.id && shared.away.fire === fireNo) return { away: "here", session: shared.away.file };
+				if (ext && ext.away.fire === fireNo) return { away: ext.peer === peer ? "here" : "elsewhere", session: ext.away.file };
+				const info = shared.runInfo?.get(`${l.id}#${fireNo}`);
+				const r = l.lastRun?.fire === fireNo ? l.lastRun : undefined;
+				if (r) return { session: r.session ?? info?.session, status: r.status, result: r.result?.slice(0, 500), ask: r.ask, needsYou: !!r.needsYou || (r.surface === "needs_you" && !r.dismissed), ...newer };
+				if (info) return { ...info, ...newer };
+				return { status: "starting", ...newer };
+			}
+			case "steer": {
+				const text = String(msg.text ?? "").trim();
+				if (!text) return { text: "nothing to send" };
+				if (!mine && l.lastRun?.fire !== fireNo) return { error: `run #${fireNo} has been replaced by #${l.lastRun?.fire}` };
+				return { text: await steerRun(l.id, text) };
+			}
+			case "take": {
+				if (readOnly) return { error: `loops are owned by pid ${ownerPid()}` };
+				if (shared.away?.id === l.id) return { error: "the owner is in this run in the session that runs the loop" };
+				if (ext) return { error: "it is already taken over in another terminal" };
+				if (!mine && l.lastRun?.fire !== fireNo) return { error: `run #${fireNo} has been replaced by #${l.lastRun?.fire}` };
+				if (!mine && run) return { error: "another run of this loop is going" };
+				const file = mine?.sessionFile ?? l.lastRun?.session;
+				if (!file) return { error: "it has no conversation yet" };
+				let place: ReturnType<typeof runPlace>;
+				try { place = runPlace(l); } catch (e) { return { error: (e as Error).message }; }
+				if (mine) await stopForTakeover(l, mine, false, step);
+				const report = reportFileOf(l, fireNo);
+				const away: Away = { id: l.id, file, home: "", attemptId: mine?.attemptId ?? l.lastRun?.attemptId, origin: mine?.origin ?? originOf(l), fire: fireNo, mode: mine?.mode ?? l.lastRun?.mode ?? "fresh", report, live: !!mine };
+				(shared.external ??= new Map()).set(l.id, { away, peer });
+				l.lastRun = { ...(l.lastRun ?? { fire: fireNo, mode: away.mode, startedAt: Date.now() }), status: "away", session: file, unread: false, host: process.pid };
+				if (mine) traceRun(mine, "handoff", { status: "away", session: file });
+				save(); refreshStatus();
+				// The watcher's terminal closed without saying it finished: the run is over, recorded as /loop done would.
+				peer.onClose(() => { if (shared.external?.get(l.id)?.away === away) live(cur => cur.control({ op: "finished", loop: l.id, fire: fireNo }, peer, () => {})); });
+				const { cmd: bin, args } = piCommand();
+				const env = { ...childEnv(l, report), ...(mine?.added ?? {}) };
+				const keep: Record<string, string> = {};
+				for (const [k, v] of Object.entries(env)) if (typeof v === "string" && (OWN_ENV.test(k) || mine?.added[k] !== undefined)) keep[k] = v;
+				delete keep.PI_LOOP_RUN;
+				return { argv: [bin, ...args, ...place.extra, "--session", file], env: keep, cwd: place.cwd };
+			}
+			case "finished": {
+				if (!ext || ext.away.fire !== fireNo) return { text: "nothing to finish" };
+				shared.external!.delete(l.id);
+				await afterLeave(ext.away, true);
+				return { text: "recorded" };
+			}
+		}
+		return { error: `unknown request ${msg?.op}` };
+	}
+
+	/** A live run stops at a safe point (or now) and its Pi exits, so its conversation can be handed to you. */
+	async function stopForTakeover(l: Loop, run: Run, now: boolean, step: (s: string) => void) {
+		run.handedOver = true;
+		if (run.working) {
+			// A few seconds to stop at a safe point and say where it is; then it is interrupted.
+			if (now) { step("interrupting its run"); await run.abort(); }
+			else {
+				step("asking its run to stop");
+				await run.steer(TAKEOVER_NOTE);
+				if (!(await run.waitIdle(TAKEOVER_GRACE_MS))) { step("interrupting its run"); await run.abort(); }
+			}
+		}
+		step("opening its conversation");
+		await run.stop();
+		if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
+		endRun(run, "away");
 	}
 
 	/** Back to the main session: the run carries on in the background (leave) or is finished (done). */
@@ -2018,7 +2194,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		shared.runs.set(l.id, run);
 		l.lastRun = { ...(l.lastRun ?? { fire: a.fire, mode: a.mode, startedAt: Date.now() }), attemptId: run.attemptId, acceptance: "unknown", status: "starting", session: a.file, host: process.pid };
 		save(); refreshStatus(); flushNotes();
-		try { await run.start(); if (!run.handedOver) await run.prompt(CONTINUE_NOTE); }
+		try { await announceStart(run, runEvent(l, run, "leave")); await run.start(); if (!run.handedOver) await run.prompt(CONTINUE_NOTE); }
 		catch (e) {
 			if (run.handedOver) return;
 			await run.stop(); if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
@@ -2027,6 +2203,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		if (run.handedOver) return;
 		traceRun(run, "accepted", { session: run.sessionFile });
+		announceRunning(run);
 		if (l.lastRun?.attemptId === run.attemptId) { l.lastRun.status = "running"; l.lastRun.acceptance = "accepted"; save(); refreshStatus(); }
 		void watchRun(run, a.report);
 	}
@@ -2055,6 +2232,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			while (shared.runs.get(l!.id) === run && Date.now() < end) await new Promise(r => setTimeout(r, 200));
 			run = shared.runs.get(l!.id);
 		}
+		if (!run && l && shared.external?.has(l.id)) return `${l.id}'s run has been taken over in another terminal; talk to it there`;
 		if (!run && l && loops.includes(l) && l.lastRun?.session && !readOnly && shared.away?.id !== l.id) return resumeRun(l, text);
 		if (!run) return `${l?.id ?? id} has no run in the background${l?.lastRun?.session ? `; /loop open ${l.id} goes into its last one` : ""}`;
 		const err = await run.steer(text);
@@ -2075,7 +2253,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		shared.runs.set(l.id, run);
 		l.lastRun = { ...r, attemptId: run.attemptId, acceptance: "unknown", status: "starting", unread: false, host: process.pid };
 		save(); refreshStatus();
-		try { await run.start(); if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · ${from}]\n${text}\n\n${REPORT_HINT}`); }
+		try { await announceStart(run, runEvent(l, run, "resume")); await run.start(); if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · ${from}]\n${text}\n\n${REPORT_HINT}`); }
 		catch (e) {
 			if (run.handedOver) return `${l.id}'s run is yours now`;
 			await run.stop(); if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
@@ -2084,6 +2262,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		if (run.handedOver) return `${l.id}'s run is yours now`;
 		traceRun(run, "accepted", { session: run.sessionFile });
+		announceRunning(run);
 		if (l.lastRun?.attemptId === run.attemptId) { l.lastRun.status = "running"; l.lastRun.acceptance = "accepted"; save(); refreshStatus(); }
 		void watchRun(run, report);
 		return `${l.id}'s run #${r.fire} carries on in the background with your words`;
@@ -2094,7 +2273,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return loops.map(l => {
 			const live = shared.runs.get(l.id);
 			const r = l.lastRun;
-			const state = live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : l.paused ? "paused" : `next ${when(l)}`;
+			const state = live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : shared.external?.has(l.id) ? "taken over in another terminal" : l.paused ? "paused" : `next ${when(l)}`;
 			const detail = [desc(l), background(l) ? `background ${l.run}` : "in conversation (foreground)", modelText(l), l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
 				r && !live ? `last #${r.fire} ${r.status}${r.result ? `: ${r.result.split("\n")[0]}` : ""}${r.needsYou ? ` · needs you` : ""}` : ""].filter(Boolean).join(" · ");
 			const dot = loopDot(l, Date.now());
@@ -2559,7 +2738,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 			const r = l.lastRun;
 			if (!r || !["starting", "running", "away"].includes(r.status) || shared.runs.has(l.id)) continue;
-			if (r.host === process.pid && shared.away?.id === l.id) continue;
+			if (r.host === process.pid && (shared.away?.id === l.id || shared.external?.has(l.id))) continue;
 			// A crash before the accepted callback can hide an executed prompt with the SAME fire number.
 			if (r.status === "starting" || r.acceptance === "unknown") l.paused = true;
 			trace({ event: "interruption", loop: originOf(l), attemptId: r.attemptId, fire: r.fire, mode: r.mode, status: "interrupted", acceptance: r.acceptance ?? "unknown", session: r.session });
@@ -2622,6 +2801,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!event?.reason || event.reason === "quit") {
 			const stopping = [...shared.runs].map(([id, run]) => {
 				run.handedOver = true;
+				endRun(run, "interrupted");
 				traceRun(run, "interruption", { status: "interrupted", session: run.sessionFile });
 				const l = loops.find(x => x.id === id);
 				if (l?.lastRun && !readOnly && sameRun(l, run)) {
@@ -2642,6 +2822,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			await Promise.all(stopping);
 			shared.pending.length = 0;
 			shared.runs.clear();
+			if (shared.control) { try { shared.control.server.close(); fs.rmSync(shared.control.file, { force: true }); } catch { /* gone */ } shared.control = undefined; }
+			shared.bus = undefined;
 			if (!readOnly) save();
 			releaseLock();
 			shared.lock = undefined; shared.lockPath = undefined;

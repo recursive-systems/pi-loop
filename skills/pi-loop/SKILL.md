@@ -147,3 +147,12 @@ alive for the native completion. You can end the launch turn and let that notice
 conversation. Process the answer before calling `loop_report`; launching a reader is not finishing
 the job. This protects normal completion delivery, not recovery after a crash or exactly-once side
 effects. Check durable job records before any manual recovery or retry.
+
+Long work a run starts (another agent, a build, a server) should stay visible: if a terminal
+multiplexer is available, start it there as a named agent or program, named after the job and what it
+does (e.g. `codebase-health-split-store`), not anonymously in the background. An integration for the
+multiplexer may already place the run itself in its own terminal, so what it starts sits under it.
+
+Other extensions can follow model runs on `pi.events` `loop:run` (start, running, end; never a gate's
+skip). Each event names the run (`name`, `title`, `description`) and gives `watch`: a command that
+opens a live view of it in any terminal, to steer it or take it over there (Tab).

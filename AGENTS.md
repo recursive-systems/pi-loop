@@ -9,7 +9,7 @@ no mode migrate to forks on load. Optional gates decide whether a due loop wakes
   holds intervals, daily times and DST. `gate.ts` runs gates. `models.ts` holds model fallback
   (lists, held-back models, the optional check command). `prompt.ts` builds a fire's
   message. `background.ts` runs a loop's turn in a child Pi over RPC (fork, thread or fresh) and
-  `view.ts` is the loops view and `watch.ts` a run full screen, drawn with Pi's own message components. `liveness.ts` is explicitly loaded in each RPC child: it implements the
+  `view.ts` is the loops view and `watch.ts` a run full screen, drawn with Pi's own message components. `standalone.ts` is that watcher on its own (a Pi started with `PI_LOOP_WATCH`), and `control.ts` the private local socket it uses to reach the owning session (state, steer, take over, finished). `liveness.ts` is explicitly loaded in each RPC child: it implements the
   optional session-liveness v1 host contract and sends only busy/idle/error, so a settled turn with
   detached work or queued completions is not mistaken for a completed loop. Background runs and the folder lock live process-wide (`shared` in
   `index.ts`), because Pi rebuilds extensions on every session switch. Every folder-lock acquisition
@@ -45,7 +45,7 @@ no mode migrate to forks on load. Optional gates decide whether a due loop wakes
   retried after reconciliation, a host must treat the same id/fire as the same occurrence. Preserve
   that contract, folder locks, kept wakes and draining gates at shutdown.
 - The `[loop <id> · … ]` header line is a public contract. Change it only in a major version. So are
-  the `pi.events` channels (`statusbar:*`, `loop:state` v1 and `loop:ready`): hosts such as
+  the `pi.events` channels (`statusbar:*`, `loop:state` v1, `loop:run` v1 and `loop:ready`): hosts such as
   multiplexers adapt to them in their own extensions, never here.
 
 ## Writing for people
