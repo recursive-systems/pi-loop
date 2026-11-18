@@ -51,6 +51,12 @@ the loop is due and prints one JSON line as its last line of output:
 - An error (non-zero exit, timeout, no JSON) wakes the model once, then reminds every 6 h until
   the gate works again. `gateOnError: "skip"` reverses that. `maxSleep` wakes the model anyway
   once that long has passed since the last wake: a heartbeat.
+- A gated loop keeps its checks. A run's `loop_report` `next` can bring the next check forward
+  (`2m` while something is changing) but never push it back: a later `next` is ignored, for
+  every fixed schedule (`every`, `at`) and for heartbeat runs too. Don't tell such a run to
+  pass `next` to "back off"; if a check should be rarer, change the loop's `every` or the
+  gate (a gate can `skip` cheaply). Self-paced loops (`every: auto`) and loops without a gate
+  still choose their own next time.
 
 Make gates cheap and honest:
 
@@ -124,7 +130,8 @@ One session can carry several responsibilities, each a loop:
   folder's settings, tools and prompts. The machine's own pi-loop must be 0.5 or later.
 - **Watching something for a while** (a deploy, a PR, a migration): an ad hoc loop with `every: auto`
   and `for` (how long at most). Each run picks the next time with `loop_report` `next` (short while it
-  changes, long when quiet) and ends the loop with `stop: true` when it's done. Ad hoc loops end after
+  changes, long when quiet) and ends the loop with `stop: true` when it's done. (Only self-paced loops pick their own time
+  freely; on a gated loop with a fixed schedule `next` can't delay a check.) Ad hoc loops end after
   7 days unless `for`/`until` says otherwise; standing jobs belong in `.pi/loop.json`.
 
 ## 6. When it fires
@@ -134,7 +141,8 @@ result where it says, and keep "nothing to do" turns to one line. End with `loop
 true only if there is something the owner should see (a background run with no findings stays
 quiet), a one-line summary, `ask` only when the owner must do something only they can (the one
 thing, a few words: "Reconnect Stripe in Executor"; it is shown to them as is), and `next` or `stop`
-when the timing should change. A classifier, then a deep judge (a background Pi that looks
+when the timing should change. On a loop with a gate and a fixed schedule `next` can only bring
+the next check sooner; leave it out when nothing is changing. A classifier, then a deep judge (a background Pi that looks
 at the owner's past answers and other loops' asks), decide whether it interrupts the owner; the deep
 judge may instead hold it, drop it, or return an answer to the loop. A message or prompt section
 saying your last report was answered without the owner is that answer: act on it. When the owner says what a

@@ -1778,3 +1778,114 @@ test("a gate's wake is recorded as by the gate, with its reason", { timeout: 120
 	const i = log.findIndex(e => e.action === "fired" && e.fire === r.fire);
 	assert.ok(i > 0 && log[i - 1].action === "wake" && log[i - 1].reason === "queue grew", JSON.stringify(log));
 });
+
+// ---- loop_report `next` on a loop that has a gate and a fixed schedule: it may bring the next check forward, never push it back.
+// These run on the closed provider, so no model writes the report. A probe extension puts the report where loop_report
+// would (the loop's report-<fire>.json, read when the turn settles); everything else is pi-loop's own code.
+
+const MIN = 60_000;
+/** A session whose loops' reports come from `reports/<id>.json`, written into place as each loop's turn starts. */
+async function reportingSession(t: any, loops: any[], reports: Record<string, object>) {
+	const quiet = '#!/bin/sh\necho \'{"action":"skip","reason":"quiet"}\'\n';
+	const p = project(t, { loops, gates: { quiet } });
+	fs.mkdirSync(path.join(p.cwd, "reports"));
+	for (const [id, body] of Object.entries(reports)) fs.writeFileSync(path.join(p.cwd, "reports", `${id}.json`), JSON.stringify({ findings: false, summary: "ok", ...body }));
+	const probe = path.join(p.cwd, "report-probe.ts");
+	fs.writeFileSync(probe, `import fs from "node:fs";
+import path from "node:path";
+const cwd = ${JSON.stringify(p.cwd)};
+export default function (pi: any) {
+	if (process.env.PI_LOOP_CHILD === "1") return;
+	pi.on("before_agent_start", (e: any) => {
+		const m = /\\[loop (\\S+) · .*? · fire #(\\d+)/.exec(String(e.prompt ?? ""));
+		if (!m || !fs.existsSync(path.join(cwd, "reports", m[1] + ".json"))) return;
+		const to = path.join(cwd, ".pi/loop-state", m[1], "report-" + m[2] + ".json");
+		fs.mkdirSync(path.dirname(to), { recursive: true });
+		fs.copyFileSync(path.join(cwd, "reports", m[1] + ".json"), to);
+	});
+}
+`);
+	const pi = new Pi(t, p, {}, { args: ["-e", probe] });
+	await pi.ready();
+	return { p, pi };
+}
+/** Fire `id` by hand and wait until its turn has settled and its report has been applied. */
+async function runByHand(p: { loops: () => any[] }, pi: Pi, id: string) {
+	assert.match(await pi.command(`/loop run ${id}`), new RegExp(`fired ${id}`));
+	return until(`${id}'s turn settled`, () => { const l = loopOf(p, id); return l && l.fires === 1 && !l.foregroundAttempt && l; }, 60_000);
+}
+const gated = { command: ".pi/gates/quiet", timeoutMs: 10_000, onError: "wake" };
+const everyMin = (m: number) => ({ kind: "every", ms: m * MIN });
+
+test("a gated loop on an interval: a run's next can bring its check forward, never push it back; an ungated loop still chooses", { timeout: 120_000 }, async t => {
+	const now = Date.now();
+	const later = now + 10 * MIN, sooner = now + 50 * MIN, ungated = now + 50 * MIN;
+	const { p, pi } = await reportingSession(t, [
+		due("later", { schedule: everyMin(15), gate: gated, nextAt: later }),
+		due("sooner", { schedule: everyMin(60), gate: gated, nextAt: sooner }),
+		due("plain", { schedule: everyMin(60), nextAt: ungated }),
+	], { later: { next: "1d" }, sooner: { next: "2m" }, plain: { next: "1d" } });
+	assert.equal((await runByHand(p, pi, "later")).nextAt, later, "next 1d on a 15m gated loop: the check stays where it was");
+	const s = await runByHand(p, pi, "sooner");
+	assert.ok(s.nextAt > Date.now() + 1 * MIN && s.nextAt <= Date.now() + 2 * MIN, `next 2m brings the check forward: in ${((s.nextAt - Date.now()) / MIN).toFixed(1)}m`);
+	assert.ok((await runByHand(p, pi, "plain")).nextAt > Date.now() + 23 * 60 * MIN, "without a gate the run's own check is the loop: next 1d stands");
+	// The run is told which it is.
+	const said = (id: string) => pi.userMessages().find(m => m.startsWith(`[loop ${id} `))!;
+	assert.match(said("later"), /sooner than its schedule \(its checks can't be postponed\)/);
+	assert.match(said("plain"), /to choose when this loop runs again/);
+});
+
+test("a gated daily `at` loop keeps its time of day: next 1d no longer moves it, next 1h still brings it forward", { timeout: 120_000 }, async t => {
+	// A time of day about 3 hours ahead (in UTC, so the zone is no part of the question).
+	const at = new Date(Math.floor((Date.now() + 187 * MIN) / MIN) * MIN);
+	const schedule = { kind: "at", hh: at.getUTCHours(), mm: at.getUTCMinutes() };
+	const { p, pi } = await reportingSession(t, [
+		due("daily", { schedule, tz: "UTC", gate: gated, nextAt: at.getTime() }),
+		due("daily-soon", { schedule, tz: "UTC", gate: gated, nextAt: at.getTime() }),
+	], { daily: { next: "1d" }, "daily-soon": { next: "1h" } });
+	assert.equal((await runByHand(p, pi, "daily")).nextAt, at.getTime(), "still the same minute of the day, not a day from the run");
+	const s = await runByHand(p, pi, "daily-soon");
+	assert.ok(s.nextAt > Date.now() + 50 * MIN && s.nextAt <= Date.now() + 60 * MIN, "an earlier next still moves it");
+});
+
+test("a self-paced loop keeps choosing its own time, gate or not, later than its fallback too", { timeout: 120_000 }, async t => {
+	const { p, pi } = await reportingSession(t, [
+		due("auto-gated", { schedule: { kind: "auto" }, gate: gated, nextAt: Date.now() + 20 * MIN }),
+		due("auto", { schedule: { kind: "auto" }, nextAt: Date.now() + 20 * MIN }),
+	], { "auto-gated": { next: "45m" }, auto: { next: "3h" } });
+	const g = await runByHand(p, pi, "auto-gated");
+	assert.ok(g.nextAt > Date.now() + 44 * MIN && g.nextAt <= Date.now() + 45 * MIN, "45m, later than the 20m it would have had");
+	const a = await runByHand(p, pi, "auto");
+	assert.ok(a.nextAt > Date.now() + 179 * MIN && a.nextAt <= Date.now() + 180 * MIN);
+});
+
+test("a gated loop's run can still stop it", { timeout: 120_000 }, async t => {
+	const { p, pi } = await reportingSession(t, [
+		due("done", { schedule: everyMin(15), gate: gated, nextAt: Date.now() + 10 * MIN }),
+	], { done: { stop: true, next: "1d" } });
+	assert.match(await pi.command("/loop run done"), /fired done/);
+	await until("the loop gone", () => !loopOf(p, "done"), 60_000);
+});
+
+test("scheduled runs follow the same rule: a gate's wake, and a maxSleep heartbeat that wakes the model without asking the gate", { timeout: 180_000 }, async t => {
+	const wake = '#!/bin/sh\necho \'{"action":"wake","reason":"queue grew"}\'\n';
+	const { p, pi } = await reportingSession(t, [
+		due("woken", { schedule: everyMin(15), gate: { command: ".pi/gates/wake", timeoutMs: 10_000, onError: "wake" } }),
+		due("beat", { schedule: everyMin(15), gate: { ...gated, maxSleepMs: MIN } }),
+	], { woken: { next: "1d" }, beat: { next: "1d" } });
+	fs.writeFileSync(path.join(p.cwd, ".pi/gates/wake"), wake, { mode: 0o755 });
+	const settled = (id: string) => until(`${id} ran and settled`, () => { const l = loopOf(p, id); return l && l.fires === 1 && !l.foregroundAttempt && l; }, 100_000);
+	const beat = await settled("beat"), woken = await settled("woken");
+	assert.match(pi.userMessages().find(m => m.startsWith("[loop beat "))!, /gate: max sleep 1m reached; gate not consulted/);
+	assert.match(pi.userMessages().find(m => m.startsWith("[loop woken "))!, /gate: queue grew/);
+	for (const l of [beat, woken]) assert.ok(l.nextAt > Date.now() && l.nextAt <= Date.now() + 15 * MIN, `${l.id}: its next check is still within its 15m schedule (in ${((l.nextAt - Date.now()) / MIN).toFixed(1)}m)`);
+});
+
+test("a gated background loop's run (a real model's loop_report) cannot postpone its checks either", { skip: real, timeout: 420_000 }, async t => {
+	const quiet = '#!/bin/sh\necho \'{"action":"skip","reason":"quiet"}\'\n';
+	const later = Date.now() + 30 * MIN;
+	const { p, pi } = await bgSession(t, { gates: { quiet }, loops: [due("bg", { run: "fresh", prompt: `Call loop_report with findings false, summary "slow down" and next "1d". Do nothing else.`, schedule: everyMin(60), gate: gated, nextAt: later })] });
+	await pi.command("/loop run bg");
+	const l = await until("the run done", () => loopOf(p, "bg")?.lastRun?.status === "done" && loopOf(p, "bg"));
+	assert.equal(l.nextAt, later, "next 1d did not move a check that was 30m away");
+});

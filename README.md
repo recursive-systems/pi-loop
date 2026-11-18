@@ -213,7 +213,7 @@ releases refuse a list declared in `.pi/loop.json`, and pass one saved by `loop_
 single comma-joined value, which fails.
 
 Each run ends with `loop_report`: whether it found something, one line, and optionally when to run
-next or to stop. Only reports that need you enter the conversation; other results stay in the loops
+next (only sooner, on a gated loop with a fixed schedule) or to stop. Only reports that need you enter the conversation; other results stay in the loops
 view, as described above.
 
 A run stays alive while a compatible extension reports outstanding background work or a pending
@@ -244,6 +244,11 @@ A gate is an executable in your project. It prints one line of JSON:
 context. `defer` asks again later (`"retryIn": "2m"`). A gate that crashes wakes the model
 once, so a bug can't keep it asleep forever. The model attaches a gate with `loop_manage`
 (`gate=.pi/gates/check`).
+
+A gate's checks keep their schedule. When a run on a gated loop with a fixed schedule (`every` or `at`)
+reports `next`, it can bring the next check forward (`2m` while something changes) but not push it back:
+a later `next` is ignored, so a run can't switch its own gate off. This holds for runs the gate woke and for
+`maxSleep` heartbeats. A loop without a gate, and a self-paced loop (`auto`), still choose their own next time.
 
 ## Keeping loops cheap
 

@@ -57,10 +57,17 @@ type Phase = { state: "queued" | "running"; id: string } | undefined;
 type LoopMode = RunMode | "foreground";
 
 const STATUS_KEY = "loop";
+/**
+ * A loop with a gate and a fixed schedule (every / at) keeps its checks: a run's `next` may bring the next one
+ * forward, never push it back. Self-paced loops, and loops with no gate (their run is the check), choose their own time.
+ */
+const keepsChecks = (l: Loop) => !!l.gate && l.schedule.kind !== "auto";
 /** What a loop run is asked to do at the end, so findings and pacing don't depend on its wording. */
-const REPORT_HINT = "When you finish, call loop_report once: findings true only if there is something the owner should see " +
+const reportHint = (l: Loop) => "When you finish, call loop_report once: findings true only if there is something the owner should see " +
 	"(false when all is as expected), a one-line summary, ask only if the owner must do something (the one thing, a few words), " +
-	"and optionally next (e.g. \"15m\") to choose when this loop runs again, or stop: true to end it.";
+	(keepsChecks(l)
+		? "and optionally next (e.g. \"2m\") to have this loop checked sooner than its schedule (its checks can't be postponed), or stop: true to end it."
+		: "and optionally next (e.g. \"15m\") to choose when this loop runs again, or stop: true to end it.");
 /** For a background run: what it starts stays visible (a generic hint; multiplexer specifics belong to their own integrations). */
 const VISIBLE_HINT = "If you start long work (another agent, a build, a server) and a terminal multiplexer is available, start it there as a named, visible agent or program, named after this loop and the job (e.g. <loop>-<what-it-does>).";
 const TAKEOVER_NOTE = "[loop] The owner is taking over this conversation now. Stop here and reply with one line saying where you are.";
@@ -570,13 +577,13 @@ function registerReportTool(pi: ExtensionAPI, file: () => string | undefined, ru
 		description: (run
 			? `This whole conversation is loop ${run}'s background run, including the owner's later words to it: call this once at the end of each run of it (again after his later words), saying whether it found something the owner should see, `
 			: "Only in a loop's turn (its message starts with [loop <id> ...]): say whether this run found something the owner should see, ") +
-			"in one line, and optionally when the loop should run next or that it should stop." + (run ? "" : " Call it once, at the end of the run."),
+			"in one line, and optionally when the loop should run next (a loop with a gate and a fixed schedule only sooner) or that it should stop." + (run ? "" : " Call it once, at the end of the run."),
 		promptSnippet: "End a loop's run: findings or not, a one-line summary, optional next time or stop",
 		parameters: Type.Object({
 			findings: Type.Boolean({ description: "true only if there is something the owner should see; false when everything is as expected (the run then stays quiet)." }),
 			summary: Type.String({ description: "One line: what this run found or did." }),
 			ask: Type.Optional(Type.String({ description: "Only if the owner must do something only they can (decide, approve, sign in, pay): the one thing, as a short imperative of a few words, e.g. \"Reconnect Stripe in Executor\". Shown to them as is." })),
-			next: Type.Optional(Type.String({ description: "When this loop should run again, e.g. 2m while something is changing, 1h when quiet (1m to 7d)." })),
+			next: Type.Optional(Type.String({ description: "When this loop should run again, e.g. 2m while something is changing, 1h when quiet (1m to 7d). A loop with a gate and a fixed schedule (every / at) can only be brought sooner: a later time is ignored, its checks stay on schedule." })),
 			stop: Type.Optional(Type.Boolean({ description: "true when what this loop watches is done, so it should end." })),
 		}),
 		async execute(_id, p) {
@@ -1292,7 +1299,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// header and gate context survive intact; see prompt.ts.
 		let commands: CommandInfo[] = [];
 		try { commands = (pi as any).getCommands?.() ?? []; } catch { /* older Pi */ }
-		const { text, expand } = compose(l.prompt, header + where, evidence + `\n\n${REPORT_HINT}`, home(l), commands, !!l.dir);
+		const { text, expand } = compose(l.prompt, header + where, evidence + `\n\n${reportHint(l)}`, home(l), commands, !!l.dir);
 		inConversation = { id: l.id, report: reportFileOf(l, l.fires), attemptId, fire: l.fires, origin: originOf(l) };
 		try { fs.rmSync(inConversation.report, { force: true }); } catch { /* none */ }
 		try {
@@ -1346,7 +1353,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function runText(l: Loop, fireNo: number, reason: Reason, gate?: GateDecision, mode?: RunMode): { text: string; expand: boolean } {
 		const why = gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : "";
 		const header = `[loop ${l.id} · ${desc(l)} · fire #${fireNo}${mode ? ` · background ${mode}` : ""}${reason === "due" ? "" : ` · ${reason}`}${why}]`;
-		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${REPORT_HINT}${mode ? ` ${VISIBLE_HINT}` : ""}`;
+		const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${reportHint(l)}${mode ? ` ${VISIBLE_HINT}` : ""}`;
 		let commands: CommandInfo[] = [];
 		try { commands = (pi as any).getCommands?.() ?? []; } catch { /* older Pi */ }
 		return compose(l.prompt, header + loopContext(l), evidence, home(l), commands, !!l.dir);
@@ -1475,7 +1482,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const composed = runText(l, fireNo, reason, gate, s.mode);
 			// Commands must be their own message; skills allow a header after the name.
 			const head = `[loop ${l.id} · ${desc(l)} · fire #${fireNo} · background ${s.mode}${reason === "due" ? "" : ` · ${reason}`}${gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : ""}]`;
-			const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${REPORT_HINT} ${VISIBLE_HINT}`;
+			const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${reportHint(l)} ${VISIBLE_HINT}`;
 			text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
 				: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
 			meta = runMeta(l, fireNo, reason, gate, s.mode);
@@ -1750,7 +1757,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			l.lastRun = rec;
 			if (o.status === "done" && o.rep && (!run.origin || (l.rev ?? 0) === run.origin.revision)) applyReport(l, o.rep);
 			// Due again while it ran: once more now, unless the run chose its own next time (or the loop paces itself).
-			const again = shared.again.delete(id) && !o.rep?.next && l.schedule.kind !== "auto";
+			// A loop that keeps its checks can't have one cancelled by a `next`: the owed check still runs.
+			const again = shared.again.delete(id) && (!o.rep?.next || keepsChecks(l)) && l.schedule.kind !== "auto";
 			if (again && loops.includes(l) && !l.paused) l.nextAt = Math.min(l.nextAt, Date.now());
 			save(); refreshStatus();
 		}
@@ -1976,7 +1984,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		if (rep.next) {
 			const ms = parseInterval(rep.next.trim());
-			if (ms !== undefined) l.nextAt = Date.now() + Math.min(Math.max(ms, MIN_INTERVAL_MS), MAX_NEXT_MS);
+			if (ms !== undefined) {
+				const at = Date.now() + Math.min(Math.max(ms, MIN_INTERVAL_MS), MAX_NEXT_MS);
+				l.nextAt = keepsChecks(l) ? Math.min(l.nextAt, at) : at;
+			}
 		}
 	}
 
@@ -2253,7 +2264,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		shared.runs.set(l.id, run);
 		l.lastRun = { ...r, attemptId: run.attemptId, acceptance: "unknown", status: "starting", unread: false, host: process.pid };
 		save(); refreshStatus();
-		try { await announceStart(run, runEvent(l, run, "resume")); await run.start(); if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · ${from}]\n${text}\n\n${REPORT_HINT}`); }
+		try { await announceStart(run, runEvent(l, run, "resume")); await run.start(); if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · ${from}]\n${text}\n\n${reportHint(l)}`); }
 		catch (e) {
 			if (run.handedOver) return `${l.id}'s run is yours now`;
 			await run.stop(); if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
@@ -2945,7 +2956,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			"Recurring prompts (loops) in this session: create, list, delete, pause, resume, run (fire now), gate (set or remove a gate), " +
 			"test (run the gate once without waking) or dismiss (clear what a loop's last run surfaced, once the owner says it's handled). A loop runs in the background by default, on a fork of this conversation. " +
 			"Choose thread or fresh for other background modes, or foreground explicitly to run in this conversation. The owner can watch, steer or go into background runs with /loop. Every loop run ends with loop_report " +
-			"(findings or not; optionally when to run next, or stop), so a self-paced loop (every: auto) chooses its own next time. Loops made here " +
+			"(findings or not; optionally when to run next, or stop), so a self-paced loop (every: auto) chooses its own next time; a loop with a gate and a fixed schedule can only be brought sooner, never delayed. Loops made here " +
 			"end after 7 days unless for/until says otherwise. " +
 			"`every` is a fixed interval (default 10m) or auto; `at` is a daily HH:MM wall-clock " +
 			"time that follows daylight saving in the loop's zone. A gate is a script in the project that runs when the loop is due and " +
