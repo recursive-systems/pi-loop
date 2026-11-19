@@ -13,6 +13,11 @@ interface Provider { name: string; sessionId: string; sessionFile?: string; isAc
 interface Shared { providers: Set<Provider>; registry: { version: 1; register(provider: Provider): () => void }; error: boolean }
 
 export default function (pi: ExtensionAPI) {
+	watchLiveness(pi, (ctx, status) => ctx.ui.setStatus(LIVENESS_STATUS_KEY, status));
+}
+
+/** Reports busy, idle or error whenever it changes; the RPC child shows it as a status, a terminal run writes it to its channel. */
+export function watchLiveness(pi: ExtensionAPI, emit: (ctx: ExtensionContext, status: "busy" | "idle" | "error") => void) {
 	const global = globalThis as any;
 	let shared: Shared = global[SHARED];
 	if (!shared) {
@@ -52,7 +57,7 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 		if (active) busyUntil = now + 5_000;
 		const status = shared.error ? "error" : active || now < busyUntil ? "busy" : "idle";
-		if (status !== previous) { previous = status; ctx.ui.setStatus(LIVENESS_STATUS_KEY, status); }
+		if (status !== previous) { previous = status; emit(ctx, status); }
 	}
 	pi.on("session_start", (_event, ctx) => {
 		if (timer) clearInterval(timer);

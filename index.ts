@@ -44,6 +44,8 @@ import { fileURLToPath } from "node:url";
 import { Run, RUN_MODES, extensionFlags, piCommand, groundAttention, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord, type Surface } from "./background.ts";
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
+import { DEFAULT_KEEP_MS, NoTerminal, TerminalRun, channelState, closeKept, modeFor, cliReportHint, resolveRunner, terminalProvided, type RunnerSpec, type TerminalRef } from "./runner.ts";
+import { pruneChannels } from "./channel.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
 import { DEFAULT_MODEL_BACKOFF_MS, MAX_BACKOFF_FACTOR, checkModels, holdModel, modelKey, modelList, parseModels, pickModel, readHolds, skippedFor, splitModel, writeHolds, type CheckAnswer, type Holds, type ModelSpec } from "./models.ts";
 import { LoopsView, GLYPH, type Dot, type LoopRow, type ViewAction } from "./view.ts";
@@ -117,12 +119,15 @@ interface Shared {
 	external?: Map<string, { away: Away; peer: Peer }>;
 	/** The local control channel standalone watchers talk to (control.ts), and its socket. */
 	control?: { server: net.Server; file: string };
+	/** Sessions left open in their terminals after their runs were recorded, by channel: closed once nobody uses them. */
+	kept?: Map<string, { id: string; ref: TerminalRef; session?: string; at: number; keepMs: number }>;
 }
 interface Instance {
 	finishRun(id: string, run: Run, report: string): Promise<void>;
 	recordRun(id: string, run: Run, outcome: Outcome): void;
 	afterLeave(a: Away, finish: boolean): Promise<void>;
 	runStarted(id: string, run: Run, note?: string, meta?: RunMeta): void;
+	runPlaced(id: string, run: TerminalRun): void;
 	runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision): void;
 	judged(id: string, fire: number, verdict: Verdict, attemptId?: string, incarnation?: number): void;
 	judgeDeeply(id: string, item: JudgeItem): void;
@@ -157,6 +162,8 @@ interface Launch {
 	noCredentials?: boolean;
 	/** What the check command said when the fire started. */
 	check?: { unavailable: string[]; available: string[] };
+	/** How its runs are started. */
+	runner: RunnerSpec;
 }
 /** The judge's decision about one run's report; `answer` is what a "returned" one tells the loop. */
 interface Verdict { surface: Surface; ask?: string; by: string; answer?: string; /** Shown with what reaches the owner, e.g. "not deep-judged: timed out". */ note?: string }
@@ -185,14 +192,17 @@ export interface RunEventBase {
 	folder: string; model?: string;
 	/** The project whose session runs the loop. */
 	project: string;
-	/** Opens a live view of the run in any terminal: steer it, or Tab to take it over there. */
-	watch: { argv: string[]; env: Record<string, string>; cwd: string; command: string };
+	/** Opens a live view of the run in any terminal: steer it, or Tab to take it over there. Absent for a run that is itself in a terminal. */
+	watch?: { argv: string[]; env: Record<string, string>; cwd: string; command: string };
+	/** How it is started (runner.ts); "rpc" when absent. A terminal run's `terminal` is where it is (set from `running` on). */
+	runner?: string; terminal?: string;
 }
 const runEvents = new WeakMap<Run, RunEventBase>();
 /** The longest a run waits for `start` listeners' `waitFor` promises. */
 const RUN_START_WAIT_MS = 5_000;
 const OWN_ENV = /^PI_LOOP_/;
-function emitRun(data: object) { try { shared.bus?.emit("loop:run", data); } catch { /* a listener's problem, never the run's */ } }
+function emitRun(data: object) { emitBus("loop:run", data); }
+function emitBus(channel: string, data: object) { try { shared.bus?.emit(channel, data); } catch { /* a listener's problem, never the run's */ } }
 /** Tell listeners a run is starting; apply what they add to its environment (bounded wait). */
 async function announceStart(run: Run, base: RunEventBase): Promise<void> {
 	runEvents.set(run, base);
@@ -209,6 +219,7 @@ async function announceStart(run: Run, base: RunEventBase): Promise<void> {
 }
 function announceRunning(run: Run) {
 	const base = runEvents.get(run);
+	if (base && run instanceof TerminalRun && run.terminal) base.terminal = run.terminal;
 	if (base) emitRun({ ...base, phase: "running", session: run.sessionFile, ...(run.reportedModel ?? run.model ? { model: run.reportedModel ?? run.model } : {}) });
 }
 /** A run is over (done, failed, cancelled, interrupted) or handed to the owner (away): once per run. */
@@ -285,6 +296,8 @@ interface Loop {
 	held?: { fire: number; at: number; what: string; reason: string }[];
 	/** The deep judge's answer for a fork or fresh loop: added to its next fire's prompt. */
 	returned?: string;
+	/** How its background runs are started (runner.ts): rpc, pi, or one described in loop.runners; absent = loop.runner, else rpc. */
+	runner?: string;
 }
 
 function executionMode(value: unknown): LoopMode {
@@ -325,7 +338,7 @@ interface Declared {
 	id: string; prompt: string; every?: string; at?: string; timezone?: string;
 	gate?: string; maxSleep?: string; gateTimeout?: string; gateOnError?: string;
 	priority?: number; context?: string[]; paused?: boolean;
-	run?: string; for?: string; until?: string; model?: ModelSpec;
+	run?: string; for?: string; until?: string; model?: ModelSpec; runner?: string;
 }
 
 // ------------------------------------------------------------ settings --
@@ -449,6 +462,19 @@ export function configuredJudge(cwd: string): string | undefined {
 		if (typeof raw === "string" && raw.trim()) return raw.trim();
 	}
 	return undefined;
+}
+
+/**
+ * loop.runner in the project's or agent's settings.json: how background runs are started when a loop doesn't say
+ * (runner.ts). Absent: "rpc", a hidden child Pi, as before.
+ */
+export function configuredRunner(cwd: string): string {
+	for (const file of [path.join(cwd, ".pi", "settings.json"), path.join(agentDir(), "settings.json")]) {
+		let raw: unknown;
+		try { raw = (JSON.parse(fs.readFileSync(file, "utf8")) as { loop?: { runner?: unknown } }).loop?.runner; } catch { continue; }
+		if (typeof raw === "string" && raw.trim()) return raw.trim();
+	}
+	return "rpc";
 }
 
 /** How long a deep judge may take by default. */
@@ -779,7 +805,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Background loops waiting for a slot (to say so, rather than "waiting for this session"). */
 	const slotWait = new Set<string>();
 	const reportFileOf = (l: Loop, fire: number) => path.join(stateDirOf(l), `report-${fire}.json`);
-	const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runFailed, judged, judgeDeeply, deepJudged, control };
+	const self: Instance = { finishRun, recordRun, afterLeave, runStarted, runPlaced, runFailed, judged, judgeDeeply, deepJudged, control };
 	let lifecycle: LifecycleHost | undefined;
 	let reportingWarning: string | undefined;
 	function originOf(l: Loop): LoopOrigin {
@@ -1051,9 +1077,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const head = (readOnly ? `(read-only: loops owned by pid ${ownerPid()})\n` : "") + (shared.away ? `(you are in ${shared.away.id}'s run: /loop leave lets it carry on, /loop done finishes it)\n` : "");
 		return head + loops.map(l => {
 			const live = shared.runs.get(l.id);
-			const state = live ? `running in background (${live.mode}, ${live.working ? "working" : "idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : shared.external?.has(l.id) ? "taken over in another terminal" : l.paused ? "paused" : `next ${when(l)}`;
+			const state = live instanceof TerminalRun ? `running in a terminal${live.terminal ? ` (${live.terminal})` : ""} (${live.runner.name}, ${live.mode}, ${live.working ? "working" : "idle"})` : live ? `running in background (${live.mode}, ${live.working ? "working" : "idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : shared.external?.has(l.id) ? "taken over in another terminal" : l.paused ? "paused" : `next ${when(l)}`;
 			const p = l.prompt.length > 70 ? `${l.prompt.slice(0, 67)}…` : l.prompt;
-			const extra = [background(l) ? `runs in background: ${l.run}` : "runs in this conversation (foreground)", modelText(l), l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "",
+			const extra = [background(l) ? `runs in background: ${l.run}${runnerText(l)}` : "runs in this conversation (foreground)", modelText(l), l.dir ? `folder ${l.dir}/` : "", l.priority ? `priority ${l.priority}` : "", l.source ? `declared in ${l.source}` : "",
 				l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "", slotWait.has(l.id) ? `waiting for a background slot (loop.maxBackground ${maxBackground})` : waited.has(l.id) ? "waiting for this session to be free" : ""].filter(Boolean);
 			const r = l.lastRun;
 			const last = r && !live ? `\n    last run #${r.fire} ${r.status}${r.endedAt ? ` ${countdown(Math.max(0, Date.now() - r.endedAt))} ago` : ""}${r.unread ? " (new)" : ""}${r.result ? `: ${r.result.split("\n")[0].slice(0, 120)}` : ""}${r.needsYou ? ` · needs you: ${r.needsYou}` : ""}${r.surface && r.judgedBy?.startsWith("deep judge") ? ` · ${r.surface}: ${r.judgedBy.slice(12)}` : ""}` : "";
@@ -1077,6 +1103,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return `on ${on.model} (fallback; ${[...passed, next].join("; ")})`;
 	}
 
+	/** ", runner pi" when a loop's runs aren't the default hidden child. */
+	function runnerText(l: Loop): string {
+		const name = l.runner ?? configuredRunner(ctx!.cwd);
+		return name === "rpc" ? "" : `, runner ${name}${l.runner ? "" : " (loop.runner)"}`;
+	}
+
 	function gateText(l: Loop): string {
 		const g = l.gate!;
 		const sleep = g.maxSleepMs ? `, max sleep ${countdown(g.maxSleepMs)}` : "";
@@ -1092,7 +1124,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// -------------------------------------------------------------- actions --
 
-	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Partial<Pick<Loop, "priority" | "dir" | "context" | "run" | "model" | "expiresAt">> = {}): Loop | string {
+	function add(schedule: Schedule, prompt: string, id?: string, tz?: string, gate?: GateConfig, more: Partial<Pick<Loop, "priority" | "dir" | "context" | "run" | "model" | "expiresAt" | "runner">> = {}): Loop | string {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}; manage them from that session`;
 		const run = executionMode(more.run);
 		if (more.dir && run === "foreground") {
@@ -1117,6 +1149,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			...(more.dir ? { dir: more.dir } : {}),
 			...(more.context?.length ? { context: more.context } : {}),
 			...(more.model ? { model: more.model } : {}),
+			...(more.runner ? { runner: more.runner } : {}),
 		};
 		loop.nextAt = nextFor(loop, now);
 		loops.push(loop);
@@ -1473,16 +1506,20 @@ export default function loopExtension(pi: ExtensionAPI) {
 		trace({ event: "attempt", loop: origin, attemptId, fire: fireNo, mode: l.run, by });
 		const chain = chainOf(l), choice = pickModel(chain, holds, now);
 		// Preparation itself can fail (session directory, template or context), before a child exists.
-		let place: ReturnType<typeof runPlace>, s: ReturnType<typeof sessionArgsFor>, report: string, text: string, meta: RunMeta;
+		let place: ReturnType<typeof runPlace>, s: ReturnType<typeof sessionArgsFor>, report: string, text: string, meta: RunMeta, runner: RunnerSpec;
 		try {
+			runner = runnerOf(l);
+			// Without anything that supplies terminals, a terminal runner can't run: said plainly, never a hidden child instead.
+			if (runner.kind !== "rpc" && !terminalProvided(emitBus)) throw new Error(`runner ${runner.name} runs in a terminal, and nothing here supplies one (install pi-loop-herdr, or set the loop's runner to rpc)`);
 			place = runPlace(l, choice);
-			s = sessionArgsFor(l, l.run);
+			const m = modeFor(runner, l.run);
+			s = { ...sessionArgsFor(l, m.mode), ...(m.note ? { note: m.note } : {}) };
 			report = reportFileOf(l, fireNo);
 			try { fs.rmSync(report, { force: true }); } catch { /* none */ }
 			const composed = runText(l, fireNo, reason, gate, s.mode);
 			// Commands must be their own message; skills allow a header after the name.
 			const head = `[loop ${l.id} · ${desc(l)} · fire #${fireNo} · background ${s.mode}${reason === "due" ? "" : ` · ${reason}`}${gate ? ` · gate: ${gate.reason.replace(/\s*[\r\n]+\s*/g, " ").trim()}` : ""}]`;
-			const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${reportHint(l)} ${VISIBLE_HINT}`;
+			const evidence = (gate?.context ? `\n\n<gate-context>\n${gate.context}\n</gate-context>` : "") + returnedText(l) + `\n\n${cliReportHint(runner, l) ?? reportHint(l)} ${VISIBLE_HINT}`;
 			text = !(composed.expand && l.prompt.startsWith("/")) ? composed.text
 				: l.prompt.startsWith("/skill:") ? `${l.prompt} ${head}${evidence}` : l.prompt;
 			meta = runMeta(l, fireNo, reason, gate, s.mode);
@@ -1497,13 +1534,32 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		if (reason !== "manual" || l.nextAt <= now) l.nextAt = nextFor(l, now);
 		waited.delete(l.id);
-		launch(l, { text, report, meta, gate, note: s.note, startedAt: now, chain, tried: [], unstarted: [], passedOver: [] }, place, choice, s, attemptId);
+		launch(l, { text, report, meta, gate, note: s.note, startedAt: now, chain, tried: [], unstarted: [], passedOver: [], runner }, place, choice, s, attemptId);
 		return undefined;
+	}
+
+	/**
+	 * A run of `l` as its runner starts it: a child Pi on a pipe (rpc), or an agent in a terminal (runner.ts). A thread
+	 * whose last run's session is still open in its terminal (kept after it was recorded) is given its next fire there.
+	 */
+	function makeRun(l: Loop, runner: RunnerSpec, fireNo: number, mode: RunMode, opts: ConstructorParameters<typeof Run>[3], text?: string): Run {
+		if (runner.kind === "rpc") return new Run(l.id, fireNo, mode, opts);
+		const title = `loop ${l.id} #${fireNo}`, first = l.prompt.split("\n").find(x => x.trim())?.trim().slice(0, 160) ?? l.id;
+		const prev = l.lastRun?.terminal;
+		const run = new TerminalRun(l.id, fireNo, mode, { ...opts, runner, text, title, name: `${l.id}-${fireNo}`.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
+			description: `${first} · ${desc(l)}`, project: ctx?.cwd ?? opts.cwd, emit: emitBus,
+			channelRoot: path.join(stateDirOf(l), "runs"), ...(mode === "thread" && prev?.runner === runner.name && prev.thread ? { thread: prev.thread } : {}) });
+		const kept = keptOf(l.id);
+		if (mode === "thread" && kept && kept.ref.runner === runner.name && runner.commands && channelState(kept.ref).alive) {
+			shared.kept!.delete(kept.ref.channel);
+			run.attach(kept.ref, false, kept.session);
+		}
+		return run;
 	}
 
 	/** Start one run of a fire: on `choice`, or with a fallback list, on the first model the holds and a check (if any) allow. */
 	function launch(l: Loop, a: Launch, place: ReturnType<typeof runPlace>, choice: string | undefined, s: { args: string[]; mode: RunMode }, attemptId: string) {
-		const run = new Run(l.id, a.meta.fire, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, a.report, a.meta), attemptId });
+		const run = makeRun(l, a.runner, a.meta.fire, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, a.report, a.meta), attemptId }, a.text);
 		run.origin = originOf(l);
 		(shared.launches ??= new WeakMap()).set(run, a);
 		shared.runs.set(l.id, run);
@@ -1524,7 +1580,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 					}
 					a.tried.push(choice!);
 				}
-				await run.start();
+				// A thread carried on in its open session has already started.
+				if (!(run instanceof TerminalRun && run.channel)) await run.start();
+				// Where it is, recorded before its prompt: a session that stops meanwhile finds it there.
+				if (run instanceof TerminalRun) live(cur => cur.runPlaced(l.id, run));
 				if (run.handedOver) return; // taken over while starting: the run is yours now
 				// Pi refuses a prompt without credentials, and a refused prompt can't be told from one that ran: ask first.
 				if (a.chain.length > 1 && !(await run.listsCredentials())) {
@@ -1651,12 +1710,21 @@ export default function loopExtension(pi: ExtensionAPI) {
 		cur.fires = Math.max(cur.fires, run.fire);
 		cur.lastFiredAt = cur.lastWokeAt = Date.now();
 		delete cur.pendingWake;
-		cur.lastRun = { ...(cur.lastRun ?? { fire: run.fire, mode: run.mode, startedAt: Date.now() }), status: "running", acceptance: "accepted", session: run.sessionFile, host: process.pid, ...modelOf(cur, run) };
+		cur.lastRun = { ...(cur.lastRun ?? { fire: run.fire, mode: run.mode, startedAt: Date.now() }), status: "running", acceptance: "accepted", session: run.sessionFile, host: process.pid, ...modelOf(cur, run),
+			...(run instanceof TerminalRun && run.ref ? { terminal: run.ref } : {}) };
 		// Models this fire passed over because their Pi didn't start: another one did, so it was them.
 		for (const key of shared.launches?.get(run)?.unstarted.splice(0) ?? []) holdFor(cur, key, run.fire, "not_started");
 		if (meta) { logFired(meta, run.sessionFile, cur.lastRun); delete cur.returned; }
 		save(); refreshStatus();
 		if (note) notify(`loop ${id}: ${note}`, "info");
+	}
+
+	/** A terminal run has its terminal: recorded at once, so a later session can find it whatever happens next. */
+	function runPlaced(id: string, run: TerminalRun) {
+		const cur = loops.find(x => x.id === id);
+		if (!cur || !sameRun(cur, run) || !cur.lastRun || !run.ref) return;
+		cur.lastRun.terminal = run.ref;
+		save();
 	}
 
 	function runFailed(id: string, run: Run, why: string, startedAt: number, gate?: GateDecision) {
@@ -1680,7 +1748,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		} else if (retry) cur.nextAt = Math.min(cur.nextAt, Date.now() + 2 * 60_000);
 		// A run started again on its own conversation (leave, steer) keeps that conversation: it can still be opened.
 		const session = run.sessionFile ?? (cur.lastRun?.fire === run.fire ? cur.lastRun?.session : undefined);
-		cur.lastRun = { attemptId: run.attemptId, acceptance: uncertain ? "unknown" : "not_accepted", fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid, ...(session ? { session } : {}), ...modelOf(cur, run) };
+		cur.lastRun = { attemptId: run.attemptId, acceptance: uncertain ? "unknown" : "not_accepted", fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid, ...(session ? { session } : {}), ...modelOf(cur, run),
+			...(run instanceof TerminalRun && run.ref ? { terminal: run.ref } : {}) };
 		save(); refreshStatus();
 		notify(`loop ${id}: its background run couldn't start (${why}); ${uncertain ? "acceptance is unknown; the loop is paused pending reconciliation, not retried" : gate && !retry ? "startup retries exhausted; its wake is kept and the loop is paused" : gate || retry ? "it is tried again soon" : "it runs again at its next time"}`, "warning");
 	}
@@ -1698,6 +1767,32 @@ export default function loopExtension(pi: ExtensionAPI) {
 		live(cur => cur.finishRun(run.loopId, run, report));
 	}
 
+	/**
+	 * A terminal run's loop turn is over but its agent is still open in its terminal: it stays, for the owner to read or
+	 * carry on in, until nobody has used it for the runner's keepOpen (default 30m), or the next fire needs its place.
+	 */
+	function keepOpen(id: string, run: TerminalRun) {
+		run.release();
+		const ref = run.ref, keepMs = run.runner.keepMs ?? DEFAULT_KEEP_MS;
+		if (!ref) return;
+		if (keepMs <= 0) { void closeKept(ref, 0); return; }
+		(shared.kept ??= new Map()).set(ref.channel, { id, ref, ...(run.sessionFile ? { session: run.sessionFile } : {}), at: Date.now(), keepMs });
+	}
+	/** The newest session a loop's run left open. */
+	function keptOf(id: string) {
+		return [...shared.kept?.values() ?? []].filter(k => k.id === id).sort((a, b) => b.at - a.at)[0];
+	}
+
+	/** Close kept sessions nobody has used for their keepOpen; forget ones already gone. */
+	async function sweepKept() {
+		for (const [channel, k] of shared.kept ?? []) {
+			const st = channelState(k.ref);
+			if (!st.alive) { shared.kept!.delete(channel); continue; }
+			if (Date.now() - Math.max(k.at, st.keysAt) < k.keepMs || st.working) continue;
+			if (await closeKept(k.ref, k.keepMs)) shared.kept!.delete(channel);
+		}
+	}
+
 	/** A run is over: collect what it came to, then have the live instance record it (a switch may happen meanwhile). */
 	async function finishRun(id: string, run: Run, report: string) {
 		if (run.handedOver || run.recorded || run.finishing) return;
@@ -1710,11 +1805,16 @@ export default function loopExtension(pi: ExtensionAPI) {
 			void watchRun(run, report);
 			return;
 		}
-		const crashed = (run.exited || !!run.livenessError) && !run.cancelled;
-		await run.stop();
+		// A terminal run whose agent settled after the loop's turn is done, whether or not its session stays open;
+		// one closed while still working (by hand, a crash, a kill) is a failure, said as such.
+		const term = run instanceof TerminalRun ? run : undefined;
+		const crashed = (term ? !!run.livenessError || (run.exited && (term.endedWorking || !term.settledOnce)) : run.exited || !!run.livenessError) && !run.cancelled;
+		if (term && !run.exited && !run.cancelled && !crashed && !run.executionError) keepOpen(id, term);
+		else await run.stop();
 		if (run.handedOver) return;
 		const rep = readReport(report);
-		const failure = crashed ? (run.livenessError ?? "its Pi exited before the run finished")
+		const closedBy = term?.closedNormally ? `its ${term.runner.name} session was closed before the run finished` : `its ${term?.runner.name ?? "Pi"} exited before the run finished`;
+		const failure = crashed ? (run.livenessError ?? closedBy)
 			: run.executionError ? `its Pi reported ${run.executionError.replaceAll("_", " ")}` : undefined;
 		const status = run.cancelled ? "cancelled" : failure ? "failed" : "done";
 		const findings = status === "failed" || !!run.needsYou || (rep ? rep.findings : true);
@@ -1752,7 +1852,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (l && run.model && o.status === "done") releaseModel(l, run.model);
 		if (l && o.unavailable && fallBack(l, run, o.unavailable)) return;
 		const rec: RunRecord = { attemptId: run.attemptId, acceptance: run.promptAccepted ? "accepted" : "unknown", fire: run.fire, mode: run.mode, status: o.status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
-			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), ...(ask ? { ask } : {}), unread: false, ...(l ? modelOf(l, run) : {}) };
+			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), ...(ask ? { ask } : {}), unread: false, ...(l ? modelOf(l, run) : {}),
+			...(run instanceof TerminalRun && run.ref ? { terminal: run.ref } : {}) };
+		if (l && run instanceof TerminalRun && run.channel) pruneChannels(path.dirname(run.channel), 5, run.channel);
 		if (l) {
 			l.lastRun = rec;
 			if (o.status === "done" && o.rep && (!run.origin || (l.rev ?? 0) === run.origin.revision)) applyReport(l, o.rep);
@@ -2010,6 +2112,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
 		const run = shared.runs.get(l.id);
+		// A run in a terminal is an ordinary session there: you go to it, it doesn't come to you (two Pis on one conversation).
+		const tref = run instanceof TerminalRun ? run.ref : keptOf(l.id)?.ref;
+		if (tref && (run || channelState(tref).alive)) return terminalHint(l.id, tref, run ? "its run is" : "its last run is still open as");
 		if (run?.backgroundWork && !now && !anyway) return `${l.id}'s run is waiting for background work it started, which reports back only to that run; watch or steer it, or /loop take ${l.id} now to stop it anyway (that work may not report back)`;
 		const file = run?.sessionFile ?? l.lastRun?.session;
 		if (!file) return `${l.id} has no run to go into`;
@@ -2057,10 +2162,22 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return undefined;
 	}
 
+	/** Where a terminal run is, for people. */
+	function terminalHint(id: string, ref: TerminalRef, what: string): string {
+		return `${id}: ${what} an ordinary ${ref.runner} session in a terminal${ref.terminal ? ` (${ref.terminal})` : ""}; type into it there${ref.attach ? ` (${ref.attach})` : ""}`;
+	}
+
 	/** What `loop:run` says about a run of `l` (see RunEventBase). */
 	function runEvent(l: Loop, run: Run, by: string, gate?: GateDecision): RunEventBase {
 		const first = l.prompt.split("\n").find(x => x.trim())?.trim().slice(0, 160) ?? l.id;
 		const why = gate ? `${by}: ${gate.reason.replace(/\s+/g, " ").trim().slice(0, 160)}` : by;
+		// A run that is itself in a terminal has no watcher: its terminal is where you see it.
+		if (run instanceof TerminalRun) return {
+			v: 1, loop: l.id, fire: run.fire, attemptId: run.attemptId, mode: run.mode,
+			name: `${l.id}-${run.fire}`.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"), title: `loop ${l.id} #${run.fire}`,
+			description: `${first} · ${desc(l)} · ${why}`, folder: run.cwd, ...(run.model ? { model: run.model } : {}), project: ctx?.cwd ?? run.cwd,
+			runner: run.runner.name, ...(run.terminal ? { terminal: run.terminal } : {}),
+		};
 		const me = selfPath();
 		// This Pi's own program (and script, when it runs as one), with only pi-loop: the watcher needs nothing else.
 		const { cmd, args } = piCommand();
@@ -2256,15 +2373,31 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const r = l.lastRun!;
 		const report = reportFileOf(l, r.fire);
 		try { fs.rmSync(report, { force: true }); } catch { /* none */ }
-		let place: ReturnType<typeof runPlace>;
-		try { place = runPlace(l); } catch (e) { return `${l.id}: ${(e as Error).message}`; }
-		const run = new Run(l.id, r.fire, r.mode, { ...place, sessionArgs: ["--session", r.session!], env: childEnv(l, report) });
+		let place: ReturnType<typeof runPlace>, runner: RunnerSpec;
+		try { place = runPlace(l); runner = r.terminal ? resolveRunner(r.terminal.runner, runnerSettings()) : resolveRunner("rpc", []); } catch (e) { return `${l.id}: ${(e as Error).message}`; }
+		// A terminal run's conversation carries on in its terminal: in its open session if it is still there, else a new
+		// one on its conversation (Pi's sessions only); another agent's is the owner's to open.
+		let run: Run;
+		if (runner.kind === "rpc") run = new Run(l.id, r.fire, r.mode, { ...place, sessionArgs: ["--session", r.session!], env: childEnv(l, report) });
+		else {
+			const kept = keptOf(l.id);
+			const open = kept && kept.ref.channel === r.terminal?.channel && runner.commands && channelState(kept.ref).alive ? kept : undefined;
+			if (!open && runner.sessions !== "pi") return terminalHint(l.id, r.terminal!, "its last run was");
+			if (!terminalProvided(emitBus) && !open) return `${l.id}: nothing here supplies a terminal for its ${runner.name} run`;
+			run = makeRun(l, runner, r.fire, r.mode, { ...place, sessionArgs: ["--session", r.session!], env: childEnv(l, report) });
+			if (open && !(run as TerminalRun).channel) { shared.kept!.delete(open.ref.channel); (run as unknown as TerminalRun).attach(open.ref, false, open.session); }
+		}
 		run.origin = originOf(l);
 		traceRun(run, "attempt", { by: "resume" });
 		shared.runs.set(l.id, run);
 		l.lastRun = { ...r, attemptId: run.attemptId, acceptance: "unknown", status: "starting", unread: false, host: process.pid };
 		save(); refreshStatus();
-		try { await announceStart(run, runEvent(l, run, "resume")); await run.start(); if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · ${from}]\n${text}\n\n${reportHint(l)}`); }
+		try {
+			await announceStart(run, runEvent(l, run, "resume"));
+			if (!(run instanceof TerminalRun && run.channel)) await run.start();
+			if (run instanceof TerminalRun) live(cur => cur.runPlaced(l.id, run as TerminalRun));
+			if (!run.handedOver) await run.prompt(`[loop ${l.id} · run #${r.fire} · ${from}]\n${text}\n\n${cliReportHint(runner, l) ?? reportHint(l)}`);
+		}
 		catch (e) {
 			if (run.handedOver) return `${l.id}'s run is yours now`;
 			await run.stop(); if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
@@ -2284,7 +2417,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return loops.map(l => {
 			const live = shared.runs.get(l.id);
 			const r = l.lastRun;
-			const state = live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : shared.external?.has(l.id) ? "taken over in another terminal" : l.paused ? "paused" : `next ${when(l)}`;
+			const state = live instanceof TerminalRun ? `running in a terminal${live.terminal ? ` (${live.terminal})` : ""} (${live.runner.name}, ${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : live ? `running in background (${live.mode}${live.working ? "" : live.backgroundWork ? ", waiting on background work" : ", idle"})` : shared.judging?.has(l.id) ? "its deep judge is deciding" : shared.away?.id === l.id ? "you are in its run" : shared.external?.has(l.id) ? "taken over in another terminal" : l.paused ? "paused" : `next ${when(l)}`;
 			const detail = [desc(l), background(l) ? `background ${l.run}` : "in conversation (foreground)", modelText(l), l.expiresAt ? `ends ${fmtTime(l.expiresAt, zoneOf(l))}` : "",
 				r && !live ? `last #${r.fire} ${r.status}${r.result ? `: ${r.result.split("\n")[0]}` : ""}${r.needsYou ? ` · needs you` : ""}` : ""].filter(Boolean).join(" · ");
 			const dot = loopDot(l, Date.now());
@@ -2496,11 +2629,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 					loops.push(loop); changed = true;
 					continue;
 				}
-				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context, x.run, x.model, x.expiresAt]);
+				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context, x.run, x.model, x.expiresAt, x.runner]);
 				const before = defOf(l);
 				const reschedule = JSON.stringify(l.schedule) !== JSON.stringify(def.schedule) || l.tz !== def.tz;
 				Object.assign(l, def);
-				for (const k of ["tz", "gate", "priority", "dir", "context", "run", "model", "expiresAt"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
+				for (const k of ["tz", "gate", "priority", "dir", "context", "run", "model", "expiresAt", "runner"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
 				l.catchUp = catchUpOf(l.schedule);
 				// Only a change to the declared `paused` pauses or resumes; /loop pause and resume hold otherwise.
 				if (l.declaredPaused !== declaredPaused) {
@@ -2517,7 +2650,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (changed) { save(); refreshStatus(); }
 	}
 
-	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context" | "run" | "model" | "expiresAt"> {
+	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context" | "run" | "model" | "expiresAt" | "runner"> {
 		if (!d || typeof d !== "object") throw new Error("not an object");
 		if (typeof d.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(d.id)) throw new Error("id: letters, digits, . _ -");
 		if (typeof d.prompt !== "string" || !d.prompt.trim()) throw new Error("prompt is required");
@@ -2549,10 +2682,23 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (d.for) throw new Error("for is for loops made in a session; a declared loop can say until (an ISO time)");
 		const ends = d.until ? parseLifetime({ until: d.until }, 0) : undefined;
 		if (typeof ends === "string") throw new Error(ends);
+		const runner = loopRunner(d.runner, run);
 		return { id: d.id, prompt: d.prompt.trim(), schedule, ...(tz ? { tz } : {}), ...(gate ? { gate } : {}),
 			...(d.priority ? { priority: d.priority } : {}), ...(dir ? { dir } : {}), ...(context ? { context } : {}),
-			run, ...(model ? { model } : {}), ...(ends ? { expiresAt: ends } : {}) };
+			run, ...(model ? { model } : {}), ...(ends ? { expiresAt: ends } : {}), ...(runner ? { runner } : {}) };
 	}
+
+	/** A loop's own `runner` (rpc, pi, or one in loop.runners), which only a background loop can have. Throws with what is wrong. */
+	function loopRunner(v: unknown, run: LoopMode): string | undefined {
+		if (v === undefined || v === null || v === "") return undefined;
+		if (typeof v !== "string") throw new Error("runner must be a name: rpc, pi, or one described in loop.runners");
+		if (run === "foreground") throw new Error("runner applies to a background loop (run: fork, thread or fresh)");
+		resolveRunner(v.trim(), runnerSettings());
+		return v.trim();
+	}
+	const runnerSettings = () => [path.join(ctx!.cwd, ".pi", "settings.json"), path.join(agentDir(), "settings.json")];
+	/** The runner a loop's runs use now. Throws when it is unknown or badly described. */
+	function runnerOf(l: Loop): RunnerSpec { return resolveRunner(l.runner ?? configuredRunner(ctx!.cwd), runnerSettings()); }
 
 	/** A loop's `model` (one, or a list to fall back through), which only a background loop can have. Throws with what is wrong. */
 	function backgroundModel(v: unknown, run: LoopMode): ModelSpec | undefined {
@@ -2597,6 +2743,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		for (const l of loops) if (l.pendingWake && l.pendingWake.rev !== (l.rev ?? 0)) { delete l.pendingWake; save(); }
 		// A held folder is asked again now and then (its owner may have quit).
 		if (foreign.size && ++ticks % 4 === 0) { declaredSeen = undefined; syncDeclared(); }
+		// Sessions kept open after their runs close once nobody uses them.
+		if (shared.kept?.size && ticks % 4 === 1) void sweepKept();
+		if (!foreign.size) ticks++;
 		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && heldFor(l) && (shared.away ?? shared.leaving)?.id !== l.id && (l.nextAt <= now || l.pendingWake));
 		// Background loops need only a run slot: each due one starts now, or runs once more after its current run.
 		for (const l of dueNow.filter(background)) {
@@ -2738,6 +2887,28 @@ export default function loopExtension(pi: ExtensionAPI) {
 		for (const fn of shared.pending.splice(0)) { try { void fn(shared.current!); } catch { /* one event's problem */ } }
 	}
 
+	/** Follow a terminal run an earlier session started; false when there is nothing to follow (its channel is gone). */
+	function adopt(l: Loop, r: RunRecord): boolean {
+		const ref = r.terminal!;
+		if (!fs.existsSync(path.join(ref.channel, "events.jsonl"))) return false;
+		let runner: RunnerSpec;
+		try { runner = resolveRunner(ref.runner, runnerSettings()); } catch { runner = { name: ref.runner, kind: "command", commands: false }; }
+		let place: ReturnType<typeof runPlace>;
+		try { place = runPlace(l); } catch { return false; }
+		const run = new TerminalRun(l.id, r.fire, r.mode, { ...place, sessionArgs: [], env: childEnv(l, reportFileOf(l, r.fire)), runner, attemptId: r.attemptId,
+			title: `loop ${l.id} #${r.fire}`, name: `${l.id}-${r.fire}`, description: l.prompt.slice(0, 160), project: ctx!.cwd, emit: emitBus, channelRoot: path.dirname(ref.channel) });
+		run.origin = originOf(l);
+		run.attach(ref, true, r.session);
+		// Seen to take its prompt before (accepted) or now, in its channel: it counts as fired, as before.
+		if (r.acceptance === "accepted") run.promptAccepted = true;
+		if (!run.promptAccepted && run.exited) return false; // it never took its prompt and is gone: interrupted, as before
+		shared.runs.set(l.id, run);
+		l.lastRun = { ...r, status: "running", acceptance: run.promptAccepted ? "accepted" : r.acceptance ?? "unknown", host: process.pid };
+		trace({ event: "attempt", loop: originOf(l), attemptId: run.attemptId, fire: r.fire, mode: r.mode, by: "resume" });
+		void watchRun(run, reportFileOf(l, r.fire));
+		return true;
+	}
+
 	/** Runs recorded as going under a Pi that is gone (a crash, a restart) were interrupted: say so, never resume them by themselves. */
 	function interrupted() {
 		let changed = false;
@@ -2748,8 +2919,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 				delete l.foregroundAttempt; changed = true;
 			}
 			const r = l.lastRun;
+			// A finished run's session still open in its terminal (an earlier session kept it): closed when nobody uses it.
+			if (r?.terminal && !["starting", "running", "away"].includes(r.status) && !shared.runs.has(l.id) && !shared.kept?.has(r.terminal.channel) && channelState(r.terminal).alive) {
+				let keepMs = DEFAULT_KEEP_MS;
+				try { keepMs = resolveRunner(r.terminal.runner, runnerSettings()).keepMs ?? DEFAULT_KEEP_MS; } catch { /* its runner is gone: the default */ }
+				(shared.kept ??= new Map()).set(r.terminal.channel, { id: l.id, ref: r.terminal, ...(r.session ? { session: r.session } : {}), at: r.endedAt ?? Date.now(), keepMs });
+			}
 			if (!r || !["starting", "running", "away"].includes(r.status) || shared.runs.has(l.id)) continue;
 			if (r.host === process.pid && (shared.away?.id === l.id || shared.external?.has(l.id))) continue;
+			// A run in a terminal doesn't end with the session that started it: one still there (or one that finished
+			// meanwhile, its channel says how) is picked up and followed, never started again.
+			if (r.terminal && r.status !== "away" && adopt(l, r)) { changed = true; continue; }
 			// A crash before the accepted callback can hide an executed prompt with the SAME fire number.
 			if (r.status === "starting" || r.acceptance === "unknown") l.paused = true;
 			trace({ event: "interruption", loop: originOf(l), attemptId: r.attemptId, fire: r.fire, mode: r.mode, status: "interrupted", acceptance: r.acceptance ?? "unknown", session: r.session });
@@ -2811,6 +2991,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// Only quitting Pi gives up the folder and its background runs; a session switch keeps both.
 		if (!event?.reason || event.reason === "quit") {
 			const stopping = [...shared.runs].map(([id, run]) => {
+				// A run in a terminal is an ordinary session that outlives this one: left to carry on, and picked up
+				// (followed, not run again) by the next session that owns these loops.
+				if (run instanceof TerminalRun && run.ref) {
+					run.release(); run.handedOver = true;
+					endRun(run, "away");
+					const l = loops.find(x => x.id === id);
+					if (l?.lastRun && !readOnly && sameRun(l, run)) l.lastRun = { ...l.lastRun, terminal: run.ref, ...(run.promptAccepted ? { acceptance: "accepted" as const, status: "running" as const } : {}) };
+					return Promise.resolve();
+				}
 				run.handedOver = true;
 				endRun(run, "interrupted");
 				traceRun(run, "interruption", { status: "interrupted", session: run.sessionFile });
@@ -2898,7 +3087,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			// --fork / --thread / --fresh / --foreground, --model <provider/id[,provider/id]> and --for <duration> / --until <time>, among the schedule
 			// words before the prompt; from the prompt's first word on, everything is the prompt.
 			const words = trimmed.split(/\s+/);
-			let run: LoopMode = "fork", models: string[] | undefined; const life: { for?: string; until?: string } = {};
+			let run: LoopMode = "fork", models: string[] | undefined, runnerName: string | undefined; const life: { for?: string; until?: string } = {};
 			const kept: string[] = [];
 			let i = 0;
 			for (; i < words.length; i++) {
@@ -2906,6 +3095,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 				if (/^--(fork|thread|fresh|foreground)$/.test(w)) { run = w.slice(2) as LoopMode; continue; }
 				if ((w === "--for" || w === "--until") && words[i + 1]) { life[w.slice(2) as "for" | "until"] = words[++i]; continue; }
 				if (w === "--model" && words[i + 1]) { models = words[++i].split(",").filter(Boolean); continue; }
+				if (w === "--runner" && words[i + 1]) { runnerName = words[++i]; continue; }
 				const first = !kept.length;
 				if (first && (parseInterval(w) !== undefined || w.toLowerCase() === "auto")) { kept.push(w); continue; }
 				if (first && w.toLowerCase() === "at" && words[i + 1]) {
@@ -2920,9 +3110,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if ("error" in parsed) { notify(parsed.error, "warning"); return; }
 			const ends = parseLifetime(life, Date.now());
 			if (typeof ends === "string") { notify(ends, "warning"); return; }
-			let model: ModelSpec | undefined;
-			try { model = backgroundModel(models, run); } catch (e) { notify((e as Error).message, "warning"); return; }
-			const r = add(parsed.schedule, parsed.prompt, undefined, parsed.tz, undefined, { run, model, expiresAt: ends });
+			let model: ModelSpec | undefined, runner: string | undefined;
+			try { model = backgroundModel(models, run); runner = loopRunner(runnerName, run); } catch (e) { notify((e as Error).message, "warning"); return; }
+			const r = add(parsed.schedule, parsed.prompt, undefined, parsed.tz, undefined, { run, model, expiresAt: ends, ...(runner ? { runner } : {}) });
 			if (typeof r === "string") { notify(r, "warning"); return; }
 			notify(`loop ${r.id}: ${desc(r)}${background(r) ? `, in the background (${r.run})` : ", in this conversation (foreground)"}, next ${when(r)}, ends ${fmtTime(r.expiresAt!, zoneOf(r))}. /loop rm ${r.id} to stop.`);
 		},
@@ -2991,6 +3181,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			context: Type.Optional(Type.Array(Type.String(), { description: "create: files in the loop's folder attached to each of its turns, e.g. [\"AGENTS.md\"]." })),
 			run: Type.Optional(Type.String({ description: "create: where each turn runs. Default fork: a background copy of this conversation as it is then. Other background modes: thread (the loop's own continued conversation) or fresh (a new conversation each run). Set foreground explicitly to run in this conversation. Background runs report through loop_report and stay quiet unless they find something." })),
 			model: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "create, background only: the model its runs use, provider/id or provider/id:thinking; default this session's. A list (first choice first) moves a run that did nothing on to the next model when one can't serve it (Pi gave up retrying a transient error, no credentials, or the folder's model check says so), and returns to the first once it is back; other failures are reported as before." })),
+			runner: Type.Optional(Type.String({ description: "create, background only: how its runs are started. rpc (default, unless loop.runner says otherwise): a hidden child Pi. pi: an ordinary Pi session in a terminal the owner can type into (needs a terminal provider such as pi-loop-herdr). Others are described in loop.runners." })),
 			for: Type.Optional(Type.String({ description: "create: how long the loop lives, e.g. 2h, 3d (default 7d; loops that must last belong in .pi/loop.json)." })),
 			until: Type.Optional(Type.String({ description: "create: when the loop ends, an ISO time with offset. Use either for or until." })),
 		}),
@@ -3034,11 +3225,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 						}
 						const run = executionMode(p.run);
 						const model = backgroundModel(p.model, run);
+						const runner = loopRunner(p.runner, run);
 						const ends = parseLifetime({ for: p.for, until: p.until }, Date.now());
 						if (typeof ends === "string") throw new Error(ends);
 						const dir = insideDir(ctx!.cwd, p.dir?.trim());
 						if (p.priority !== undefined && !Number.isFinite(p.priority)) throw new Error("priority must be a number");
-						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p, dir) : undefined, { priority: p.priority, dir, context: contextFiles(p.context), run, model, expiresAt: ends });
+						const r = add(schedule, p.prompt.trim(), p.id, tz, p.gate?.trim() ? gateConfig(p, dir) : undefined, { priority: p.priority, dir, context: contextFiles(p.context), run, model, expiresAt: ends, ...(runner ? { runner } : {}) });
 						if (typeof r === "string") throw new Error(r);
 						const hints: string[] = [];
 						const twins = loops.filter(l => l !== r && l.prompt === r.prompt);

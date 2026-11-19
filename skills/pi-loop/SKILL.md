@@ -98,7 +98,7 @@ One session can carry several responsibilities, each a loop:
   ```
 
   Fields are those of `loop_manage create` (`every` or `at`, `timezone`, `gate`, `maxSleep`,
-  `gateTimeout`, `gateOnError`, `priority`, `context`, `run`, `model`), plus `paused` and `until`. The
+  `gateTimeout`, `gateOnError`, `priority`, `context`, `run`, `model`, `runner`), plus `paused` and `until`. The
   folder holding the file is the loop's folder. Edits apply within a tick; deleting the entry deletes the loop. An id already
   used by a `loop_manage` loop is refused. Change a declared loop in its file: `loop_manage`
   `delete` and `gate` refuse it; `pause` and `resume` work until the file's `paused` changes.

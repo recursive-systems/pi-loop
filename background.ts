@@ -89,6 +89,8 @@ export interface RunRecord {
 	 * without an attempt has none ("held" adds until when, and `after` the hold's own reason).
 	 */
 	passedOver?: { model: string; why: string; session?: string; until?: string; after?: string }[];
+	/** A run in a terminal (a runner other than rpc): its runner, channel, process and terminal, so a later session can pick it up. */
+	terminal?: { runner: string; channel: string; pid?: number; terminal?: string; thread?: string };
 }
 
 /** Pi's folder name for a cwd's sessions, with a suffix: --home-u-project-loop-check-- */
@@ -190,13 +192,13 @@ export class Run {
 	promptDispatched = false;
 	/** A failed prompt response can follow command effects too. Never automatically retry it. */
 	promptUncertain = false;
-	private extensionFailed = false;
-	private modelFailure?: "model_error" | "model_aborted";
+	protected extensionFailed = false;
+	protected modelFailure?: "model_error" | "model_aborted";
 	get executionError() { return this.extensionFailed ? "extension_error" : this.modelFailure; }
 	/** How Pi took the prompt: "started" a run of its own, or "handled" by an extension command (which may act by itself). */
-	private disposition?: string;
+	protected disposition?: string;
 	/** Anything that may have had an effect: assistant output, a tool call, the owner's words. */
-	private didWork = false;
+	protected didWork = false;
 	/** The model Pi last answered with (provider/id). */
 	reportedModel?: string;
 	/**
@@ -207,8 +209,8 @@ export class Run {
 	 * named each error it retried (auto_retry_start). Kept only in memory, never recorded.
 	 */
 	gaveUpRetrying = false;
-	private retriedErrors = new Set<string>();
-	private lastError?: string;
+	protected retriedErrors = new Set<string>();
+	protected lastError?: string;
 	/**
 	 * It failed on its model before doing anything: Pi started its prompt, every answer was a model error
 	 * with no content, and no tool ran. Running the same prompt again on another model repeats nothing.
@@ -223,7 +225,7 @@ export class Run {
 	/** Detached work or its queued completion still needs this exact session alive. */
 	backgroundWork = false;
 	livenessError?: string;
-	private livenessReady = false;
+	protected livenessReady = false;
 	exited = false;
 	needsYou?: string;
 	/** Set when the run is being handed to you, so its exit is not a failure. */
@@ -233,23 +235,23 @@ export class Run {
 	/** Its outcome has been recorded (once, by whichever instance is live). */
 	recorded = false;
 	/** Turns started so far: a command's own turn may begin before or after Pi answers "handled". */
-	private starts = 0;
-	private compactionStartedAt?: number;
-	private compactedMs = 0;
-	private compactionWaiters = new Set<() => void>();
+	protected starts = 0;
+	protected compactionStartedAt?: number;
+	protected compactedMs = 0;
+	protected compactionWaiters = new Set<() => void>();
 	cancelled = false;
 	private buf = "";
 	private seq = 0;
-	private waiting = new Map<string, (r: any) => void>();
-	private changes = new Set<() => void>();
-	private exitWaiters: (() => void)[] = [];
-	private idleWaiters: (() => void)[] = [];
+	protected waiting = new Map<string, (r: any) => void>();
+	protected changes = new Set<() => void>();
+	protected exitWaiters: (() => void)[] = [];
+	protected idleWaiters: (() => void)[] = [];
 
 	constructor(
 		readonly loopId: string,
 		readonly fire: number,
 		readonly mode: RunMode,
-		private opts: { cwd: string; sessionArgs: string[]; extra?: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv; attemptId?: string },
+		protected opts: { cwd: string; sessionArgs: string[]; extra?: string[]; model?: string; thinking?: string; env: NodeJS.ProcessEnv; attemptId?: string },
 	) { this.attemptId = opts.attemptId ?? randomUUID(); }
 
 	/** The model it asks Pi for (provider/id); absent = Pi's default. */
@@ -292,13 +294,13 @@ export class Run {
 		return false;
 	}
 
-	private compactionTime(now: number) {
+	protected compactionTime(now: number) {
 		return this.compactedMs + (this.compactionStartedAt === undefined ? 0 : now - this.compactionStartedAt);
 	}
 
 	onChange(fn: () => void) { this.changes.add(fn); return () => this.changes.delete(fn); }
-	private changed() { for (const fn of this.changes) { try { fn(); } catch { /* a viewer's problem */ } } }
-	private push(lines: string[]) {
+	protected changed() { for (const fn of this.changes) { try { fn(); } catch { /* a viewer's problem */ } } }
+	protected push(lines: string[]) {
 		for (const l of lines) if (l) this.lines.push(l);
 		if (this.lines.length > 400) this.lines.splice(0, this.lines.length - 400);
 		this.changed();
@@ -323,15 +325,7 @@ export class Run {
 			}
 		});
 		proc.stderr.on("data", () => { /* Pi's own diagnostics; not part of the run */ });
-		const gone = () => {
-			if (this.exited) return;
-			this.exited = true; this.working = false;
-			for (const w of this.waiting.values()) w({ success: false, error: "the run's Pi exited" });
-			this.waiting.clear();
-			for (const w of this.exitWaiters.splice(0)) w();
-			for (const w of this.idleWaiters.splice(0)) w();
-			this.changed();
-		};
+		const gone = () => this.markExited();
 		proc.on("exit", gone);
 		// A failed spawn emits error/close, NOT exit. Settle RPC and stop waiters there too.
 		proc.on("error", gone);
@@ -342,6 +336,17 @@ export class Run {
 		if (!this.livenessReady) throw new Error("The run did not load its background-work liveness companion");
 		if (this.livenessError) throw new Error(this.livenessError);
 		if (this.executionError) throw new Error("The run reported an extension error during startup");
+	}
+
+	/** Its process is gone: settle everything waiting on it. */
+	protected markExited() {
+		if (this.exited) return;
+		this.exited = true; this.working = false;
+		for (const w of this.waiting.values()) w({ success: false, error: "the run's Pi exited" });
+		this.waiting.clear();
+		for (const w of this.exitWaiters.splice(0)) w();
+		for (const w of this.idleWaiters.splice(0)) w();
+		this.changed();
 	}
 
 	private handle(msg: any) {
@@ -460,13 +465,13 @@ export class Run {
 	}
 
 	/** Settle a handled command unless it started a turn of its own, now or within a few seconds. */
-	private settleUnlessStarted(before: number) {
+	protected settleUnlessStarted(before: number) {
 		if (this.starts > before) return;
 		const t = setTimeout(() => { if (this.starts === before && this.working) this.settle(); }, 3_000);
 		t.unref?.();
 	}
 
-	private settle() {
+	protected settle() {
 		this.working = false;
 		for (const w of this.idleWaiters.splice(0)) w();
 		this.changed();
