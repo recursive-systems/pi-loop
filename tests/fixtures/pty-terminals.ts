@@ -1,5 +1,6 @@
 // A terminal provider for the tests: answers pi-loop's `loop:terminal` requests by running the run in a real
-// pseudo-terminal (tests/terminal.py), with no multiplexer. It records what it opened in PTY_LOG and keeps each
+// pseudo-terminal (tests/terminal.py), with no multiplexer. PTY_REFUSE=1: it answers with nothing (opens nothing).
+// PTY_SLOW_MS: it starts the run at once but answers only after this long (a provider that misses pi-loop's deadline). It records what it opened in PTY_LOG and keeps each
 // terminal's output in PTY_DIR/<id>.out, so a test can see the run's screen and type into it (PTY_DIR/<id>.in, a FIFO).
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -17,6 +18,7 @@ export default function (pi: any) {
 		r.inherit.push("PTY_*");
 		r.provide((async () => {
 			await r.ready;
+			if (process.env.PTY_REFUSE) return undefined;
 			const id = `p${++n}-${process.pid}`;
 			const fifo = path.join(dir, `${id}.in`);
 			fs.mkdirSync(dir, { recursive: true });
@@ -29,6 +31,7 @@ export default function (pi: any) {
 				{ cwd: r.cwd, stdio: ["ignore", out, out], detached: true, env: { ...process.env, PTY_ID: id } });
 			p.unref();
 			if (log) fs.appendFileSync(log, JSON.stringify({ id, loop: r.loop, fire: r.fire, runner: r.runner, name: r.name, pid: p.pid }) + "\n");
+			if (process.env.PTY_SLOW_MS) await new Promise(res => setTimeout(res, Number(process.env.PTY_SLOW_MS)));
 			return {
 				id, attach: `pty ${id}`,
 				close: async () => { try { process.kill(-p.pid!, "SIGTERM"); } catch { /* gone */ } },

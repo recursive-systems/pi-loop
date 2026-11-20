@@ -90,7 +90,7 @@ export interface RunRecord {
 	 */
 	passedOver?: { model: string; why: string; session?: string; until?: string; after?: string }[];
 	/** A run in a terminal (a runner other than rpc): its runner, channel, process and terminal, so a later session can pick it up. */
-	terminal?: { runner: string; channel: string; pid?: number; terminal?: string; thread?: string };
+	terminal?: { runner: string; channel: string; pid?: number; pidStart?: string; terminal?: string; attach?: string; dispatch?: "none" | "sent" | "accepted"; thread?: string };
 }
 
 /** Pi's folder name for a cwd's sessions, with a suffix: --home-u-project-loop-check-- */

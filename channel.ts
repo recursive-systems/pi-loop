@@ -2,25 +2,30 @@
  * A terminal run's channel: a private folder per attempt through which a run in a terminal (an ordinary
  * interactive agent, not a child on a pipe) tells the loop what it is doing, and the loop tells it what to do.
  *
- *   events.jsonl     appended by the run (its companion extension, or its hooks via bin/loop-run.mjs)
+ *   events.jsonl     appended by the run (its companion extension, its hooks via bin/loop-run.mjs, and the launcher)
  *   commands.jsonl   appended by the loop's session; read by a run that can act on them (Pi's companion)
- *   prompt-<n>.txt   a prompt for a run whose prompt is delivered through the channel
+ *   start            the launcher's one-time socket and token, removed as the launcher reads it
+ *   prompt-<a>.txt   a prompt delivered through the channel, removed as the run reads it
  *
- * Events, one JSON object per line, each with `e` (and `at`, epoch ms, added on write):
- *   started   {pid?, session?, providers?}   the agent is up (and which providers it has credentials for)
- *   accepted  {disposition?}                 it took the loop's prompt: "started" a turn, or "handled" it as a command
+ * Every event carries `a`, the attempt it belongs to; a reader ignores events of any other attempt. Events hold
+ * facts only, never model text, error messages, dialog wording or steering text: the record keeps what a hidden
+ * run's would (pi-loop's RPC path keeps only the fact of an extension failure, not its diagnostic).
+ *   spawned {pid} / exited {code}            the launcher: the agent's process started / ended
+ *   started {session?, session_id?, providers?}  the agent is up
+ *   accepted {disposition}                   it took the loop's prompt: "started" a turn, or "handled" it as a command
  *   working / idle                           a turn started / it settled (nothing more will happen by itself)
- *   background {status: busy|idle|error}     it still owns detached work after settling (Pi's liveness contract)
- *   answer    {model?, stop?, content?}      an assistant message ended (stop "error" or "aborted" for failures)
- *   tool                                     a tool ran (it did work)
- *   activity                                 still making progress (at most every few seconds)
+ *   background {status: busy|idle|error}     it still owns detached work after settling (session-liveness v1)
+ *   answer {model?, stop?, content, err?}    an assistant message ended; err is a short digest of the error, for retry counting
+ *   extension_error                          an extension failed (the fact only)
+ *   tool / activity                          it did work / is still making progress
  *   compaction {phase: start|end}            preflight compaction, which may delay acceptance
- *   dialog    {title?} / dialog_end          it waits on a person / no longer
- *   owner                                    someone typed into it in its terminal
- *   exit                                     it is closing normally (the owner quit it, or it was asked to)
- * Commands: {c: "prompt", file}, {c: "say", text}, {c: "abort"}, {c: "exit"}.
+ *   dialog / dialog_end / declined           it waits on a person / no longer / pi-loop declined it
+ *   keys / owner                             someone typed into it / sent it words in its terminal
+ *   exit {by}                                it is closing normally
+ * Commands, each with `a`: {c: "prompt", file}, {c: "say", text}, {c: "abort"}, {c: "decline"}, {c: "exit"}.
  *
- * Files are 0600 in a 0700 folder. Nothing is ever read from a channel but these records.
+ * Files are 0600 in a 0700 folder. Once a run is recorded, its channel keeps only events.jsonl; folders are
+ * pruned to the newest few per loop, never one whose agent is still running.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -65,10 +70,21 @@ export class Tail {
 	}
 }
 
-/** Keep the newest `keep` channel folders under `root` (a loop's runs/), remove older ones. */
-export function pruneChannels(root: string, keep: number, except?: string) {
+/** Everything in a finished attempt's channel but its events (prompt, commands, start file, a runner's files). */
+export function scrubChannel(dir: string) {
+	let names: string[] = [];
+	try { names = fs.readdirSync(dir); } catch { return; }
+	for (const n of names) if (n !== "events.jsonl") { try { fs.rmSync(path.join(dir, n), { force: true, recursive: true }); } catch { /* gone */ } }
+}
+export function removeChannel(dir: string) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* gone */ } }
+
+/**
+ * Keep the newest `keep` channel folders under `root` (a loop's runs/); remove older ones, except those `live`
+ * says are still running (an agent still there owns its channel), which are scrubbed of nothing and kept.
+ */
+export function pruneChannels(root: string, keep: number, live: (dir: string) => boolean) {
 	let dirs: { d: string; m: number }[] = [];
-	try { dirs = fs.readdirSync(root).map(n => path.join(root, n)).filter(d => d !== except).map(d => ({ d, m: fs.statSync(d).mtimeMs })); } catch { return; }
+	try { dirs = fs.readdirSync(root).map(n => path.join(root, n)).map(d => ({ d, m: fs.statSync(d).mtimeMs })); } catch { return; }
 	dirs.sort((a, b) => b.m - a.m);
-	for (const { d } of dirs.slice(keep)) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* in use */ } }
+	for (const { d } of dirs.slice(keep)) { if (!live(d)) removeChannel(d); }
 }

@@ -11,6 +11,9 @@
 //   crash       exit 3 mid-turn
 //   error       answer with a model error twice (as an agent that retried and gave up)
 //   stay        after its turn, stay open (an interactive session waiting for more)
+//   bgbusy      after its turn, say it still owns detached work, and never say otherwise
+//   envprobe    write whether FAKE_SECRET reached it to $FAKE_PROBE (the run's environment arrived, from memory)
+// FAKE_PRESUBMIT_MS: wait this long before its prompt hook (a window between start and acceptance).
 // Hooks come from the settings file its runner wrote into the run's channel (FAKE_SETTINGS, a path).
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -29,7 +32,9 @@ const loopRun = process.env.FAKE_LOOP_RUN;
 
 console.log(`fake agent: ${prompt.split("\n")[0].slice(0, 80)}`);
 hook("SessionStart", { model: "fake/one" });
+if (process.env.FAKE_PRESUBMIT_MS) await sleep(Number(process.env.FAKE_PRESUBMIT_MS));
 hook("UserPromptSubmit", { prompt });
+if (steps.includes("envprobe") && process.env.FAKE_PROBE) fs.writeFileSync(process.env.FAKE_PROBE, process.env.FAKE_SECRET ? "secret-arrived" : "no-secret");
 for (const step of steps) {
 	if (step === "report") execFileSync("node", [loopRun, "report", "--findings", "false", "--summary", "FAKE_OK"], { stdio: "inherit" });
 	if (step === "report-ask") execFileSync("node", [loopRun, "report", "--findings", "true", "--summary", "FAKE_FOUND", "--ask", "Approve the fake"], { stdio: "inherit" });
@@ -40,5 +45,6 @@ for (const step of steps) {
 	if (step === "error") { hook("Answer", { stop: "error" }); hook("Answer", { stop: "error" }); }
 }
 hook("Stop", { last_assistant_message: "fake turn done" });
+if (steps.includes("bgbusy")) { hook("Background", {}); await sleep(24 * 60 * 60_000); }
 if (steps.includes("stay")) await sleep(24 * 60 * 60_000);
 hook("SessionEnd", {});

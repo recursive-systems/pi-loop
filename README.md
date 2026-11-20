@@ -165,8 +165,9 @@ Remove the setting (or set it to `"rpc"`) to go back. The terminal comes from an
 for Herdr), on `pi.events` (`loop:terminal`). With none installed, a `pi`-runner loop's runs fail, saying so.
 The loop still counts a run once it took its prompt, gets its `loop_report`, notices a run that hangs, crashes or
 is closed by hand, declines a dialog nobody answers, falls back to the next model, and picks up runs still going
-after the session restarts. After a run is recorded its session stays open for 30 minutes for you to read or
-carry on in. A thread's next fire continues in that same session. Other agents (Claude Code, Codex) are added by
+after the session restarts. Each run gets its own terminal; its agent is ended before its run is recorded (a
+thread's next fire carries its conversation on in a new one). Nothing of its environment is written to disk.
+Other agents (Claude Code, Codex) are added by
 describing them in settings: see [RUNNERS.md](RUNNERS.md).
 
 ## Background runs

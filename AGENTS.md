@@ -17,8 +17,12 @@ no mode migrate to forks on load. Optional gates decide whether a due loop wakes
 - `runner.ts` is how a background run is started (RUNNERS.md): `rpc`, the RPC child above, by default; `pi` and
   runners described in settings run as ordinary agent sessions in a terminal that another extension supplies
   (`loop:terminal` on pi.events), and `TerminalRun` follows them through a private channel folder (`channel.ts`)
-  instead of a pipe. `runner-pi.ts` is the companion loaded into the `pi` runner's Pi; `bin/loop-run.mjs` is what
-  other agents' hooks call. Nothing agent-specific belongs in the core: a new agent is a settings description.
+  instead of a pipe. `runner-pi.ts` is the companion loaded into the `pi` runner's Pi; `bin/loop-run.mjs` is the
+  terminal's launcher and what other agents' hooks call. Nothing agent-specific belongs in the core: a new agent is
+  a settings description. Keep: one terminal per attempt, ended before it is recorded; the inventory
+  (`Loop.terminals`) saved before a terminal is asked for; attempt-tagged, fact-only events; no environment or
+  argv on disk. Never use `instanceof` or module-local state for anything that crosses a /reload (a code-changing
+  reload leaves old instances in `shared`): duck-type (`isTerminal`) and keep it on `globalThis`.
 - `lifecycle.ts` owns the generic private registration/append-only metadata feed; see `LIFECYCLE.md`.
   Preserve distinct attempt/evaluation/incarnation identities, metadata-only projection, fsync/atomic
   registration and explicit gaps. Never put prompts, asks, reasons, reports, child errors, model data
