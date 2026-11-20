@@ -160,7 +160,7 @@ export interface TerminalRequest {
 
 /** Terminal identity every terminal sets for its own program. Providers add theirs through `inherit`. */
 const TERMINAL_OWN = ["TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLORTERM", "COLUMNS", "LINES", "PI_PROGRAM_STATUS", "WINDOWID",
-	"TMUX", "TMUX_PANE", "STY", "WEZTERM_PANE", "KITTY_WINDOW_ID", "ZELLIJ*", "HERDR_*", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET"];
+	"TMUX", "TMUX_PANE", "STY", "WEZTERM_PANE", "KITTY_WINDOW_ID", "ZELLIJ*", "HERDR_*", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"];
 
 const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 const okName = (k: string) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k);
