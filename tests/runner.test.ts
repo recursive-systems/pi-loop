@@ -45,6 +45,9 @@ const FAKE_RUNNER = {
 interface Opts { live?: boolean; settings?: object; projectSettings?: object; provider?: boolean; env?: Record<string, string> }
 
 function project(t: any, o: Opts = {}) {
+	// Registered before the folders' own removal (after-hooks run in order), so the pids they record are still there.
+	let p: P | undefined;
+	t.after(() => { if (p) kill(p); });
 	const cwd = tmp(t, "pi-loop-rn-cwd-"), agent = tmp(t, "pi-loop-rn-agent-"), pty = tmp(t, "pi-loop-rn-pty-"), sessions = tmp(t, "pi-loop-rn-sessions-");
 	fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
 	let model: object = { defaultProvider: "closed", defaultModel: "none" };
@@ -60,9 +63,10 @@ function project(t: any, o: Opts = {}) {
 	}
 	fs.writeFileSync(path.join(agent, "settings.json"), JSON.stringify({ ...model, retry: { enabled: false }, defaultProjectTrust: "always", ...(o.settings ?? {}) }));
 	fs.writeFileSync(path.join(cwd, ".pi", "settings.json"), JSON.stringify({ loop: { judge: "off", deepJudge: "off", runners: { fake: FAKE_RUNNER } }, ...(o.projectSettings ?? {}) }));
-	return { cwd, agent, pty, sessions, log: path.join(pty, "terminals.jsonl"), loops: () => JSON.parse(fs.readFileSync(path.join(cwd, ".pi/loops.json"), "utf8")) };
+	p = { cwd, agent, pty, sessions, log: path.join(pty, "terminals.jsonl"), loops: () => JSON.parse(fs.readFileSync(path.join(cwd, ".pi/loops.json"), "utf8")) };
+	return p;
 }
-type P = ReturnType<typeof project>;
+interface P { cwd: string; agent: string; pty: string; sessions: string; log: string; loops: () => any[] }
 
 class Host {
 	proc: ChildProcessWithoutNullStreams;
@@ -108,16 +112,20 @@ const terminals = (p: P): any[] => { try { return fs.readFileSync(p.log, "utf8")
 const screen = (p: P, id: string) => { try { return fs.readFileSync(path.join(p.pty, `${id}.out`), "utf8"); } catch { return ""; } };
 const alive = (pid?: number) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
 const events = (r: any) => fs.readFileSync(path.join(r.terminal.channel, "events.jsonl"), "utf8").trim().split("\n").map((l: string) => JSON.parse(l));
-/** Kill what a test left in its terminals. */
-function cleanup(t: any, p: P) {
-	t.after(() => {
-		for (const x of terminals(p)) { try { process.kill(-x.pid, "SIGKILL"); } catch { /* gone */ } }
-		// The agents lead their own sessions (the pty's): end them by the pids their channels recorded.
-		try {
-			for (const l of p.loops()) { const pid = l.lastRun?.terminal?.pid; if (pid) { try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } } }
-		} catch { /* no loops */ }
-	});
+/** Kill what a test left in its terminals: the pty helpers, and the agents (they lead their own sessions), by every pid their channels recorded. */
+function kill(p: P) {
+	const pids: number[] = [];
+	try { for (const l of fs.readFileSync(p.log, "utf8").trim().split("\n").filter(Boolean)) pids.push(JSON.parse(l).pid); } catch { /* none */ }
+	try {
+		const root = path.join(p.cwd, ".pi", "loop-state");
+		for (const loop of fs.readdirSync(root)) for (const run of fs.readdirSync(path.join(root, loop, "runs"))) {
+			for (const l of fs.readFileSync(path.join(root, loop, "runs", run, "events.jsonl"), "utf8").split("\n")) { try { const e = JSON.parse(l); if (e.pid) pids.push(Number(e.pid)); } catch { /* */ } }
+		}
+	} catch { /* none */ }
+	for (const pid of pids) { try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } }
 }
+/** project() already cleans up; kept so the tests read as before. */
+function cleanup(_t: any, _p: P) {}
 
 async function fireFake(t: any, script: string, extra: { settings?: object; runner?: object } = {}) {
 	const projectSettings = extra.runner ? { loop: { judge: "off", deepJudge: "off", runners: { fake: { ...FAKE_RUNNER, ...extra.runner } } } } : undefined;
