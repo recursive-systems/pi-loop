@@ -361,21 +361,6 @@ test("pi: when a terminal run's record can't be saved, the owner survives: alive
 	assert.equal(exit, null);
 });
 
-test("pi: a state file that is there but can't be read is never written over with an empty one; loops run again once it reads", { timeout: 120_000 }, async t => {
-	const b = await box(t);
-	seed(b, "c");
-	const lj = path.join(b.cwd, ".pi/loops.json");
-	const good = fs.readFileSync(lj, "utf8");
-	fs.writeFileSync(lj, good.slice(0, good.length - 5)); // truncated: unparseable
-	const host = new Host(t, b);
-	await host.ready();
-	await new Promise(r => setTimeout(r, 20_000)); // a tick or more
-	assert.equal(fs.readFileSync(lj, "utf8"), good.slice(0, good.length - 5), "left exactly as it was");
-	assert.ok(host.notes().some(n => /couldn't read .*loops\.json/.test(n)), "and said");
-	fs.writeFileSync(lj, good);
-	await until("read again and run", () => ["done", "failed"].includes(b.loop("c")?.lastRun?.status), 60_000);
-});
-
 test("pi: /loop open, take and steer on a finished terminal run say how to open it, and leave its report alone", { timeout: 120_000 }, async t => {
 	const b = await box(t);
 	seed(b, "c", { prompt: "Call loop_report with findings false and summary OPEN_ME. Do nothing else." });

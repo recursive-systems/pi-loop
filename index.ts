@@ -941,26 +941,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	function load(): Loop[] {
 		migratedModes = false;
-		stateUnreadable = undefined;
 		try {
 			const saved = JSON.parse(fs.readFileSync(file, "utf8")) as Loop[];
 			for (const l of saved) if (l.run === undefined) { l.run = "fork"; migratedModes = true; }
 			return saved;
-		} catch (e) {
-			// No file is an empty estate. A file that is there but can't be read is not: nothing is written over it (see save).
-			if ((e as NodeJS.ErrnoException).code !== "ENOENT" && fs.existsSync(file)) {
-				stateUnreadable = (e as Error).message;
-				notify(`pi-loop couldn't read ${file} (${stateUnreadable}); it writes nothing to it until it can, and runs no loops meanwhile`, "error");
-			}
-			return [];
-		}
+		} catch { return []; }
 	}
-	/** Its state file exists but couldn't be read at the last load: an unknown estate, never written over with an empty one. */
-	let stateUnreadable: string | undefined;
 	function save() {
 		// Only the owner writes. If the lock went away (its helper died), stop at once: another session may own it now.
 		if (!holding()) return;
-		if (stateUnreadable) return;
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		const tmp = `${file}.${process.pid}.tmp`;
 		fs.writeFileSync(tmp, JSON.stringify(loops, null, 2), { mode: 0o600 });
@@ -1656,7 +1645,6 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** save(), but failing loudly: a terminal attempt that can't be recorded must not start. */
 	function saveStrict() {
 		if (!holding()) throw new Error("this session lost the folder's lock");
-		if (stateUnreadable) throw new Error(`its state file can't be read (${stateUnreadable})`);
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		const tmp = `${file}.${process.pid}.tmp`;
 		fs.writeFileSync(tmp, JSON.stringify(loops, null, 2), { mode: 0o600 });
@@ -2517,7 +2505,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		await run.stop();
 		// Its watcher records it; if none is left to (a lost event), record it here.
 		await new Promise(r => setTimeout(r, 2500));
-		if (shared.runs.get(l!.id) === run && !run.recorded) live(cur => cur.finishRun(l!.id, run, reportFileOf(l!, run.fire)));
+		if (shared.runs.get(l!.id) === run && !run.recorded) {
+			if (isTerminal(run)) liveSafe("recording a cancelled terminal run", cur => cur.finishRun(l!.id, run, reportFileOf(l!, run.fire)));
+			else live(cur => cur.finishRun(l!.id, run, reportFileOf(l!, run.fire)));
+		}
 		return `stopped ${l!.id}'s run #${run.fire}`;
 	}
 
@@ -2884,8 +2875,6 @@ export default function loopExtension(pi: ExtensionAPI) {
 			claimLock(() => activateOwner());
 			return;
 		}
-		// Its state couldn't be read: nothing runs (an empty list would look like no loops) until it can; tried again each tick.
-		if (stateUnreadable) { loops = load(); if (stateUnreadable) return; interrupted(); refreshStatus(); }
 		const now = Date.now();
 		// One loop per tick: a burst after sleep should not queue five turns at once.
 		// A fired prompt that never reached the transcript (dropped queue) must not read "queued" forever.
@@ -3134,7 +3123,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			l.lastRun = { ...r, status: "interrupted", endedAt: Date.now(), findings: true, unread: true, result: r.result ?? "the Pi running it stopped before it finished" };
 			changed = true;
 		}
-		if (changed) save();
+		// A save failure after picking up terminal runs is contained (said); one with no terminal runs is as before.
+		if (changed) { if (loops.some(l => l.terminals?.length)) { try { save(); } catch (e) { notify(`pi-loop: saving after picking up runs in terminals failed (${(e as Error).message})`, "warning"); } } else save(); }
 	}
 
 	// queued -> running when the loop's own message enters the transcript; done when Pi settles.
