@@ -27,6 +27,11 @@ function stdinJson() {
 	try { const t = fs.readFileSync(0, "utf8"); return t.trim() ? JSON.parse(t) : {}; } catch { return {}; }
 }
 
+/** This process's start time (/proc/self/stat field 22), so the loop knows it is still the same process. */
+function selfStart() {
+	try { const st = fs.readFileSync("/proc/self/stat", "utf8"); return st.slice(st.lastIndexOf(")") + 2).split(" ")[19]; } catch { return undefined; }
+}
+
 if (cmd === "start") {
 	const dir = args[0];
 	let spec;
@@ -36,13 +41,14 @@ if (cmd === "start") {
 		const sock = net.createConnection(spec.socket);
 		let buf = "";
 		sock.setEncoding("utf8");
-		sock.on("connect", () => sock.write(JSON.stringify({ token: spec.token, pid: process.pid }) + "\n"));
+		sock.setTimeout(15_000, () => { sock.destroy(); resolve({ error: "no answer from the session that runs this loop" }); });
+		sock.on("connect", () => sock.write(JSON.stringify({ token: spec.token, pid: process.pid, start: selfStart() }) + "\n"));
 		sock.on("data", d => { buf += d; });
 		sock.on("end", () => { try { resolve(JSON.parse(buf)); } catch { resolve({ error: "no answer" }); } });
 		sock.on("error", () => resolve({ error: "the session that runs this loop isn't reachable" }));
 	});
 	if (!reply?.argv?.length) { console.error(`pi-loop: couldn't start this run: ${reply?.error ?? "no answer"}`); append(dir, { e: "exited", a: spec.attempt, code: 2 }); process.exit(2); }
-	append(dir, { e: "spawned", a: spec.attempt, pid: process.pid });
+	append(dir, { e: "spawned", a: spec.attempt, pid: process.pid, start: selfStart() });
 	const env = { ...process.env, ...reply.env };
 	delete env.BUN_BE_BUN;
 	// The agent shares this process group: a signal to the group (the loop stopping it, the terminal closing) reaches

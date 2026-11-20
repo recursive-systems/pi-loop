@@ -316,6 +316,8 @@ interface Loop {
 	 * dropped only once its agent is confirmed gone. What a later session finds, follows or ends; never pruned while live.
 	 */
 	terminals?: TerminalAttempt[];
+	/** It was deleted (or expired, or stopped) while it had terminal attempts: removed once they are confirmed gone. */
+	removing?: true;
 }
 
 /** One terminal attempt, as saved (see Loop.terminals): enough to follow it, end it, or record it after a restart. */
@@ -326,6 +328,12 @@ interface TerminalAttempt {
 	ref: TerminalRef;
 	/** Why it ran (for its `fired` line), the model it asked for, and its session once known. */
 	meta?: RunMeta; model?: string; session?: string;
+	/** Where its loop_report goes (the loop's folder may have changed since). */
+	report?: string;
+	/** The gate's wake that started it, with its context, kept until the run took its prompt (or it is reconciled). */
+	wake?: NonNullable<Loop["pendingWake"]>;
+	/** Its `fired` line is in the gate log (so it is never written twice). */
+	firedLogged?: true;
 	/** Its run was recorded: only its process is left to confirm gone. */
 	recorded?: true;
 }
@@ -1197,15 +1205,16 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
 		if (l.source) return `${l.id} is declared in ${l.source}; remove it there (or pause it)`;
-		loops = loops.filter(x => x !== l);
+		const wait = removeLoops([l]);
 		save(); refreshStatus();
-		return `removed ${l.id}`;
+		return wait.length ? `${l.id} is paused and goes once its run in a terminal has ended` : `removed ${l.id}`;
 	}
 
 	function setPaused(id: string, paused: boolean): string {
 		if (readOnly) return `loops are owned by pid ${ownerPid()}`;
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
+		if (!paused && l.removing) return `${l.id} was removed; it goes once its run in a terminal has ended`;
 		l.paused = paused;
 		if (!paused) l.nextAt = nextFor(l, Date.now());
 		save(); refreshStatus();
@@ -1582,7 +1591,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	 * A run of `l` as its runner starts it: a child Pi on a pipe (rpc), or an agent in a terminal (runner.ts), one
 	 * terminal per attempt. A terminal run saves itself in the loop's `terminals` before its terminal is asked for.
 	 */
-	function makeRun(l: Loop, runner: RunnerSpec, fireNo: number, mode: RunMode, opts: ConstructorParameters<typeof Run>[3], text?: string, meta?: RunMeta): Run {
+	function makeRun(l: Loop, runner: RunnerSpec, fireNo: number, mode: RunMode, opts: ConstructorParameters<typeof Run>[3], text?: string, meta?: RunMeta, gate?: GateDecision, report?: string): Run {
 		if (runner.kind === "rpc") return new Run(l.id, fireNo, mode, opts);
 		const first = l.prompt.split("\n").find(x => x.trim())?.trim().slice(0, 160) ?? l.id;
 		const attemptId = opts.attemptId ?? randomUUID();
@@ -1590,18 +1599,55 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return new TerminalRun(l.id, fireNo, mode, { ...opts, attemptId, runner, text, title: `loop ${l.id} #${fireNo}`, name: `${l.id}-${fireNo}`.toLowerCase().replace(/[^a-z0-9_-]+/g, "-"),
 			description: `${first} · ${desc(l)}`, project: ctx?.cwd ?? opts.cwd, emit: emitBus, socketDir: path.join(agentDir(), "loop-hosts", "ctl"),
 			channelRoot: path.join(stateDirOf(l), "runs"), ...(mode === "thread" && l.lastRun?.terminal?.runner === runner.name && l.lastRun.terminal.thread ? { thread: l.lastRun.terminal.thread } : {}),
-			persist: ref => live(cur => cur.saveTerminal?.(l.id, { attemptId, fire: fireNo, mode, startedAt, rev, incarnation, ref, ...(meta ? { meta } : {}), ...(opts.model ? { model: opts.model } : {}) })) });
+			persist: (ref, extra) => {
+				// Synchronously, through the live instance; one that can't save (no instance, no lock, a failed write) throws,
+				// and the attempt doesn't go on.
+				const cur = shared.current;
+				if (!cur?.saveTerminal) throw new Error("the session that runs this loop is switching");
+				cur.saveTerminal(l.id, { attemptId, fire: fireNo, mode, startedAt, rev, incarnation, ref, ...(meta ? { meta } : {}),
+					...(extra.model ?? opts.model ? { model: extra.model ?? opts.model } : {}), ...(extra.session ? { session: extra.session } : {}),
+					...(report ? { report } : {}), ...(gate ? { wake: keptWake(gate, startedAt, rev) } : {}) });
+			} });
 	}
 
 	/** Save (or update) one terminal attempt of a loop, synchronously: its terminal may outlive this session from here on. */
 	function saveTerminal(id: string, t: TerminalAttempt) {
-		const l = loops.find(x => x.id === id);
-		if (!l || readOnly || l.createdAt !== t.incarnation) return;
+		const l = loops.find(x => x.id === id && x.createdAt === t.incarnation);
+		if (readOnly || !holding()) throw new Error("this session doesn't hold the folder's loops");
+		// A loop is never removed while it has terminal attempts (see removeLoops): one missing here was never ours.
+		if (!l) throw new Error(`loop ${id} is gone`);
 		const list = (l.terminals ??= []);
 		const i = list.findIndex(x => x.attemptId === t.attemptId);
-		if (i >= 0) list[i] = { ...list[i], ...t, ref: { ...list[i]!.ref, ...t.ref } }; else list.push(t);
-		if (l.lastRun?.attemptId === t.attemptId) l.lastRun.terminal = list[i >= 0 ? i : list.length - 1]!.ref;
-		save();
+		const was = i >= 0 ? list[i]! : undefined;
+		// Kept from what was saved before: its wake, report, and whether its fired line is written.
+		const merged: TerminalAttempt = { ...was, ...t, ref: { ...was?.ref, ...t.ref }, ...(was?.wake && !t.wake ? { wake: was.wake } : {}), ...(was?.firedLogged ? { firedLogged: true as const } : {}), ...(was?.report && !t.report ? { report: was.report } : {}) };
+		if (merged.ref.dispatch === "accepted") delete merged.wake;
+		if (i >= 0) list[i] = merged; else list.push(merged);
+		if (l.lastRun?.attemptId === t.attemptId) l.lastRun.terminal = merged.ref;
+		saveStrict();
+	}
+
+	/** save(), but failing loudly: a terminal attempt that can't be recorded must not start. */
+	function saveStrict() {
+		if (!holding()) throw new Error("this session lost the folder's lock");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const tmp = `${file}.${process.pid}.tmp`;
+		fs.writeFileSync(tmp, JSON.stringify(loops, null, 2), { mode: 0o600 });
+		fs.renameSync(tmp, file);
+		migratedModes = false;
+		registerHost();
+	}
+
+	/**
+	 * Take loops out of the list (delete, expire, stop, clear). One with terminal attempts not yet confirmed gone is
+	 * paused and marked `removing` instead: the sweep ends its agents and removes it once its inventory is empty, so a
+	 * live terminal is never left with nothing that knows about it. Returns the ones that wait.
+	 */
+	function removeLoops(gone: Loop[]): Loop[] {
+		const wait = gone.filter(l => l.terminals?.length);
+		for (const l of wait) { l.removing = true; l.paused = true; delete l.pendingWake; }
+		loops = loops.filter(x => !gone.includes(x) || wait.includes(x));
+		return wait;
 	}
 
 	/** This loop's terminal attempts whose agents are still running (a thread conversation is theirs while so). */
@@ -1612,7 +1658,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Start one run of a fire: on `choice`, or with a fallback list, on the first model the holds and a check (if any) allow. */
 	function launch(l: Loop, a: Launch, place: ReturnType<typeof runPlace>, choice: string | undefined, s: { args: string[]; mode: RunMode }, attemptId: string) {
 		// A launch begun by older code (0.19.1, before a /reload into this one) has no runner: it was a hidden child.
-		const run = makeRun(l, a.runner ?? RPC_RUNNER, a.meta.fire, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, a.report, a.meta), attemptId }, a.text, a.meta);
+		const run = makeRun(l, a.runner ?? RPC_RUNNER, a.meta.fire, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, a.report, a.meta), attemptId }, a.text, a.meta, a.gate, a.report);
 		run.origin = originOf(l);
 		(shared.launches ??= new WeakMap()).set(run, a);
 		shared.runs.set(l.id, run);
@@ -1764,7 +1810,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 			...(isTerminal(run) && run.ref ? { terminal: run.ref } : {}) };
 		// Models this fire passed over because their Pi didn't start: another one did, so it was them.
 		for (const key of shared.launches?.get(run)?.unstarted.splice(0) ?? []) holdFor(cur, key, run.fire, "not_started");
-		if (meta) { logFired(meta, run.sessionFile, cur.lastRun); delete cur.returned; }
+		// A terminal attempt's fired line is written once: marked in its inventory and saved first, then logged (a crash
+		// in between loses the line, never doubles it).
+		const ta = isTerminal(run) ? cur.terminals?.find(x => x.attemptId === run.attemptId) : undefined;
+		if (meta && !ta?.firedLogged) {
+			if (ta) { ta.firedLogged = true; delete ta.wake; }
+			delete cur.returned;
+			save();
+			logFired(meta, run.sessionFile, cur.lastRun);
+		}
 		save(); refreshStatus();
 		if (note) notify(`loop ${id}: ${note}`, "info");
 	}
@@ -1779,34 +1833,40 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (run.handedOver || run.recorded) return;
 		endRun(run, "failed", { findings: true, result: `couldn't start: ${why}` });
 		const cur = loops.find(x => x.id === id);
-		// A terminal attempt that never got going: gone (stop() confirmed it), so it leaves the inventory; one that
-		// wouldn't end stays, and the sweep ends it.
+		// A terminal attempt is retired first (recorded; gone ones leave the inventory, one that wouldn't end stays for
+		// the sweep), before any fallback can start another on its loop.
+		let savedWake: Loop["pendingWake"];
 		if (cur && isTerminal(run) && cur.terminals?.some(t => t.attemptId === run.attemptId)) {
 			const t = cur.terminals.find(x => x.attemptId === run.attemptId)!;
-			t.recorded = true;
+			savedWake = t.wake; t.recorded = true;
 			if (run.gone) forgetTerminal(cur, run.attemptId);
 		}
 		const uncertain = run.promptUncertain || run.promptDispatched === undefined; // Older active code has no dispatch proof.
 		traceRun(run, "terminal", { status: "failed", error: true, session: run.sessionFile });
 		if (!cur || !sameRun(cur, run)) return;
-		// Nothing was sent: the next model on the loop's list can take this fire.
-		if (!uncertain && !run.promptDispatched && fallBack(cur, run, shared.launches?.get(run)?.noCredentials ? "no_credentials" : "not_started")) return;
-		// A failed/missing acknowledgement can follow effects. Stop retries until reconciled.
-		if (uncertain) { cur.paused = true; delete cur.pendingWake; }
+		// Nothing was sent: the next model on the loop's list can take this fire. A terminal attempt whose agent wouldn't
+		// end blocks that (a fallback would be a second writer); the sweep ends it and the wake is kept.
+		const blocked = isTerminal(run) && !run.gone;
+		if (!uncertain && !run.promptDispatched && !blocked && fallBack(cur, run, shared.launches?.get(run)?.noCredentials ? "no_credentials" : "not_started")) return;
+		// A failed/missing acknowledgement can follow effects. Stop retries until reconciled. A terminal run's gate wake
+		// is kept even then (resuming runs it again); RPC's is dropped, as before.
+		if (uncertain) { cur.paused = true; if (isTerminal(run) && (savedWake ?? gate)) cur.pendingWake = savedWake ?? keptWake(gate!, Date.now(), cur.rev ?? 0); else delete cur.pendingWake; }
+		if (uncertain && isTerminal(run)) deliver({ content: `[loop ${id} · run #${run.fire} · acceptance unknown] its prompt was sent but never acknowledged (${why}); it may have run, so the loop is paused (resume runs it again)`, details: { id, status: "failed" } });
 		// A gate may have recorded that it reported this: keep its wake rather than ask it again. Otherwise try
 		// this occurrence again soon, a few times, before leaving it to the schedule.
 		cur.startFailures = (cur.startFailures ?? 0) + 1;
 		const retry = !uncertain && cur.startFailures <= 3;
-		if (gate && !uncertain) {
-			cur.pendingWake = keptWake(gate, Date.now(), cur.rev ?? 0);
+		if ((gate || savedWake) && !uncertain) {
+			cur.pendingWake = savedWake ?? keptWake(gate!, Date.now(), cur.rev ?? 0);
 			if (!retry) cur.paused = true; // Keep the wake without an unbounded 15-second startup storm.
 		} else if (retry) cur.nextAt = Math.min(cur.nextAt, Date.now() + 2 * 60_000);
+		const wakeKept = !!(gate || savedWake);
 		// A run started again on its own conversation (leave, steer) keeps that conversation: it can still be opened.
 		const session = run.sessionFile ?? (cur.lastRun?.fire === run.fire ? cur.lastRun?.session : undefined);
 		cur.lastRun = { attemptId: run.attemptId, acceptance: uncertain ? "unknown" : "not_accepted", fire: run.fire, mode: run.mode, status: "failed", startedAt, endedAt: Date.now(), result: `couldn't start: ${why}`, findings: true, unread: true, host: process.pid, ...(session ? { session } : {}), ...modelOf(cur, run),
 			...(isTerminal(run) && run.ref ? { terminal: run.ref } : {}) };
 		save(); refreshStatus();
-		notify(`loop ${id}: its background run couldn't start (${why}); ${uncertain ? "acceptance is unknown; the loop is paused pending reconciliation, not retried" : gate && !retry ? "startup retries exhausted; its wake is kept and the loop is paused" : gate || retry ? "it is tried again soon" : "it runs again at its next time"}`, "warning");
+		notify(`loop ${id}: its background run couldn't start (${why}); ${uncertain ? "acceptance is unknown; the loop is paused pending reconciliation, not retried" : wakeKept && !retry ? "startup retries exhausted; its wake is kept and the loop is paused" : wakeKept || retry ? "it is tried again soon" : "it runs again at its next time"}`, "warning");
 	}
 
 	/** Wait until a run has really finished (idle and staying idle), then hand it to the live instance. */
@@ -1838,10 +1898,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** Every tick: attempts whose agents have gone since are forgotten; one still running after its run was recorded is ended again. */
 	async function sweepTerminals() {
-		for (const l of loops) for (const t of [...(l.terminals ?? [])]) {
-			if (shared.runs.get(l.id)?.attemptId === t.attemptId) continue;
-			if (!sameProcess(t.ref.pid, t.ref.pidStart) && (t.ref.pid || t.recorded || Date.now() - t.startedAt > 5 * 60_000)) { forgetTerminal(l, t.attemptId); save(); continue; }
-			if (t.recorded && await endProcess(t.ref, t.attemptId, 5_000, true)) { forgetTerminal(l, t.attemptId); save(); }
+		for (const l of [...loops]) {
+			for (const t of [...(l.terminals ?? [])]) {
+				// The one being followed is its run's to end; any other attempt (recorded, superseded, or of a loop going) is ended here.
+				if (shared.runs.get(l.id)?.attemptId === t.attemptId) continue;
+				if (!sameProcess(t.ref.pid, t.ref.pidStart) && (t.ref.pid || t.recorded || Date.now() - t.startedAt > 5 * 60_000)) { forgetTerminal(l, t.attemptId); save(); continue; }
+				if (t.ref.pid && await endProcess(t.ref, t.attemptId, 5_000, true)) { forgetTerminal(l, t.attemptId); save(); }
+			}
+			if (l.removing && !l.terminals?.length && !shared.runs.has(l.id)) { loops = loops.filter(x => x !== l); save(); refreshStatus(); }
 		}
 	}
 
@@ -1903,17 +1967,19 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const ask = o.rep?.ask?.trim() || undefined;
 		traceRun(run, "terminal", { status: o.status, session: run.sessionFile, findings: o.findings, hasAsk: !!ask, needsPermission: !!run.needsYou, error: o.status === "failed" });
 		endRun(run, o.status, { findings: o.findings, result: o.summary.slice(0, 500), ...(ask ? { ask } : {}), ...(run.needsYou ? { needsYou: true } : {}) });
-		// A model that served a run is available. One that couldn't, for want of it, is held back and the fire
-		// goes on on the next model; that attempt leaves no record of its own (the next run's passedOver has it).
-		if (l && run.model && o.status === "done") releaseModel(l, run.model);
-		if (l && o.unavailable && fallBack(l, run, o.unavailable)) return;
-		const rec: RunRecord = { attemptId: run.attemptId, acceptance: run.promptAccepted ? "accepted" : "unknown", fire: run.fire, mode: run.mode, status: o.status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
-			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), ...(ask ? { ask } : {}), unread: false, ...(l ? modelOf(l, run) : {}),
-			...(isTerminal(run) && run.ref ? { terminal: run.ref } : {}) };
+		// A terminal attempt is retired before anything else (recorded; gone, it leaves the inventory).
 		if (l && isTerminal(run)) {
 			const t = l.terminals?.find(x => x.attemptId === run.attemptId);
 			if (t) { t.recorded = true; if (run.gone) forgetTerminal(l, run.attemptId); }
 		}
+		// A model that served a run is available. One that couldn't, for want of it, is held back and the fire
+		// goes on on the next model; that attempt leaves no record of its own (the next run's passedOver has it).
+		// Never while an agent of this loop is still running: that would be a second writer.
+		if (l && run.model && o.status === "done") releaseModel(l, run.model);
+		if (l && o.unavailable && !(isTerminal(run) && !run.gone) && fallBack(l, run, o.unavailable)) return;
+		const rec: RunRecord = { attemptId: run.attemptId, acceptance: run.promptAccepted ? "accepted" : "unknown", fire: run.fire, mode: run.mode, status: o.status, startedAt: l?.lastRun?.startedAt ?? Date.now(), endedAt: Date.now(), session: run.sessionFile, host: process.pid,
+			result: o.summary.slice(0, 2000), findings: o.findings, ...(run.needsYou ? { needsYou: run.needsYou } : {}), ...(ask ? { ask } : {}), unread: false, ...(l ? modelOf(l, run) : {}),
+			...(isTerminal(run) && run.ref ? { terminal: run.ref } : {}) };
 		if (l) {
 			l.lastRun = rec;
 			if (o.status === "done" && o.rep && (!run.origin || (l.rev ?? 0) === run.origin.revision)) applyReport(l, o.rep);
@@ -2140,7 +2206,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function applyReport(l: Loop, rep: Report) {
 		if (rep.stop) {
 			if (l.source) { l.paused = true; notify(`loop ${l.id} asked to stop; it is declared in ${l.source}, so it is paused`, "info"); }
-			else { loops = loops.filter(x => x !== l); notify(`loop ${l.id} finished what it was watching and ended`, "info"); }
+			else { removeLoops([l]); notify(`loop ${l.id} finished what it was watching and ended`, "info"); }
 			return;
 		}
 		if (rep.next) {
@@ -2175,6 +2241,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (isTerminal(run) && run.ref) return terminalHint(l.id, run.ref, "its run is");
 		const still = liveTerminals(l)[0];
 		if (still) return terminalHint(l.id, still.ref, "an earlier run of it is still");
+		// A finished terminal run's conversation is opened by you, not stepped into from here (documented in RUNNERS.md).
+		if (!run && l.lastRun?.terminal) return finishedTerminalHint(l);
 		if (run?.backgroundWork && !now && !anyway) return `${l.id}'s run is waiting for background work it started, which reports back only to that run; watch or steer it, or /loop take ${l.id} now to stop it anyway (that work may not report back)`;
 		const file = run?.sessionFile ?? l.lastRun?.session;
 		if (!file) return `${l.id} has no run to go into`;
@@ -2220,6 +2288,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			return "couldn't switch into the run";
 		}
 		return undefined;
+	}
+
+	/** A finished terminal run: where its conversation is, to open yourself once its agent is gone. */
+	function finishedTerminalHint(l: Loop): string {
+		const s = l.lastRun?.session;
+		return `${l.id}'s last run ran in a terminal and has ended; open its conversation yourself${s ? `: pi --session ${s}` : ""}`;
 	}
 
 	/** Where a terminal run is, for people. */
@@ -2290,6 +2364,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 				if (ext) return { error: "it is already taken over in another terminal" };
 				if (!mine && l.lastRun?.fire !== fireNo) return { error: `run #${fireNo} has been replaced by #${l.lastRun?.fire}` };
 				if (!mine && run) return { error: "another run of this loop is going" };
+				if (isTerminal(mine) || (!mine && l.lastRun?.terminal) || liveTerminals(l).length) return { error: isTerminal(mine) && mine.ref ? terminalHint(l.id, mine.ref, "its run is") : finishedTerminalHint(l) };
 				const file = mine?.sessionFile ?? l.lastRun?.session;
 				if (!file) return { error: "it has no conversation yet" };
 				let place: ReturnType<typeof runPlace>;
@@ -2431,14 +2506,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 	async function resumeRun(l: Loop, text: string, from = "the owner's words"): Promise<string> {
 		if (phase?.id === l.id) return `loop ${l.id} waits for its current foreground turn to finish`;
 		const r = l.lastRun!;
-		const report = reportFileOf(l, r.fire);
-		try { fs.rmSync(report, { force: true }); } catch { /* none */ }
-		// A terminal run's conversation is the owner's to open (pi --session ...), once its agent is gone: carrying it on
-		// from here would mean a second writer, or a session reused for another purpose. Not done.
+		// Refused before anything is touched (its report stays as it is).
 		if (r.terminal) {
 			const still = liveTerminals(l)[0];
-			return still ? terminalHint(l.id, still.ref, "its run is still") : `${l.id}'s last run ran in a terminal and has ended; open its conversation yourself${r.session ? `: pi --session ${r.session}` : ""}`;
+			return still ? terminalHint(l.id, still.ref, "its run is still") : finishedTerminalHint(l);
 		}
+		const report = reportFileOf(l, r.fire);
+		try { fs.rmSync(report, { force: true }); } catch { /* none */ }
 		let place: ReturnType<typeof runPlace>;
 		try { place = runPlace(l); } catch (e) { return `${l.id}: ${(e as Error).message}`; }
 		const run = new Run(l.id, r.fire, r.mode, { ...place, sessionArgs: ["--session", r.session!], env: childEnv(l, report) });
@@ -2696,7 +2770,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		// A declared loop whose file no longer declares it is gone; one in a broken file is kept as it was.
 		const kept = loops.filter(l => !l.source || seen.has(l.id) || broken.has(l.source) || heldBack.has(l.id));
-		if (kept.length !== loops.length) { loops = kept; changed = true; }
+		if (kept.length !== loops.length) { removeLoops(loops.filter(l => !kept.includes(l))); changed = true; }
+		// Declared again while it waited to go: it stays.
+		for (const l of loops) if (l.removing && l.source && seen.has(l.id)) { delete l.removing; changed = true; }
 		if (changed) { save(); refreshStatus(); }
 	}
 
@@ -2794,8 +2870,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// A held folder is asked again now and then (its owner may have quit).
 		if (foreign.size && ++ticks % 4 === 0) { declaredSeen = undefined; syncDeclared(); }
 		// Sessions kept open after their runs close once nobody uses them (counted apart, so the foreign-folder retry keeps its phase).
-		if (loops.some(l => l.terminals?.length) && ++sweepTicks % 4 === 0) void sweepTerminals();
-		const dueNow = loops.filter(l => !l.paused && !gating.has(l.id) && heldFor(l) && (shared.away ?? shared.leaving)?.id !== l.id && (l.nextAt <= now || l.pendingWake));
+		if (loops.some(l => l.terminals?.length || l.removing) && ++sweepTicks % 4 === 0) void sweepTerminals();
+		const dueNow = loops.filter(l => !l.paused && !l.removing && !gating.has(l.id) && heldFor(l) && (shared.away ?? shared.leaving)?.id !== l.id && (l.nextAt <= now || l.pendingWake));
 		// Background loops need only a run slot: each due one starts now, or runs once more after its current run.
 		for (const l of dueNow.filter(background)) {
 			if (phase?.id === l.id) continue;
@@ -2826,9 +2902,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const over = (l: Loop) => l.expiresAt !== undefined && l.expiresAt <= now && !shared.runs.has(l.id) && (shared.away ?? shared.leaving)?.id !== l.id && !gating.has(l.id);
 		// A declared loop past its `until` is paused: its file is yours to edit.
 		for (const l of loops) if (l.source && over(l) && !l.paused) { l.paused = true; notify(`loop ${l.id} reached its until and is paused (${l.source})`, "info"); save(); }
-		const gone = loops.filter(l => !l.source && over(l));
+		const gone = loops.filter(l => !l.source && over(l) && !l.removing);
 		if (!gone.length) return;
-		loops = loops.filter(l => !gone.includes(l));
+		removeLoops(gone);
 		for (const l of gone) {
 			waited.delete(l.id);
 			logDecision(gateLog, { ts: new Date(now).toISOString(), id: l.id, action: "expired", reason: `ended ${fmtTime(l.expiresAt!, zoneOf(l))}`, ms: 0 });
@@ -2937,42 +3013,58 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * A terminal attempt an earlier session of the loop left (its terminal outlives that session). Followed from its
-	 * saved state, reading only its own attempt's events: if it took its prompt (saved, or in its channel), the fire
-	 * is counted exactly as when it was seen live (runStarted, idempotent), and its report applies only to the
-	 * definition it ran for. One that never got its prompt is ended and the fire is not counted. Returns whether a run
-	 * is now followed for the loop.
+	 * A terminal attempt an earlier session of the loop left (its terminal outlives that session), by what was saved
+	 * about its prompt and what its own events say:
+	 *   accepted  followed (its own attempt's events only); its fire counted once, if the session that saw it died first
+	 *   refused   proven not to have run: ended; the occurrence not counted, its wake kept (it runs again)
+	 *   sent, not acknowledged, or none  ended; recorded unknown (it may have run) or interrupted (it can't have); the
+	 *             loop paused, the gate's wake kept, and the owner told. Never followed: an unacknowledged prompt is
+	 *             one rule, the same as a live launch whose acknowledgement deadline passes.
+	 * Its report applies only to the definition it ran for. Returns whether a run is now followed for the loop.
 	 */
 	function adopt(l: Loop, t: TerminalAttempt): boolean {
 		let runner: RunnerSpec;
 		try { runner = resolveRunner(t.ref.runner, runnerSettings()); } catch { runner = { name: t.ref.runner, kind: "command", commands: false }; }
 		let place: ReturnType<typeof runPlace>;
 		try { place = runPlace(l); } catch { place = { cwd: ctx!.cwd, extra: [] }; }
-		const run = new TerminalRun(l.id, t.fire, t.mode, { ...place, ...(t.model ? splitModel(t.model) : {}), sessionArgs: [], env: childEnv(l, reportFileOf(l, t.fire)), runner, attemptId: t.attemptId,
+		const report = t.report ?? reportFileOf(l, t.fire);
+		const run = new TerminalRun(l.id, t.fire, t.mode, { ...place, ...(t.model ? splitModel(t.model) : {}), sessionArgs: [], env: childEnv(l, report), runner, attemptId: t.attemptId,
 			title: `loop ${l.id} #${t.fire}`, name: `${l.id}-${t.fire}`, description: l.prompt.slice(0, 160), project: ctx!.cwd, emit: emitBus,
 			socketDir: path.join(agentDir(), "loop-hosts", "ctl"), channelRoot: path.dirname(t.ref.channel),
-			persist: ref => saveTerminal(l.id, { ...t, ref }) });
+			persist: (ref, extra) => saveTerminal(l.id, { ...t, ref, ...(extra.session ? { session: extra.session } : {}) }) });
 		run.origin = { ...originOf(l), incarnation: t.incarnation, revision: t.rev };
 		run.adopt(t.ref, t.session);
-		const lr = l.lastRun?.attemptId === t.attemptId ? l.lastRun : undefined;
-		if (!run.promptDispatched || (!run.promptAccepted && run.exited)) {
-			// Its prompt never left (or it is gone without taking it): nothing ran. End what is left; the occurrence is
-			// interrupted as before (not counted, the loop paused if it might have been sent).
-			void run.stop().then(() => { if (run.gone) { forgetTerminal(l, t.attemptId); save(); } });
-			return false;
-		}
+		if (!run.promptAccepted) { settleUnacknowledged(l, t, run); return false; }
 		shared.runs.set(l.id, run);
-		const fired = l.fires >= t.fire;
-		l.lastRun = { ...(lr ?? { attemptId: t.attemptId, fire: t.fire, mode: t.mode, startedAt: t.startedAt }), status: "running", acceptance: run.promptAccepted ? "accepted" : "unknown", host: process.pid, terminal: t.ref, ...(t.session ? { session: t.session } : {}) };
+		const lr = l.lastRun?.attemptId === t.attemptId ? l.lastRun : undefined;
+		l.lastRun = { ...(lr ?? { attemptId: t.attemptId, fire: t.fire, mode: t.mode, startedAt: t.startedAt }), status: "running", acceptance: "accepted", host: process.pid, terminal: t.ref, ...(t.session ? { session: t.session } : {}) };
 		trace({ event: "attempt", loop: run.origin, attemptId: t.attemptId, fire: t.fire, mode: t.mode, by: "resume" });
-		// Accepted, but the session that saw it stopped before it counted the fire: count it now, once.
-		if (run.promptAccepted && !fired) runStarted(l.id, run, undefined, t.meta);
-		else if (!run.promptAccepted) {
-			// Sent, not seen taken: followed until it says so (then counted) or its stall bound ends it.
-			const off = run.onChange(() => { if (run.promptAccepted) { off(); if (l.fires < t.fire) live(cur => cur.runStarted(l.id, run, undefined, t.meta)); } });
-		}
-		void watchRun(run, reportFileOf(l, t.fire));
+		// Accepted, but the session that saw it stopped before it counted the fire (or logged it): now, once.
+		if (l.fires < t.fire || !t.firedLogged) runStarted(l.id, run, undefined, t.meta);
+		void watchRun(run, report);
 		return true;
+	}
+
+	/**
+	 * A terminal attempt picked up without an acknowledged prompt: ended (and confirmed gone, or left in the inventory for
+	 * the sweep), then recorded. Proven refusal or never sent: interrupted, not counted, its wake kept so it runs again.
+	 * Sent and unacknowledged: unknown, the loop paused with its wake kept, the owner told; resuming it sends the wake.
+	 */
+	function settleUnacknowledged(l: Loop, t: TerminalAttempt, run: TerminalRun) {
+		// Sent, unless its own events prove it refused (written by its companion before anything ran).
+		const sent = t.ref.dispatch === "sent" && run.refusedWhy === undefined;
+		const wake = t.wake ?? l.pendingWake;
+		const lr = l.lastRun?.attemptId === t.attemptId ? l.lastRun : undefined;
+		if (wake) l.pendingWake = wake;
+		if (sent) l.paused = true;
+		trace({ event: "interruption", loop: run.origin!, attemptId: t.attemptId, fire: t.fire, mode: t.mode, status: "interrupted", acceptance: sent ? "unknown" : "not_accepted", session: t.session });
+		const result = sent ? "its prompt was sent but never acknowledged before the session that ran it stopped; it may have run, so the loop is paused (resume runs it again)"
+			: "the session that started it stopped before its prompt was sent; it didn't run";
+		l.lastRun = { ...(lr ?? { attemptId: t.attemptId, fire: t.fire, mode: t.mode, startedAt: t.startedAt }), status: "interrupted", acceptance: sent ? "unknown" : "not_accepted", endedAt: Date.now(), findings: true, unread: true, host: process.pid, result, terminal: t.ref, ...(t.session ? { session: t.session } : {}) };
+		t.recorded = true;
+		save();
+		if (sent) deliver({ content: `[loop ${l.id} · run #${t.fire} · acceptance unknown] ${result}`, details: { id: l.id, status: "interrupted" } });
+		void run.stop().then(() => { if (run.gone) { forgetTerminal(l, t.attemptId); save(); } });
 	}
 
 	/** Runs recorded as going under a Pi that is gone (a crash, a restart) were interrupted: say so, never resume them by themselves. */
@@ -2989,8 +3081,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			// (recorded, or superseded) whose agents still run are ended by the sweep; gone ones are forgotten.
 			if (l.terminals?.length && !shared.runs.has(l.id)) {
 				const current = r && ["starting", "running"].includes(r.status) ? l.terminals.find(t => t.attemptId === r.attemptId && !t.recorded) : undefined;
-				if (current && adopt(l, current)) { changed = true; continue; }
 				changed = true;
+				// Followed, or settled by the one rule for an unacknowledged prompt: either way its record is done here.
+				if (current) { adopt(l, current); continue; }
 			}
 			if (!r || !["starting", "running", "away"].includes(r.status) || shared.runs.has(l.id)) continue;
 			if (r.host === process.pid && (shared.away?.id === l.id || shared.external?.has(l.id))) continue;
@@ -3128,8 +3221,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 			if (trimmed === "clear") {
 				if (readOnly) { notify(`loops are owned by pid ${ownerPid()}`, "warning"); return; }
-				const keep = loops.filter(l => l.source);
-				const n = loops.length - keep.length; loops = keep; save(); refreshStatus();
+				const drop = loops.filter(l => !l.source && !l.removing), keep = loops.filter(l => l.source);
+				const n = drop.length; removeLoops(drop); save(); refreshStatus();
 				notify(`removed ${n} loop${n === 1 ? "" : "s"}${keep.length ? `; ${keep.length} declared in .pi/loop.json files kept (edit them there)` : ""}`); return;
 			}
 			const [verb, target, ...more] = trimmed.split(/\s+/);

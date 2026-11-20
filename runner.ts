@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import * as net from "node:net";
 import { randomBytes } from "node:crypto";
 import { Run, lastAssistantText, piCommand, type RunMode } from "./background.ts";
-import { Tail, makeChannel, sendCommand, removeChannel, scrubChannel } from "./channel.ts";
+import { Tail, makeChannel, sendCommand, sendEvent, removeChannel, scrubChannel } from "./channel.ts";
 
 declare const __filename: string | undefined;
 function here(): string {
@@ -186,11 +186,14 @@ export function sameProcess(pid: number | undefined, start: string | undefined):
 /**
  * The one-time handoff: a run's launcher (bin/loop-run.mjs start, in its terminal) asks this session, over a private
  * socket, for its environment and argv with a single-use token. Nothing of them is written to disk; a token is
- * answered once, and forgotten after it is used, its run ends, or a minute passes.
+ * answered once, and forgotten after it is used, its run ends, or its deadline passes. Its run's record must have
+ * been saved (`onTaken` returns normally) before the argv is sent: if that save fails, the launcher is refused.
  */
-interface Handoff { env: Record<string, string>; argv: string[]; cwd: string; expires: number; onTaken(pid: number): void }
+interface Handoff { env: Record<string, string>; argv: string[]; cwd: string; expires: number; onTaken(pid: number, start?: string): void }
 const HANDOFF = Symbol.for("pi-loop.runner.handoff.v1");
-function handoffs(): { server?: net.Server; file?: string; offers: Map<string, Handoff> } {
+/** A launcher's request is one short line; a connection gets this long to send it. */
+const HANDOFF_MAX_BYTES = 4096, HANDOFF_CONN_MS = 10_000;
+function handoffs(): { server?: net.Server; file?: string; listening?: Promise<string>; offers: Map<string, Handoff> } {
 	return ((globalThis as any)[HANDOFF] ??= { offers: new Map() });
 }
 /** Stop answering launchers (Pi is quitting): offers still open are dropped, their runs fail to start. */
@@ -198,38 +201,59 @@ export function closeHandoffs() {
 	const h = handoffs();
 	h.offers.clear();
 	try { h.server?.close(); if (h.file) fs.rmSync(h.file, { force: true }); } catch { /* gone */ }
-	h.server = undefined; h.file = undefined;
+	h.server = undefined; h.file = undefined; h.listening = undefined;
 }
-function handoffServer(dir: string): string {
+/** Socket files of sessions that are gone (a hard kill leaves its path): removed. */
+function scavenge(dir: string) {
+	let names: string[] = [];
+	try { names = fs.readdirSync(dir); } catch { return; }
+	for (const n of names) {
+		const m = /^(\d+)-runs\.sock$/.exec(n);
+		if (m && Number(m[1]) !== process.pid && !pidAlive(Number(m[1]))) { try { fs.rmSync(path.join(dir, n), { force: true }); } catch { /* not ours */ } }
+	}
+}
+/** The handoff socket, listening; rejects (and leaves nothing behind) when it can't listen. */
+function handoffServer(dir: string): Promise<string> {
 	const h = handoffs();
-	if (h.server && h.file && fs.existsSync(h.file)) return h.file;
+	if (h.listening && h.server && h.file && fs.existsSync(h.file)) return h.listening;
 	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 	try { fs.chmodSync(dir, 0o700); } catch { /* not ours */ }
+	scavenge(dir);
 	const file = path.join(dir, `${process.pid}-runs.sock`);
 	try { fs.rmSync(file, { force: true }); } catch { /* none */ }
 	const server = net.createServer(sock => {
-		let buf = "";
+		let buf = "", done = false;
+		const refuse = (why: string) => { if (done) return; done = true; try { sock.end(JSON.stringify({ error: why }) + "\n"); } catch { /* gone */ } };
 		sock.setEncoding("utf8");
+		sock.setTimeout(HANDOFF_CONN_MS, () => sock.destroy());
 		sock.on("error", () => { /* the launcher went away */ });
 		sock.on("data", (d: string) => {
+			if (done) return;
 			buf += d;
+			if (buf.length > HANDOFF_MAX_BYTES) { done = true; sock.destroy(); return; }
 			const i = buf.indexOf("\n");
 			if (i < 0) return;
 			let req: any;
-			try { req = JSON.parse(buf.slice(0, i)); } catch { sock.end(); return; }
+			try { req = JSON.parse(buf.slice(0, i)); } catch { refuse("not a request"); return; }
 			const offer = typeof req?.token === "string" ? h.offers.get(req.token) : undefined;
 			if (offer) h.offers.delete(req.token);
-			if (!offer || offer.expires < Date.now()) { sock.end(JSON.stringify({ error: "no such run (or it was already started)" }) + "\n"); return; }
-			try { offer.onTaken(Number(req.pid) || 0); } catch { /* the run's problem */ }
+			if (!offer || offer.expires < Date.now()) { refuse("no such run (or it was already started)"); return; }
+			try { offer.onTaken(Number(req.pid) || 0, typeof req.start === "string" ? req.start : undefined); }
+			catch { refuse("the session that runs this loop couldn't record this run, so it doesn't start"); return; }
+			done = true;
 			sock.end(JSON.stringify({ env: offer.env, argv: offer.argv, cwd: offer.cwd }) + "\n");
 		});
 	});
-	server.on("error", () => { /* a failed listen: launches fail clearly, nothing else is affected */ });
+	h.server = server; h.file = file;
+	h.listening = new Promise<string>((resolve, reject) => {
+		const fail = (e: Error) => { try { server.close(); } catch { /* */ } try { fs.rmSync(file, { force: true }); } catch { /* */ } if (h.server === server) { h.server = undefined; h.file = undefined; h.listening = undefined; } reject(e); };
+		server.once("error", fail);
+		server.once("listening", () => { server.off("error", fail); server.on("error", () => { /* later errors: launches fail clearly */ }); resolve(file); });
+	});
 	const old = process.umask(0o177);
 	try { server.listen(file); } finally { process.umask(old); }
 	server.unref();
-	h.server = server; h.file = file;
-	return file;
+	return h.listening;
 }
 
 /** Persisted with the run's record before its terminal is asked for, so a later session can find (or rule out) it. */
@@ -239,7 +263,9 @@ export interface TerminalRef {
 	pid?: number; pidStart?: string;
 	terminal?: string; attach?: string;
 	/** Where the prompt stood when last saved: not sent yet, sent (so maybe running), or taken (it said so). */
-	dispatch?: "none" | "sent" | "accepted";
+	dispatch?: "none" | "sent" | "accepted" | "refused";
+	/** When the prompt was sent (the acknowledgement deadline runs from it, also after a restart). */
+	sentAt?: number;
 	/** Another agent's own session id, as its hooks reported it: a thread's next fire resumes it. */
 	thread?: string;
 }
@@ -291,8 +317,11 @@ export interface TerminalOpts {
 	title: string; name: string; description: string; project: string;
 	/** Emits on pi.events (the live session's bus). */
 	emit(channel: string, data: object): void;
-	/** Called (synchronously) whenever something it must find again after a restart changes: its ref. Saves the record. */
-	persist(ref: TerminalRef): void;
+	/**
+	 * Called synchronously whenever something it must find again after a restart changes. Saves the loop's record;
+	 * throws when it can't (no lock, a failed write), and then nothing more is started or sent for this attempt.
+	 */
+	persist(ref: TerminalRef, extra: { model?: string; session?: string }): void;
 	/** A thread's agent session id from its last run (another agent's resume id). */
 	thread?: string;
 }
@@ -304,6 +333,8 @@ function launcherCommand(): string[] {
 
 /** The longest a provider may take to open a terminal, and an agent to say it is up. */
 const OPEN_TIMEOUT_MS = 20_000, START_TIMEOUT_MS = 90_000;
+/** The longest a prompt waits to be acknowledged while its run shows signs of life, and compaction may pause the clocks. */
+export const ACK_CAP_MS = 10 * 60_000, COMPACTION_CAP_MS = 10 * 60_000;
 
 /**
  * A background run in a terminal. It behaves as a Run to the rest of pi-loop: acceptance, working and idle,
@@ -321,7 +352,8 @@ export class TerminalRun extends Run {
 	pidStart?: string;
 	/** Its agent session id, as its hooks report it (another agent's thread). */
 	thread?: string;
-	private dispatch: "none" | "sent" | "accepted" = "none";
+	private dispatch: "none" | "sent" | "accepted" | "refused" = "none";
+	private sentAt?: number;
 	private tail?: Tail;
 	private timer?: ReturnType<typeof setInterval>;
 	private started = false;
@@ -332,7 +364,11 @@ export class TerminalRun extends Run {
 	private acceptWaiters: ((e: any) => void)[] = [];
 	private startWaiters: ((e: any) => void)[] = [];
 	private compacting = false;
+	private compactingSince = 0;
+	/** Compaction pauses the acknowledgement and stall clocks, for at most this long. */
+	private get compactionExempt(): boolean { return this.compacting && Date.now() - this.compactingSince < COMPACTION_CAP_MS; }
 	private token?: string;
+	private handoffFailed?: string;
 	/** It closed itself (the owner quit it, or the loop asked it to), rather than crashed or was killed. */
 	closedNormally = false;
 	/** It was working when its process went away (rather than settled after the loop's prompt). */
@@ -352,10 +388,13 @@ export class TerminalRun extends Run {
 	/** Its record's pointer to the terminal (see TerminalRef). */
 	get ref(): TerminalRef | undefined {
 		return this.channel ? { runner: this.runner.name, channel: this.channel, ...(this.pid ? { pid: this.pid } : {}), ...(this.pidStart ? { pidStart: this.pidStart } : {}),
-			...(this.term ? { terminal: this.term.id } : {}), ...(this.term?.attach ? { attach: this.term.attach } : {}), dispatch: this.dispatch, ...(this.thread ? { thread: this.thread } : {}) } : undefined;
+			...(this.term ? { terminal: this.term.id } : {}), ...(this.term?.attach ? { attach: this.term.attach } : {}), dispatch: this.dispatch, ...(this.sentAt ? { sentAt: this.sentAt } : {}), ...(this.thread ? { thread: this.thread } : {}) } : undefined;
 	}
 	get terminal(): string | undefined { return this.term?.id; }
-	private save() { const r = this.ref; if (r) { try { this.topts.persist(r); } catch { /* the record's problem */ } } }
+	/** Save its record (throws when that fails: callers that start or send something must not go on). */
+	private save() { const r = this.ref; if (r) this.topts.persist(r, { ...(this.model ? { model: this.model } : {}), ...(this.sessionFile ? { session: this.sessionFile } : {}) }); }
+	/** Save where failing can't undo anything (it already happened): said, and the next save tries again. */
+	private trySave() { try { this.save(); } catch { /* the next save, or a restart's pickup, catches up */ } }
 
 	private argv(): string[] {
 		const spec = this.runner, o = this.topts;
@@ -412,21 +451,33 @@ export class TerminalRun extends Run {
 		this.topts.emit("loop:terminal", req);
 		if (!offers.length) throw new NoTerminal("no terminal provider: nothing on pi.events supplies terminals (loop:terminal), e.g. pi-loop-herdr");
 		this.writeFiles();
-		const sock = handoffServer(this.topts.socketDir);
+		const sock = await handoffServer(this.topts.socketDir);
 		// The launcher reads the socket and token from a file only it can read, removed as it reads it.
 		fs.writeFileSync(path.join(this.channel, "start"), JSON.stringify({ socket: sock, token: this.token, attempt: this.attemptId }), { mode: 0o600 });
 		handoffs().offers.set(this.token, { env: this.env(req.inherit), argv: this.argv(), cwd: this.cwd, expires: Date.now() + OPEN_TIMEOUT_MS + START_TIMEOUT_MS,
-			onTaken: pid => { this.pid = pid || this.pid; this.pidStart = pidStart(this.pid); if (this.runner.prompt === "argv") { this.dispatch = "sent"; this.promptDispatched = true; } this.save(); } });
+			// Saved before the launcher gets its argv (which, for a runner taking its prompt on its command line, is the prompt).
+			onTaken: (pid, start) => {
+				this.pid = pid || this.pid; this.pidStart = start ?? pidStart(this.pid);
+				if (this.runner.prompt === "argv") { this.dispatch = "sent"; this.sentAt = Date.now(); this.promptDispatched = true; }
+				try { this.save(); }
+				catch (e) {
+					if (this.runner.prompt === "argv") { this.dispatch = "none"; this.sentAt = undefined; this.promptDispatched = false; }
+					// Refused to the launcher, and said now: its start fails at once, not after the start deadline.
+					this.handoffFailed = (e as Error).message || "its record couldn't be saved"; this.wake(this.startWaiters, {});
+					throw e;
+				}
+			} });
 		markReady();
 		this.timer = setInterval(() => this.poll(), 250);
 		this.timer.unref?.();
 		let t: ReturnType<typeof setTimeout> | undefined;
 		const handle = await Promise.race([Promise.any(offers.map(o => o.then(h => h ?? Promise.reject()))).catch(() => undefined), new Promise<undefined>(r => { t = setTimeout(() => r(undefined), OPEN_TIMEOUT_MS); })]);
 		if (t) clearTimeout(t);
-		if (handle) { this.term = handle; this.save(); }
+		if (handle) { this.term = handle; this.trySave(); }
 		// A provider that never answered may still have started the launcher: its pid (from the handoff) is what counts.
 		if (!handle && !this.pid) throw new Error("the terminal provider didn't open a terminal for the run");
-		const up = await this.until(this.startWaiters, () => this.started, START_TIMEOUT_MS);
+		const up = await this.until(this.startWaiters, () => this.started || !!this.handoffFailed, START_TIMEOUT_MS);
+		if (this.handoffFailed) throw new Error(`its record couldn't be saved (${this.handoffFailed}), so it wasn't started`);
 		if (!up) throw new Error(this.exited ? `its ${this.runner.name} exited before it started` : `its ${this.runner.name} didn't say it started within ${START_TIMEOUT_MS / 1000}s`);
 	}
 
@@ -435,16 +486,17 @@ export class TerminalRun extends Run {
 	 * for this attempt only, from the start: a run that finished meanwhile is recorded from what it said.
 	 */
 	adopt(ref: TerminalRef, session?: string) {
-		this.channel = ref.channel; this.pid = ref.pid; this.pidStart = ref.pidStart; this.dispatch = ref.dispatch ?? "none"; this.thread = ref.thread ?? this.thread;
+		this.channel = ref.channel; this.pid = ref.pid; this.pidStart = ref.pidStart; this.dispatch = ref.dispatch ?? "none"; this.sentAt = ref.sentAt; this.thread = ref.thread ?? this.thread;
 		if (session) this.sessionFile = session;
 		this.term = ref.terminal ? { id: ref.terminal, ...(ref.attach ? { attach: ref.attach } : {}) } : undefined;
 		this.tail = new Tail(path.join(ref.channel, "events.jsonl"));
 		this.started = true;
-		this.promptDispatched = this.dispatch !== "none";
+		this.promptDispatched = this.dispatch === "sent" || this.dispatch === "accepted";
+		if (this.dispatch === "refused") this.refusedWhy = "it refused the prompt";
 		if (this.dispatch === "accepted") this.promptAccepted = true;
 		this.poll();
-		// Sent but not seen taken yet: it is on its way (or hangs, which the stall check catches).
-		if (this.promptDispatched && !this.exited && !this.settledOnce) this.working = true;
+		// Followed only once it took its prompt (the caller ends one that didn't): working until it settles.
+		if (this.promptAccepted && !this.exited && !this.settledOnce) this.working = true;
 		if (!this.exited) { this.timer = setInterval(() => this.poll(), 250); this.timer.unref?.(); }
 	}
 
@@ -467,7 +519,7 @@ export class TerminalRun extends Run {
 		const stallMs = this.runner.stallMs ?? DEFAULT_STALL_MS;
 		// Bounded whatever it waits on: its turn, its prompt, or detached work it says it still owns. Typing counts as life.
 		const waiting = this.working || this.backgroundWork || (this.promptDispatched && !this.promptAccepted);
-		if (waiting && !this.dialog && !this.compacting && !this.livenessError && now - Math.max(this.lastEventAt, this.lastKeys) > stallMs) {
+		if (waiting && !this.dialog && !this.compactionExempt && !this.livenessError && now - Math.max(this.lastEventAt, this.lastKeys) > stallMs) {
 			this.livenessError = `no sign of progress from its ${this.runner.name} for ${Math.round(stallMs / 60_000)}m; stopped`;
 			void this.stop();
 			this.changed();
@@ -484,11 +536,12 @@ export class TerminalRun extends Run {
 		if (e.a !== this.attemptId) return;
 		this.lastEventAt = Date.now();
 		switch (e.e) {
-			case "spawned": if (!this.pid) { this.pid = Number(e.pid) || undefined; this.pidStart = pidStart(this.pid); } break;
+			// Its start time as the launcher read it for itself, never recomputed from a pid that may since be reused.
+			case "spawned": if (!this.pid) { this.pid = Number(e.pid) || undefined; this.pidStart = typeof e.start === "string" ? e.start : undefined; } break;
 			case "started":
 				this.started = true;
-				if (this.runner.sessions === "pi" && typeof e.session === "string") this.sessionFile = e.session;
-				if (typeof e.session_id === "string" && e.session_id && e.session_id !== this.thread) { this.thread = e.session_id; this.save(); }
+				if (this.runner.sessions === "pi" && typeof e.session === "string" && e.session !== this.sessionFile) { this.sessionFile = e.session; this.trySave(); }
+				if (typeof e.session_id === "string" && e.session_id && e.session_id !== this.thread) { this.thread = e.session_id; this.trySave(); }
 				if (Array.isArray(e.providers)) this.providers = e.providers.filter((x: unknown) => typeof x === "string");
 				this.wake(this.startWaiters, e);
 				break;
@@ -497,7 +550,11 @@ export class TerminalRun extends Run {
 				this.accept(e.disposition === "handled" ? "handled" : "started");
 				this.wake(this.acceptWaiters, e);
 				break;
-			case "refused": this.wake(this.acceptWaiters, e); break;
+			case "refused":
+				// Refused by its companion before it was sent on (it checks first): proven, nothing ran.
+				if (!this.promptAccepted) { this.refusedWhy = String(e.why ?? "it refused the prompt"); this.promptDispatched = false; this.dispatch = "refused"; this.trySave(); }
+				this.wake(this.acceptWaiters, e);
+				break;
 			// A runner that takes its prompt on its command line says so from its prompt hook (e.g. UserPromptSubmit).
 			case "prompt":
 				if (!this.promptAccepted) { this.accept("started"); this.wake(this.acceptWaiters, e); }
@@ -530,7 +587,7 @@ export class TerminalRun extends Run {
 			}
 			case "extension_error": this.extensionFailed = true; this.changed(); break;
 			case "tool": this.didWork = true; break;
-			case "compaction": this.compacting = e.phase === "start"; break;
+			case "compaction": this.compacting = e.phase === "start"; if (this.compacting) this.compactingSince = Date.now(); break;
 			// A dialog holds the run open (a command waiting on it hasn't finished), until it is answered or declined.
 			case "dialog":
 				this.dialog = { title: typeof e.title === "string" ? e.title : "a question", since: Date.now() };
@@ -551,7 +608,7 @@ export class TerminalRun extends Run {
 		this.promptAccepted = true;
 		this.disposition = disposition;
 		this.dispatch = "accepted";
-		this.save();
+		this.trySave();
 		if (disposition === "started") { this.working = true; this.starts++; this.changed(); }
 		else this.settleUnlessStarted(this.starts);
 	}
@@ -567,6 +624,8 @@ export class TerminalRun extends Run {
 		this.releaseDialog();
 		this.needsYou = `dialog: ${d.title.slice(0, 120)}`;
 		this.push([`  ! nobody answered a dialog (needs you): ${d.title.slice(0, 100)}`]);
+		// The fact is written here too, so it survives this session dying before the run declines it.
+		sendEvent(this.channel!, { e: "declined", a: this.attemptId, by: "loop" });
 		if (this.runner.commands) { try { sendCommand(this.channel!, { c: "decline", a: this.attemptId }); } catch { /* gone */ } return; }
 		// Nothing can answer it for this agent: the run ends here, and says what it needed.
 		this.livenessError = `nobody answered its dialog within ${Math.round((this.runner.dialogMs ?? DEFAULT_DIALOG_MS) / 60_000)}m; stopped`;
@@ -600,32 +659,44 @@ export class TerminalRun extends Run {
 	 */
 	override async prompt(text: string): Promise<void> {
 		if (this.runner.prompt === "channel") {
-			this.dispatch = "sent"; this.promptDispatched = true;
-			this.save();
+			this.dispatch = "sent"; this.sentAt = Date.now();
+			try { this.save(); } catch (e) { this.dispatch = "none"; this.sentAt = undefined; throw e; }
+			this.promptDispatched = true;
 			const file = path.join(this.channel!, `prompt-${this.attemptId}.txt`);
 			fs.writeFileSync(file, text, { mode: 0o600 });
 			sendCommand(this.channel!, { c: "prompt", a: this.attemptId, file });
 		}
 		this.push([`› ${text.split("\n")[0]!.slice(0, 200)}`]);
-		// Accepted once it says so. While it shows signs of life (compaction, preparing) it is given longer.
-		const cap = Date.now() + 10 * 60_000;
+		const r = await this.awaitAck(Date.now());
+		if (r === "accepted") return;
+		if (r === "refused") throw new Error(this.refusedWhy ?? "it refused the prompt");
+		throw new Error(r === "exited" ? `its ${this.runner.name} exited before it took the prompt` : `no sign that its ${this.runner.name} took the prompt`);
+	}
+
+	/** Why its companion refused the prompt, when it did. */
+	refusedWhy?: string;
+
+	/**
+	 * The one acknowledgement wait, for a prompt sent at `sentAt` (now, or before a restart): accepted; refused (by its
+	 * companion, before anything ran: proven, so not dispatched); exited or silent (unknown: it may have run). Silent
+	 * means no event at all for 30s, or none of them an acknowledgement within ACK_CAP_MS while it shows life (compaction
+	 * pauses the silence clock, for at most COMPACTION_CAP_MS).
+	 */
+	async awaitAck(sentAt: number): Promise<"accepted" | "refused" | "exited" | "silent"> {
+		const cap = sentAt + ACK_CAP_MS;
 		for (;;) {
-			const seen = this.lastEventAt;
-			let refused: any;
+			if (this.promptAccepted) return "accepted";
+			if (this.refusedWhy !== undefined) return "refused";
+			if (this.exited) { this.promptUncertain = true; return "exited"; }
+			const seen = Math.max(this.lastEventAt, sentAt);
 			const got = await new Promise<boolean>(resolve => {
-				const t = setTimeout(() => { const i = this.acceptWaiters.indexOf(w); if (i >= 0) this.acceptWaiters.splice(i, 1); resolve(false); }, 30_000);
-				const w = (e: any) => { if (e?.e === "refused") refused = e; if (!(this.promptAccepted || refused || this.exited)) return; clearTimeout(t); const i = this.acceptWaiters.indexOf(w); if (i >= 0) this.acceptWaiters.splice(i, 1); resolve(true); };
-				if (this.promptAccepted || this.exited) { clearTimeout(t); resolve(true); return; }
+				const left = Math.max(0, Math.min(30_000 - (Date.now() - seen), cap - Date.now()));
+				const t = setTimeout(() => { const i = this.acceptWaiters.indexOf(w); if (i >= 0) this.acceptWaiters.splice(i, 1); resolve(false); }, left);
+				const w = () => { if (!(this.promptAccepted || this.refusedWhy !== undefined || this.exited)) return; clearTimeout(t); const i = this.acceptWaiters.indexOf(w); if (i >= 0) this.acceptWaiters.splice(i, 1); resolve(true); };
 				this.acceptWaiters.push(w);
 			});
-			if (this.promptAccepted) return;
-			if (refused) {
-				// Refused by its companion before it was sent on (it checked first): nothing ran.
-				this.promptDispatched = false; this.dispatch = "none"; this.save();
-				throw new Error(String(refused.why ?? "it refused the prompt"));
-			}
-			if (this.exited) { this.promptUncertain = true; throw new Error(`its ${this.runner.name} exited before it took the prompt`); }
-			if (!got && ((this.lastEventAt === seen && !this.compacting) || Date.now() > cap)) { this.promptUncertain = true; throw new Error(`no sign that its ${this.runner.name} took the prompt`); }
+			if (got) continue;
+			if (Date.now() >= cap || (Math.max(this.lastEventAt, sentAt) === seen && !this.compactionExempt)) { if (!this.promptAccepted && this.refusedWhy === undefined) { this.promptUncertain = true; return "silent"; } }
 		}
 	}
 
@@ -664,6 +735,9 @@ export class TerminalRun extends Run {
 		this.term = term ? { id: term.id, ...(term.attach ? { attach: term.attach } : {}) } : undefined;
 		try { await term?.close?.(); } catch { /* gone */ }
 	}
+
+	/** When its prompt was sent, as saved (pickup measures the acknowledgement deadline from it). */
+	get sentTime(): number | undefined { return this.sentAt; }
 
 	/** Stop following it without ending it: the session that follows it is going away, the next one picks it up. */
 	detach() { this.stopTimer(); if (this.token) { handoffs().offers.delete(this.token); this.token = undefined; } }

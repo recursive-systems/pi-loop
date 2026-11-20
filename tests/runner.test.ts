@@ -273,19 +273,20 @@ async function killHostWhen(t: any, script: string, ready: (p: P, id: string) =>
 	return { p, id, again: () => new Host(t, p, { env: { FAKE_SCRIPT: script, ...env } }) };
 }
 
-test("window: the host is killed after the terminal opened, its prompt handed over but not yet taken; the next host follows it, counts it once when taken, runs nothing twice", { timeout: 120_000 }, async t => {
-	const { p, id, again } = await killHostWhen(t, "report", (p, id) => inventory(p, id)[0]?.ref?.pid, { FAKE_PRESUBMIT_MS: "8000" });
+test("window: the host is killed after its prompt was handed over but before it was taken; the next host ends it, records unknown, pauses the loop, never counts it or starts it again", { timeout: 120_000 }, async t => {
+	const { p, id, again } = await killHostWhen(t, "report", (p, id) => inventory(p, id)[0]?.ref?.dispatch === "sent", { FAKE_PRESUBMIT_MS: "15000" });
 	const t0 = inventory(p, id)[0];
 	assert.ok(t0, "the attempt was saved before its prompt was taken");
 	assert.equal(loopOf(p, id).fires, 0);
 	const next = again();
 	await next.ready();
-	// Its prompt (on its command line) had been handed over, so it may run: followed, and counted once it says it took it.
-	const r = await until("recorded", () => ["done", "failed", "interrupted"].includes(loopOf(p, id)?.lastRun?.status) && loopOf(p, id).lastRun, 60_000);
+	const r = await until("recorded", () => loopOf(p, id)?.lastRun?.status === "interrupted" && loopOf(p, id).lastRun, 60_000);
 	assert.equal(r.attemptId, t0.attemptId);
-	assert.equal(loopOf(p, id).fires, 1, "counted exactly once");
+	assert.equal(r.acceptance, "unknown", "it may have run");
+	assert.equal(loopOf(p, id).paused, true, "paused until someone decides");
+	assert.equal(loopOf(p, id).fires, 0, "not counted");
 	assert.equal(terminals(p).length, 1, "never started again");
-	await until("its agent gone and forgotten", () => !alive(t0.ref.pid) && !inventory(p, id).length, 20_000);
+	await until("its agent gone and forgotten", () => !alive(t0.ref.pid) && !inventory(p, id).length, 30_000);
 });
 
 test("window: the host is killed before the prompt was ever sent (pi runner, still starting); the next host ends it, doesn't count it, runs nothing twice", { timeout: 120_000 }, async t => {
@@ -316,9 +317,9 @@ test("window: accepted, but the host died before it saved that; the next host co
 	// Simulate the save that never happened: the record still says "starting", the fire uncounted, a wake kept.
 	const loops = p.loops(); const l = loops.find((x: any) => x.id === id);
 	l.fires = 0; l.lastRun.status = "starting"; l.lastRun.acceptance = "unknown"; l.pendingWake = { reason: "kept", at: Date.now(), rev: l.rev ?? 0 };
-	l.terminals[0].ref.dispatch = "sent";
+	l.terminals[0].ref.dispatch = "sent"; delete l.terminals[0].firedLogged;
 	fs.writeFileSync(path.join(p.cwd, ".pi/loops.json"), JSON.stringify(loops));
-	// And the gate log as it was before that save (the dead host wrote its fired line with it).
+	// And the gate log as it was before that save (the dead host wrote its fired line with it, after marking it).
 	const log = path.join(p.cwd, ".pi/loops.log.jsonl");
 	if (fs.existsSync(log)) fs.writeFileSync(log, fs.readFileSync(log, "utf8").split("\n").filter(x => !x.includes('"fired"')).join("\n"));
 	const next = again();

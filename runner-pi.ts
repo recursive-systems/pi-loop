@@ -38,8 +38,13 @@ export default function (pi: ExtensionAPI) {
 	let pressing = false;
 	const press = (data: string) => { pressing = true; try { process.stdin.emit("data", Buffer.from(data)); } catch { /* no terminal */ } finally { pressing = false; } };
 
+	// Test hooks (tests/runner.test.ts), read only from the run's own environment: hold the prompt before acting on it
+	// (PI_LOOP_TEST_HOLD_PROMPT_MS), act on it but never say it was taken (PI_LOOP_TEST_NO_ACK), or refuse it (PI_LOOP_TEST_REFUSE).
+	const hold = Number(process.env.PI_LOOP_TEST_HOLD_PROMPT_MS) || 0;
 	async function command(c: any) {
 		if (!ctx || c?.a !== attempt) return;
+		if (c.c === "prompt" && hold) await new Promise(r => setTimeout(r, hold));
+		if (c.c === "prompt" && process.env.PI_LOOP_TEST_REFUSE) { ev({ e: "refused", why: "refused by the test" }); return; }
 		if (c.c === "prompt" && typeof c.file === "string") {
 			let text: string;
 			try { text = fs.readFileSync(c.file, "utf8"); } catch { ev({ e: "refused", why: "its prompt file is gone" }); return; }
@@ -85,7 +90,7 @@ export default function (pi: ExtensionAPI) {
 	// The owner typed into the run in its terminal: their words are part of the run.
 	pi.on("input", (e: any) => { if (e.source === "interactive") ev({ e: "owner" }); });
 	pi.on("agent_start", () => {
-		if (s.pendingPrompt && !s.accepted) { s.accepted = true; s.pendingPrompt = false; ev({ e: "accepted", disposition: "started" }); }
+		if (s.pendingPrompt && !s.accepted && !process.env.PI_LOOP_TEST_NO_ACK) { s.accepted = true; s.pendingPrompt = false; ev({ e: "accepted", disposition: "started" }); }
 		ev({ e: "working" });
 	});
 	pi.on("agent_settled", (e: any) => { ev({ e: "idle", aborted: !!e?.aborted }); });
