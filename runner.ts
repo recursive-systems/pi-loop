@@ -203,8 +203,8 @@ export function closeHandoffs() {
 	try { h.server?.close(); if (h.file) fs.rmSync(h.file, { force: true }); } catch { /* gone */ }
 	h.server = undefined; h.file = undefined; h.listening = undefined;
 }
-/** Socket files of sessions that are gone (a hard kill leaves its path): removed. */
-function scavenge(dir: string) {
+/** Socket files of sessions that are gone (a hard kill leaves its path): removed (at session start, and before a launch). */
+export function scavenge(dir: string) {
 	let names: string[] = [];
 	try { names = fs.readdirSync(dir); } catch { return; }
 	for (const n of names) {
@@ -225,12 +225,15 @@ function handoffServer(dir: string): Promise<string> {
 		let buf = "", done = false;
 		const refuse = (why: string) => { if (done) return; done = true; try { sock.end(JSON.stringify({ error: why }) + "\n"); } catch { /* gone */ } };
 		sock.setEncoding("utf8");
-		sock.setTimeout(HANDOFF_CONN_MS, () => sock.destroy());
+		// An absolute lifetime (not an idle timeout): a connection that trickles bytes is closed all the same.
+		const life = setTimeout(() => sock.destroy(), HANDOFF_CONN_MS);
+		life.unref?.();
+		sock.on("close", () => clearTimeout(life));
 		sock.on("error", () => { /* the launcher went away */ });
 		sock.on("data", (d: string) => {
 			if (done) return;
 			buf += d;
-			if (buf.length > HANDOFF_MAX_BYTES) { done = true; sock.destroy(); return; }
+			if (Buffer.byteLength(buf) > HANDOFF_MAX_BYTES) { done = true; sock.destroy(); return; }
 			const i = buf.indexOf("\n");
 			if (i < 0) return;
 			let req: any;

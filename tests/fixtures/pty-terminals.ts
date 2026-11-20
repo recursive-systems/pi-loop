@@ -19,6 +19,10 @@ export default function (pi: any) {
 		r.provide((async () => {
 			await r.ready;
 			if (process.env.PTY_REFUSE) return undefined;
+			// PTY_HOLD_MS: wait this long before opening anything (the owner can be killed before any terminal exists).
+			if (process.env.PTY_HOLD_MS) await new Promise(res => setTimeout(res, Number(process.env.PTY_HOLD_MS)));
+			// PTY_COPY_START: copy the run's one-time start file (socket and token) here before the launcher reads it.
+			if (process.env.PTY_COPY_START) { try { fs.copyFileSync(path.join(r.argv[r.argv.length - 1], "start"), process.env.PTY_COPY_START); } catch { /* none */ } }
 			const id = `p${++n}-${process.pid}`;
 			const fifo = path.join(dir, `${id}.in`);
 			fs.mkdirSync(dir, { recursive: true });

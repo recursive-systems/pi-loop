@@ -1,8 +1,8 @@
 // The Pi runner's recovery and ownership edges, on the real channel: the session that runs the loops is the real
 // `pi` (RPC mode), the run is the real interactive Pi in a real pseudo-terminal (tests/fixtures/pty-terminals.ts),
 // its model is tests/fixtures/fake-model.mjs (answers, fails or is slow on cue, for free), and gates are real scripts.
-// The run's Pi reads a few test-only variables (runner-pi.ts): PI_LOOP_TEST_HOLD_PROMPT_MS, PI_LOOP_TEST_NO_ACK,
-// PI_LOOP_TEST_REFUSE, to hold, swallow or refuse the loop's prompt.
+// Faults (hold, refuse, or silently drop the loop's prompt) come from tests/fixtures/pi-fault.ts, an extension this
+// test's own agent dir loads (settings.json `extensions`) with its `fault.json`; nothing in pi-loop reads them.
 //
 // Run: node --experimental-strip-types --test tests/pi-runner.test.ts
 import assert from "node:assert/strict";
@@ -45,15 +45,18 @@ async function fakeModel(t: any): Promise<number> {
 interface Box { cwd: string; agent: string; pty: string; sessions: string; log: string; loops(): any[]; loop(id: string): any; gateLog(): any[]; stream(): any[] }
 
 /** A project with the Pi runner on, a fake model, and (optionally) a real one-shot gate that wakes once per marker. */
-async function box(t: any, o: { gate?: boolean; runner?: object } = {}): Promise<Box> {
+async function box(t: any, o: { gate?: boolean; runner?: object; fault?: object } = {}): Promise<Box> {
 	const port = await fakeModel(t);
-	const cwd = tmp(t, "pi-loop-pr-cwd-"), agent = tmp(t, "pi-loop-pr-agent-"), pty = tmp(t, "pi-loop-pr-pty-"), sessions = tmp(t, "pi-loop-pr-sessions-");
-	let b: Box;
+	// Registered before the folders' own removal (after-hooks run in order), so the pids they record are still readable.
+	let b: Box | undefined;
 	t.after(() => kill(b));
+	const cwd = tmp(t, "pi-loop-pr-cwd-"), agent = tmp(t, "pi-loop-pr-agent-"), pty = tmp(t, "pi-loop-pr-pty-"), sessions = tmp(t, "pi-loop-pr-sessions-");
 	fs.mkdirSync(path.join(cwd, ".pi/gates"), { recursive: true });
 	fs.writeFileSync(path.join(agent, "models.json"), JSON.stringify({ providers: { fake: { baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "none",
 		models: ["ok", "503", "slow-20000", "slow-600000"].map(id => ({ id })) } } }));
-	fs.writeFileSync(path.join(agent, "settings.json"), JSON.stringify({ defaultProvider: "fake", defaultModel: "ok", defaultProjectTrust: "always", retry: { enabled: false } }));
+	fs.writeFileSync(path.join(agent, "settings.json"), JSON.stringify({ defaultProvider: "fake", defaultModel: "ok", defaultProjectTrust: "always", retry: { enabled: false },
+		...(o.fault ? { extensions: [path.join(PACKAGE, "tests/fixtures/pi-fault.ts")] } : {}) }));
+	if (o.fault) fs.writeFileSync(path.join(agent, "fault.json"), JSON.stringify(o.fault));
 	fs.writeFileSync(path.join(cwd, ".pi/settings.json"), JSON.stringify({ loop: { runner: "pi", judge: "off", deepJudge: "off", ...(o.runner ? { runners: { pi: o.runner } } : {}) } }));
 	// A real gate: wakes once per marker (with context), as a gate that marks its finding seen does.
 	fs.writeFileSync(path.join(cwd, ".pi/gates/once"), `#!/bin/sh
@@ -69,7 +72,7 @@ mkdir -p "$(dirname "$m")"; date > "$m"; echo '{"action":"wake","reason":"findin
 		gateLog: () => { try { return fs.readFileSync(path.join(cwd, ".pi/loops.log.jsonl"), "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l)); } catch { return []; } },
 		stream: () => { const d = path.join(agent, "loop-hosts", "streams"); try { return fs.readdirSync(d).flatMap(f => fs.readFileSync(path.join(d, f), "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l))); } catch { return []; } },
 	};
-	return b;
+	return b!;
 }
 /** Every agent a test started: by its terminal log and every pid its channels recorded. */
 function kill(b?: Box) {
@@ -127,9 +130,9 @@ const firedLines = (b: Box, id: string) => b.gateLog().filter(x => x.action === 
 // ----------------------------------------------------------- finding 4: one acknowledgement rule --
 
 test("pi: sent but never acknowledged, live: recorded unknown, the loop paused with its gate's wake kept, the owner told; the fire number is never reused", { timeout: 150_000 }, async t => {
-	const b = await box(t);
+	const b = await box(t, { fault: { silent: true } });
 	seed(b, "c", { gate: true });
-	const host = new Host(t, b, { PI_LOOP_TEST_NO_ACK: "1" });
+	const host = new Host(t, b);
 	await host.ready();
 	const l = await until("recorded", () => ["failed", "interrupted"].includes(b.loop("c")?.lastRun?.status) && b.loop("c"), 90_000);
 	assert.equal(l.lastRun.acceptance, "unknown");
@@ -145,9 +148,9 @@ test("pi: sent but never acknowledged, live: recorded unknown, the loop paused w
 });
 
 test("pi: sent but never acknowledged, then the session dies: the next one ends it, records unknown, pauses the loop and keeps the wake; nothing runs twice", { timeout: 150_000 }, async t => {
-	const b = await box(t);
+	const b = await box(t, { fault: { hold: 20_000 } });
 	seed(b, "c", { gate: true });
-	const host = new Host(t, b, { PI_LOOP_TEST_HOLD_PROMPT_MS: "20000" });
+	const host = new Host(t, b);
 	await host.ready();
 	const t0 = await until("its prompt sent", () => { const x = b.loop("c")?.terminals?.[0]; return x?.ref?.dispatch === "sent" && x; }, 60_000);
 	assert.equal(t0.wake?.reason, "finding X", "the gate's wake is in the inventory before the terminal opened");
@@ -167,9 +170,9 @@ test("pi: sent but never acknowledged, then the session dies: the next one ends 
 });
 
 test("pi: a refused prompt is proven not to have run: not counted, the wake kept, retried soon (not paused)", { timeout: 120_000 }, async t => {
-	const b = await box(t);
+	const b = await box(t, { fault: { refuse: true } });
 	seed(b, "c", { gate: true });
-	const host = new Host(t, b, { PI_LOOP_TEST_REFUSE: "1" });
+	const host = new Host(t, b);
 	await host.ready();
 	const l = await until("recorded", () => b.loop("c")?.lastRun?.status === "failed" && b.loop("c"), 60_000);
 	assert.equal(l.lastRun.acceptance, "not_accepted");
@@ -180,10 +183,10 @@ test("pi: a refused prompt is proven not to have run: not counted, the wake kept
 });
 
 test("pi: a refusal that arrives while no session follows the run is read as proven on pickup (not unknown, not paused)", { timeout: 150_000 }, async t => {
-	const b = await box(t);
+	const b = await box(t, { fault: { refuse: true, hold: 8000 } });
 	seed(b, "c", { gate: true });
 	// The run holds its prompt 8s, then refuses it; the session dies as soon as the prompt is sent.
-	const host = new Host(t, b, { PI_LOOP_TEST_REFUSE: "1", PI_LOOP_TEST_HOLD_PROMPT_MS: "8000" });
+	const host = new Host(t, b);
 	await host.ready();
 	await until("its prompt sent", () => b.loop("c")?.terminals?.[0]?.ref?.dispatch === "sent", 60_000);
 	await host.kill();
@@ -195,6 +198,24 @@ test("pi: a refusal that arrives while no session follows the run is read as pro
 	assert.equal(l.paused, false, "a proven refusal doesn't pause");
 	assert.equal(l.pendingWake?.reason, "finding X", "its wake is kept");
 	assert.equal(l.fires, 0);
+});
+
+test("pi: killed after the gate's wake and the start record are saved, before any terminal exists: the wake (with context) survives", { timeout: 150_000 }, async t => {
+	const b = await box(t);
+	seed(b, "c", { gate: true });
+	// The provider waits before it opens anything (PTY_HOLD_MS), so the owner can be killed at loop:run start.
+	const host = new Host(t, b, { PTY_HOLD_MS: "30000" });
+	await host.ready();
+	await until("its gate woke and its start record is saved", () => b.loop("c")?.lastGate?.action === "wake" && b.loop("c")?.lastRun?.status === "starting", 60_000);
+	assert.equal(b.loop("c").pendingWake?.reason, "finding X", "the wake is in the very first record");
+	assert.ok(!b.loop("c").terminals?.some((x: any) => x.ref?.pid), "no launcher yet");
+	await host.kill();
+	const next = new Host(t, b);
+	await next.ready();
+	const l = await until("recorded", () => b.loop("c")?.lastRun?.status === "interrupted" && b.loop("c"), 30_000);
+	assert.equal(l.fires, 0);
+	assert.equal(l.pendingWake?.reason, "finding X", "the wake survived");
+	assert.equal(l.pendingWake?.context, "evidence for finding X");
 });
 
 // --------------------------------------------- finding 5: the wake survives, fired is logged once --
@@ -239,6 +260,18 @@ test("pi: accepted and fired-logged, killed before the count was saved: one fire
 	const after = await until("recorded", () => b.loop("c")?.lastRun?.status === "done" && b.loop("c"), 60_000);
 	assert.equal(after.fires, 1);
 	assert.equal(firedLines(b, "c").length, 1, "one fired line for the one attempt");
+});
+
+test("pi: a production launch has no fault hooks: the old PI_LOOP_TEST_* variables in the owner's environment change nothing", { timeout: 120_000 }, async t => {
+	const b = await box(t);
+	seed(b, "c", { prompt: "Call loop_report with findings false and summary NO_HOOKS. Do nothing else." });
+	const host = new Host(t, b, { PI_LOOP_TEST_NO_ACK: "1", PI_LOOP_TEST_REFUSE: "1", PI_LOOP_TEST_HOLD_PROMPT_MS: "60000" });
+	await host.ready();
+	const l = await until("recorded", () => ["done", "failed"].includes(b.loop("c")?.lastRun?.status) && b.loop("c"), 60_000);
+	assert.equal(l.lastRun.status, "done", JSON.stringify(l.lastRun));
+	assert.equal(l.lastRun.acceptance, "accepted");
+	assert.equal(l.fires, 1);
+	for (const f of ["runner-pi.ts", "runner.ts", "index.ts", "bin/loop-run.mjs"]) assert.doesNotMatch(fs.readFileSync(path.join(PACKAGE, f), "utf8"), /PI_LOOP_TEST/, `${f} reads no test hooks`);
 });
 
 // ----------------------------------------- finding 6: retire first, no orphans, fail closed, commands --
@@ -293,24 +326,54 @@ test("pi: if the attempt can't be saved, nothing is started: no launcher gets it
 	assert.equal(l.terminals, undefined);
 });
 
-test("pi: a launcher whose attempt can't be recorded is refused its argv (the save happens before the handoff answers)", { timeout: 120_000 }, async t => {
+test("pi: when a terminal run's record can't be saved, the owner survives: alive, holding its lock, no agent started, and a hidden sibling runs once the state file is writable again", { timeout: 150_000 }, async t => {
 	const b = await box(t);
-	seed(b, "c", { model: "fake/slow-20000" });
-	const host = new Host(t, b, { PTY_SLOW_MS: "3000" });
+	// Two loops: "c" on the Pi runner, due now; "h" a hidden (rpc) sibling, run later by hand.
+	const now = Date.now();
+	fs.writeFileSync(path.join(b.cwd, ".pi/loops.json"), JSON.stringify([
+		{ id: "c", prompt: "say hi", schedule: { kind: "every", ms: 3_600_000 }, run: "fresh", paused: false, createdAt: now - 7_200_000, fires: 0, catchUp: "latest", nextAt: now + 3_600_000, model: "fake/slow-20000" },
+		{ id: "h", prompt: "say hi", schedule: { kind: "every", ms: 3_600_000 }, run: "fresh", runner: "rpc", paused: false, createdAt: now - 7_200_000, fires: 0, catchUp: "latest", nextAt: now + 3_600_000 },
+	]));
+	const host = new Host(t, b, { PTY_HOLD_MS: "8000" });
+	let exit: number | null = null, stderr = "";
+	host.proc.on("exit", c => { exit = c; });
+	host.proc.stderr.on("data", d => { stderr += d; });
 	await host.ready();
-	// The handoff's save fails: the record can't be written once the terminal is opening (loops.json becomes a folder).
+	// The terminal run fires; its first record is saved, then (while its provider holds before opening a terminal) the
+	// state file becomes unwritable: loops.json turns into a folder. The launcher's save then fails (so it gets no argv),
+	// the start fails, and recording that failure fails too. The owner must stay (the reviewer's reproduction).
 	const lj = path.join(b.cwd, ".pi/loops.json");
-	await until("the attempt saved, its terminal opening", () => b.loop("c")?.terminals?.length, 30_000);
+	await host.command("/loop run c");
+	await until("its first record saved, its provider holding", () => b.loop("c")?.terminals?.length, 30_000);
 	const keep = fs.readFileSync(lj, "utf8");
 	fs.rmSync(lj); fs.mkdirSync(lj);
 	t.after(() => { try { fs.rmSync(lj, { recursive: true, force: true }); } catch { /* */ } });
-	await new Promise(r => setTimeout(r, 12_000));
-	fs.rmSync(lj, { recursive: true, force: true }); fs.writeFileSync(lj, keep);
+	await new Promise(r => setTimeout(r, 30_000));
+	assert.equal(exit, null, `the owner is still running (stderr: ${stderr.slice(-400)})`);
+	assert.equal(Number(fs.readFileSync(path.join(b.cwd, ".pi/loops.lock"), "utf8").trim().split(/\s+/)[0]), host.proc.pid, "and holds the lock");
 	const runs = path.join(b.cwd, ".pi/loop-state/c/runs");
-	for (const d of fs.readdirSync(runs)) {
-		const es = fs.readFileSync(path.join(runs, d, "events.jsonl"), "utf8");
-		assert.doesNotMatch(es, /"e":"started"/, "no agent started for an attempt that couldn't be recorded");
-	}
+	for (const d of fs.existsSync(runs) ? fs.readdirSync(runs) : []) assert.doesNotMatch(fs.readFileSync(path.join(runs, d, "events.jsonl"), "utf8"), /"e":"started"/, "no agent started for an attempt that couldn't be recorded");
+	// The obstruction goes; the hidden sibling runs and is recorded by the same owner.
+	fs.rmSync(lj, { recursive: true, force: true }); fs.writeFileSync(lj, keep);
+	await host.command("/loop run h");
+	const h = await until("the sibling recorded", () => ["done", "failed"].includes(b.loop("h")?.lastRun?.status) && b.loop("h"), 60_000);
+	assert.equal(h.lastRun.status, "done", JSON.stringify(h.lastRun));
+	assert.equal(exit, null);
+});
+
+test("pi: a state file that is there but can't be read is never written over with an empty one; loops run again once it reads", { timeout: 120_000 }, async t => {
+	const b = await box(t);
+	seed(b, "c");
+	const lj = path.join(b.cwd, ".pi/loops.json");
+	const good = fs.readFileSync(lj, "utf8");
+	fs.writeFileSync(lj, good.slice(0, good.length - 5)); // truncated: unparseable
+	const host = new Host(t, b);
+	await host.ready();
+	await new Promise(r => setTimeout(r, 20_000)); // a tick or more
+	assert.equal(fs.readFileSync(lj, "utf8"), good.slice(0, good.length - 5), "left exactly as it was");
+	assert.ok(host.notes().some(n => /couldn't read .*loops\.json/.test(n)), "and said");
+	fs.writeFileSync(lj, good);
+	await until("read again and run", () => ["done", "failed"].includes(b.loop("c")?.lastRun?.status), 60_000);
 });
 
 test("pi: /loop open, take and steer on a finished terminal run say how to open it, and leave its report alone", { timeout: 120_000 }, async t => {
@@ -332,7 +395,7 @@ test("pi: /loop open, take and steer on a finished terminal run say how to open 
 
 // ------------------------------------------------------- findings 7 and 8: the handoff, the bounds --
 
-test("pi: the handoff is answered once (a replay is refused), bounds its input, and a dead owner's socket path is cleared", { timeout: 120_000 }, async t => {
+test("pi: the handoff is answered once (its own consumed token is refused on replay), bounds its input and its lifetime, and a dead owner's socket path is cleared", { timeout: 120_000 }, async t => {
 	const b = await box(t);
 	// A dead owner's socket path: a pid that can't be running.
 	const ctl = path.join(b.agent, "loop-hosts", "ctl");
@@ -340,23 +403,31 @@ test("pi: the handoff is answered once (a replay is refused), bounds its input, 
 	const stale = path.join(ctl, "999999999-runs.sock");
 	fs.writeFileSync(stale, "");
 	seed(b, "c", { model: "fake/slow-20000" });
-	const host = new Host(t, b, { PI_LOOP_TEST_HOLD_PROMPT_MS: "5000" });
+	const copy = path.join(b.pty, "start-copy.json");
+	const host = new Host(t, b, { PTY_COPY_START: copy });
 	await host.ready();
-	const t0 = await until("running", () => { const l = b.loop("c"); return l?.terminals?.[0]?.ref?.pid && l.terminals[0]; }, 60_000);
+	await until("running", () => b.loop("c")?.terminals?.[0]?.ref?.pid, 60_000);
 	assert.equal(fs.existsSync(stale), false, "the dead owner's socket path is gone");
-	const sock = fs.readdirSync(ctl).filter(f => f.endsWith("-runs.sock")).map(f => path.join(ctl, f))[0]!;
-	const ask = (line: string) => new Promise<string>(resolve => {
-		const s = net.createConnection(sock); let out = "";
-		s.on("connect", () => s.write(line)); s.on("data", d => { out += d; }); s.on("close", () => resolve(out)); s.on("error", () => resolve(out));
+	const { socket, token } = JSON.parse(fs.readFileSync(copy, "utf8"));
+	const ask = (line: string, keep = false) => new Promise<{ out: string; ms: number }>(resolve => {
+		const t0 = Date.now(), s = net.createConnection(socket); let out = "";
+		s.on("connect", () => { if (line) s.write(line); if (keep) s.write("x"); });
+		s.on("data", d => { out += d; }); s.on("close", () => resolve({ out, ms: Date.now() - t0 })); s.on("error", () => resolve({ out, ms: Date.now() - t0 }));
 	});
-	// The launcher already used its token: asking again (any token) is refused, with no environment in the answer.
-	const again = await ask(JSON.stringify({ token: "0".repeat(48), pid: 1 }) + "\n");
-	assert.match(again, /no such run/);
-	assert.doesNotMatch(again, /"env"/);
+	// The launcher used this exact token: asking again with it is refused, with no environment in the answer.
+	const again = await ask(JSON.stringify({ token, pid: 1 }) + "\n");
+	assert.match(again.out, /no such run/);
+	assert.doesNotMatch(again.out, /"env"/);
 	// An endless line is cut off, not buffered.
-	const big = await ask("x".repeat(10_000));
-	assert.equal(big, "");
-	void t0;
+	assert.equal((await ask("x".repeat(10_000))).out, "");
+	// A connection that trickles bytes for ever is closed within its absolute lifetime (not an idle timeout).
+	const slow = new Promise<number>(resolve => {
+		const t0 = Date.now(), s = net.createConnection(socket);
+		const iv = setInterval(() => { try { s.write("y"); } catch { /* */ } }, 500);
+		s.on("close", () => { clearInterval(iv); resolve(Date.now() - t0); }); s.on("error", () => { clearInterval(iv); resolve(Date.now() - t0); });
+	});
+	const lived = await slow;
+	assert.ok(lived < 15_000, `closed after ${lived}ms`);
 });
 
 test("pi: a run picked up after a restart has the same stall bound as a live one", { timeout: 180_000 }, async t => {
