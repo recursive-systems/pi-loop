@@ -1889,3 +1889,96 @@ test("a gated background loop's run (a real model's loop_report) cannot postpone
 	const l = await until("the run done", () => loopOf(p, "bg")?.lastRun?.status === "done" && loopOf(p, "bg"));
 	assert.equal(l.nextAt, later, "next 1d did not move a check that was 30m away");
 });
+
+/** Requests to the session's control channel, as a run's standalone watcher sends them; the answers in order. */
+async function control(socket: string, msgs: object[]): Promise<any[]> {
+	const net = await import("node:net");
+	return new Promise((resolve, reject) => {
+		const c = net.createConnection(socket), got = new Map<number, any>();
+		let buf = "";
+		const t = setTimeout(() => { c.destroy(); reject(new Error(`no answer from the control channel: ${JSON.stringify([...got])}`)); }, 120_000);
+		c.setEncoding("utf8");
+		c.on("error", reject);
+		c.on("data", (d: string) => {
+			buf += d;
+			let i;
+			while ((i = buf.indexOf("\n")) >= 0) {
+				const m = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+				if (m.type !== "reply") continue;
+				got.set(m.rid, m);
+				if (got.size === msgs.length) { clearTimeout(t); c.end(); resolve(msgs.map((_, k) => got.get(k + 1))); }
+			}
+		});
+		c.on("connect", async () => { for (const [k, m] of msgs.entries()) { c.write(JSON.stringify({ rid: k + 1, ...m }) + "\n"); await new Promise(r => setTimeout(r, 150)); } });
+	});
+}
+
+/** Its Pi (and the runs it started) gone before the test's folders are removed: a judge writing late can't trip cleanup. */
+async function stopped(pi: Pi) {
+	if (pi.proc.exitCode !== null) return;
+	const gone = new Promise(r => pi.proc.once("exit", r));
+	pi.stop();
+	await gone;
+	await new Promise(r => setTimeout(r, 500));
+}
+
+/** A finished run's watcher socket, after a real run of a loop whose prompt is a command (no model needed). */
+async function finishedRun(t: any) {
+	const { p, pi } = await closedSession(t);
+	await pi.command("/loop 1d --fresh /loop");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done", 60_000);
+	const socket = path.join(p.agent, "loop-hosts", "ctl", `${pi.proc.pid}.sock`);
+	await until("the control socket", () => fs.existsSync(socket), 10_000);
+	return { p, pi, id, socket, session: loopOf(p, id).lastRun.session as string };
+}
+
+test("a multiplexer's note typed into a finished run's watcher doesn't start the run again", { timeout: 120_000 }, async t => {
+	const { p, pi, id, socket, session } = await finishedRun(t);
+	const before = fs.existsSync(session) ? fs.readFileSync(session, "utf8") : "";
+	const [r] = await control(socket, [{ op: "steer", loop: id, fire: 1, text: "<hc>t9 helper exited (exit 0). Read: hc read t9</hc>" }]);
+	assert.match(r.text, /has ended, so this note was not sent/, JSON.stringify(r));
+	await new Promise(res => setTimeout(res, 3000));
+	const l = loopOf(p, id);
+	assert.equal(l.lastRun.status, "done", JSON.stringify(l.lastRun));
+	assert.equal(l.paused, false);
+	assert.equal(fs.existsSync(session) ? fs.readFileSync(session, "utf8") : "", before, "nothing reached its conversation");
+	// An agent's message (<hc from=...>) is someone's words: it still starts the run again.
+	const [w] = await control(socket, [{ op: "steer", loop: id, fire: 1, text: `<hc from="t9 helper">Done; result in /tmp/x</hc>` }]);
+	assert.match(w.text, /carries on in the background/, JSON.stringify(w));
+	await stopped(pi);
+});
+
+test("words sent while a finished run is starting again wait for its prompt; the loop isn't paused", { timeout: 180_000 }, async t => {
+	// A model that takes the request and never answers, so the restarted run's turn is still going when the second
+	// words arrive (the first run is a command and needs no model).
+	const net = await import("node:net");
+	const held: any[] = [];
+	const hang = net.createServer(c => { held.push(c); c.on("error", () => {}); });
+	await new Promise<void>(r => hang.listen(0, "127.0.0.1", () => r()));
+	t.after(() => { for (const c of held) c.destroy(); hang.close(); });
+	const port = (hang.address() as any).port;
+	const { p, pi } = await closedSession(t);
+	fs.writeFileSync(path.join(p.agent, "models.json"), JSON.stringify({ providers: { closed: {
+		baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "none", models: [{ id: "none" }] } } }));
+	await pi.command("/loop 1d --fresh /loop");
+	const id = p.loops()[0].id;
+	await pi.command(`/loop run ${id}`);
+	await until("the run done", () => loopOf(p, id)?.lastRun?.status === "done", 60_000);
+	const socket = path.join(p.agent, "loop-hosts", "ctl", `${pi.proc.pid}.sock`);
+	await until("the control socket", () => fs.existsSync(socket), 10_000);
+	const [a, b] = await control(socket, [
+		{ op: "steer", loop: id, fire: 1, text: "First words from the owner." },
+		{ op: "steer", loop: id, fire: 1, text: "Second words from the owner." },
+	]);
+	assert.match(a.text, /carries on in the background/, JSON.stringify(a));
+	assert.match(b.text, /sent to/, JSON.stringify(b));
+	const l = await until("the run running", () => { const x = loopOf(p, id); return x?.lastRun?.status === "running" && x; }, 30_000);
+	assert.equal(l.paused, false, JSON.stringify(l.lastRun));
+	assert.equal(l.lastRun.acceptance, "accepted");
+	const users = fs.readFileSync(l.lastRun.session, "utf8").trim().split("\n").map(x => JSON.parse(x))
+		.filter(e => e.type === "message" && e.message?.role === "user").map(e => JSON.stringify(e.message.content));
+	assert.match(users.at(-1) ?? "", /First words from the owner/, `the run's own prompt went first: ${users.join(" | ")}`);
+	await stopped(pi);
+});
