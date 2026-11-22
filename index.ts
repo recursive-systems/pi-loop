@@ -76,6 +76,11 @@ const TAKEOVER_NOTE = "[loop] The owner is taking over this conversation now. St
 /** How long a run gets to stop on its own when you go into it, before it is interrupted (its conversation is kept). */
 const TAKEOVER_GRACE_MS = 8_000;
 const CONTINUE_NOTE = "[loop] The owner stepped out. Carry on from where you are, and call loop_report when you are done.";
+/**
+ * A terminal multiplexer's own note, typed into a run's watcher as if someone had: Herdr's `<hc>…</hc>`, sent when a
+ * terminal the run started exits or stops. Not anyone's words to the run. (An agent's message, `<hc from=…>`, is.)
+ */
+const isTerminalNote = (text: string) => text.trimStart().startsWith("<hc>");
 /** Longest a self-paced loop may put off its next run. */
 const MAX_NEXT_MS = 7 * 24 * 60 * 60_000;
 
@@ -2410,7 +2415,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return `stopped ${l!.id}'s run #${run.fire}`;
 	}
 
-	/** Your words to a running background run: steered in at its next step, or a new turn if it is idle. */
+	/**
+	 * Your words to a running background run: steered in at its next step, or a new turn if it is idle. A finished
+	 * run is started again with them, unless they are a multiplexer's own note (isTerminalNote): that reaches a run
+	 * only while it runs, and never starts it again.
+	 */
 	async function steerRun(id: string, text: string): Promise<string> {
 		const l = find(id);
 		let run = l && shared.runs.get(l.id);
@@ -2420,7 +2429,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 			while (shared.runs.get(l!.id) === run && Date.now() < end) await new Promise(r => setTimeout(r, 200));
 			run = shared.runs.get(l!.id);
 		}
+		// Still starting (its Pi coming up, its own prompt not yet taken): your words wait for that prompt. Sent now,
+		// they would start a turn of their own first, and the run's prompt would then be refused as "already processing".
+		if (run && !run.promptAccepted && !run.handedOver && !run.exited) {
+			const starting = run, end = Date.now() + 120_000;
+			while (shared.runs.get(l!.id) === starting && !starting.promptAccepted && !starting.handedOver && !starting.exited && Date.now() < end) await new Promise(r => setTimeout(r, 200));
+			if (shared.runs.get(l!.id) !== starting || starting.exited) return `${l!.id}'s run didn't start, so your words were not sent`;
+			if (starting.handedOver) return `${l!.id}'s run is being handed over; talk to it there`;
+			if (!starting.promptAccepted) return `${l!.id}'s run is still starting; your words were not sent, send them again in a moment`;
+		}
 		if (!run && l && shared.external?.has(l.id)) return `${l.id}'s run has been taken over in another terminal; talk to it there`;
+		if (!run && isTerminalNote(text)) return `${l?.id ?? id}'s run has ended, so this note was not sent (a note reaches a run only while it runs)`;
 		if (!run && l && loops.includes(l) && l.lastRun?.session && !readOnly && shared.away?.id !== l.id) return resumeRun(l, text);
 		if (!run) return `${l?.id ?? id} has no run in the background${l?.lastRun?.session ? `; /loop open ${l.id} goes into its last one` : ""}`;
 		const err = await run.steer(text);
