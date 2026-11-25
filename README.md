@@ -336,6 +336,9 @@ What the gate measured is for the gate to keep, in `$LOOP_STATE_DIR`.
 ## Optional end-to-end checks
 
 Outside the build, nonblocking and against the real `pi`, with no mocks: `npm test`.
+The test runner needs Node.js 22.6 or newer for `--experimental-strip-types`. If `node --version`
+shows an older version, put the newer Node installation first on `PATH` for the test command:
+`PATH=/path/to/node/bin:$PATH npm test` (replace `/path/to/node/bin` with its actual `bin` directory).
 Use light selected checks periodically; failures go to the owner, never a required release gate.
 
 Live-model tests are opt-in: set `PI_E2E_PROVIDER` and `PI_E2E_MODEL` explicitly.
