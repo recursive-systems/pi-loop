@@ -108,6 +108,8 @@ interface Shared {
 	deepJudgeWarned?: true;
 	/** The live extension instance: finished runs report to it, whichever instance started them. */
 	current?: Instance;
+	/** One scheduler timer per Pi process, including overlapping session replacements. */
+	timer?: ReturnType<typeof setInterval>;
 	/** Local metadata writers, retained across session switches and reloads. */
 	lifecycleHosts?: Map<string, LifecycleHost>;
 	/** What each live run was started with, so a run whose model failed before doing anything can start again on the next. */
@@ -2699,6 +2701,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 	// ------------------------------------------------------------ lifecycle --
 
 	pi.on("session_start", (_event, c) => {
+		// A concurrent replacement can start an intermediate session without shutting it down.
+		// The folder lock is process-wide, so it cannot exclude that session's timer.
+		if (shared.timer) clearInterval(shared.timer);
+		shared.timer = undefined;
 		ctx = c;
 		file = path.join(c.cwd, ".pi", "loops.json");
 		lock = path.join(c.cwd, ".pi", "loops.lock");
@@ -2746,8 +2752,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			readOnly = true;
 			claimLock(() => activateOwner());
 		}
-		if (timer) clearInterval(timer);
-		timer = setInterval(tick, TICK_MS);
+		timer = shared.timer = setInterval(tick, TICK_MS);
 		phase = undefined;
 		refreshStatus();
 	});
@@ -2815,8 +2820,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event: { reason?: string }) => {
-		if (timer) clearInterval(timer);
-		timer = undefined;
+		if (timer) {
+			clearInterval(timer);
+			if (shared.timer === timer) shared.timer = undefined;
+			timer = undefined;
+		}
 		// Let running gates finish (up to their own timeout), so a wake they return is kept for the
 		// next owner instead of lost; a gate may already have recorded that it reported it.
 		closing = true;
