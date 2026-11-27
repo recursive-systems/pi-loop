@@ -50,6 +50,7 @@ export function standaloneWatch(pi: ExtensionAPI, raw: string) {
 		else if (state.needsYou) s = ["blocked", state.ask || state.result || title, "question"];
 		else if (state.status === "failed") s = ["error", state.result || `${title} failed`];
 		else if (state.status === "done") s = ["done", state.result || title];
+		else if (state.status === "replaced") s = ["done", `${title} ended · #${state.newer} has run since`];
 		else if (state.status === "starting" || state.status === "running") s = ["working", title];
 		else s = ["idle", state.result || title];
 		const out = programStatus(...s);
@@ -61,13 +62,15 @@ export function standaloneWatch(pi: ExtensionAPI, raw: string) {
 		if (state.away === "elsewhere") return "taken over in another terminal";
 		if (state.away === "here") return "the owner is in it, in the session that runs the loop";
 		if (state.live) return `running (${state.working ? "working" : state.backgroundWork ? "waiting on background work" : "idle"})`;
-		const st = state.status ?? "starting";
+		const st = state.status === "replaced" ? "ended" : state.status ?? "starting";
 		return `${st}${state.result ? `: ${state.result.split("\n")[0]}` : ""}${state.newer ? ` · #${state.newer} has run since` : ""}`;
 	};
 	const refresh = async () => {
 		if (!connected) return;
 		const r = await client.request("state", { loop: spec.loop, fire: spec.fire }, undefined, 10_000);
 		if (r.error && client.closed) connected = false;
+		// The owner falls back to "starting" when it no longer has this run's details.
+		if (r.status === "starting" && r.newer) r.status = "replaced";
 		const changed = JSON.stringify(r) !== JSON.stringify(state);
 		state = r;
 		reportStatus();
