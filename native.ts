@@ -26,7 +26,16 @@ import { fileURLToPath } from "node:url";
 import { Run, type RunMode } from "./background.ts";
 
 export type AgentKind = "claude" | "codex";
-export interface AgentSpec { run: AgentKind; env?: Record<string, string> }
+/**
+ * How a native run may act without asking (nobody is there to answer):
+ *   auto    the default. Claude Code's auto mode (its classifier runs what it judges safe and blocks the rest);
+ *           Codex's --approve-for-me (its workspace sandbox, escalations reviewed automatically: no network, no
+ *           writes outside the folder)
+ *   full    no checks, as a Pi run has today: Claude Code --permission-mode bypassPermissions, Codex
+ *           -a never -s danger-full-access. Only when the loop's owner declares it.
+ */
+export type Permissions = "auto" | "full";
+export interface AgentSpec { run: AgentKind; env?: Record<string, string>; permissions?: Permissions }
 export type Agents = Record<string, AgentSpec>;
 
 /** What a host gives a native run: its terminal, and how to see and reach the program in it. */
@@ -109,6 +118,7 @@ export function parseAgents(v: unknown): Agents | undefined {
 	for (const [name, spec] of entries) {
 		if (!NAME.test(name)) throw new Error(`agents: name "${name}" must be lowercase letters, digits, - and _`);
 		if (!spec || typeof spec !== "object" || !KINDS.includes(spec.run)) throw new Error(`agents.${name}.run must be claude or codex`);
+		for (const k of Object.keys(spec)) if (!["run", "env", "permissions"].includes(k)) throw new Error(`agents.${name}: unknown field ${k}`);
 		const env: Record<string, string> = {};
 		if (spec.env !== undefined) {
 			if (!spec.env || typeof spec.env !== "object" || Array.isArray(spec.env)) throw new Error(`agents.${name}.env must be an object of strings`);
@@ -118,7 +128,8 @@ export function parseAgents(v: unknown): Agents | undefined {
 				env[k] = val;
 			}
 		}
-		out[name] = { run: spec.run, ...(Object.keys(env).length ? { env } : {}) };
+		if (spec.permissions !== undefined && spec.permissions !== "auto" && spec.permissions !== "full") throw new Error(`agents.${name}.permissions must be auto (the default) or full`);
+		out[name] = { run: spec.run, ...(Object.keys(env).length ? { env } : {}), ...(spec.permissions === "full" ? { permissions: "full" as const } : {}) };
 	}
 	return Object.keys(out).length ? out : undefined;
 }
@@ -209,18 +220,19 @@ export class NativeRun extends Run {
 		for (const k of Object.keys(set)) strip.delete(k);
 		const prompt = n.text + this.reportNote();
 		const effort = n.thinking && n.thinking !== "off" ? (n.thinking === "minimal" ? "low" : n.thinking) : undefined;
+		const full = n.spec.permissions === "full";
 		let agent: string[];
 		if (kind === "claude") {
 			const settings = path.join(n.dir, "settings.json");
 			fs.writeFileSync(settings, JSON.stringify(claudeSettings()), { mode: 0o600 });
 			const context = contextText(this.cwd, n.agentDir);
 			agent = ["claude", "--model", n.agentModel, ...(effort ? ["--effort", effort === "max" ? "max" : effort] : []),
-				"--permission-mode", "bypassPermissions", "--settings", settings, ...(context ? ["--append-system-prompt", context] : []),
+				"--permission-mode", full ? "bypassPermissions" : "auto", "--settings", settings, ...(context ? ["--append-system-prompt", context] : []),
 				...(n.resume ? ["--resume", n.resume] : ["--session-id", this.attemptId]), "-n", n.label, prompt];
 		} else {
 			const hook = JSON.stringify([hookPath(), "notify"]);
 			agent = ["codex", "--no-daemon", "-m", n.agentModel, ...(effort ? ["-c", `model_reasoning_effort="${effort === "max" ? "xhigh" : effort}"`] : []),
-				"-a", "never", "-s", "danger-full-access", "-c", `notify=${hook}`, ...(n.resume ? ["resume", n.resume] : []), prompt];
+				...(full ? ["-a", "never", "-s", "danger-full-access"] : ["--approve-for-me"]), "-c", `notify=${hook}`, ...(n.resume ? ["resume", n.resume] : []), prompt];
 		}
 		return ["env", ...[...strip].sort().flatMap(k => ["-u", k]), ...Object.entries(set).map(([k, v]) => `${k}=${v}`), ...agent];
 	}
@@ -456,7 +468,7 @@ export class NativeRun extends Run {
 	}
 }
 
-/** Claude Code's settings for a run: its hooks and status line report here; it never stops on the bypass-mode notice. */
+/** Claude Code's settings for a run: its hooks and status line report here; a run declared `full` doesn't stop on the bypass-mode notice. */
 function claudeSettings(): object {
 	const hook = q(hookPath());
 	const on = (event: string) => [{ hooks: [{ type: "command", command: `${hook} event ${event}` }] }];

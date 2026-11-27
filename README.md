@@ -235,9 +235,12 @@ provider of a `model` entry. Entries of other providers still run in Pi, so a li
   natively) tells it to report with `bin/loop-report.mjs` (same report, same fields). Claude Code's hooks and
   status line, or Codex's notify command, tell pi-loop when it took the prompt and when its turn ended, through a
   private folder per run. A fresh run that finished well stays open for you; a failed one, or a thread, ends.
-- **Unattended.** Claude Code runs with `bypassPermissions` (as a Pi run, it has no approval prompts), Codex with
-  `-a never -s danger-full-access`. First-run screens (theme, security notes, trusting the loop's folder) are
-  passed on their default, and a prompt they swallow is typed once.
+- **Unattended.** Nobody is there to answer a permission prompt. By default (`"permissions": "auto"`) Claude Code
+  runs in its auto mode (its classifier runs what it judges safe and blocks the rest) and Codex with
+  `--approve-for-me` (its workspace sandbox: no network, no writes outside the folder). `"permissions": "full"` on
+  an agent runs it with no checks, as a Pi run has today (`bypassPermissions`; `-a never -s danger-full-access`).
+  A prompt nobody answers stops the run after 10 minutes and says it needed you. First-run screens (theme,
+  security notes, trusting the loop's own folder) are passed on their default, and a prompt they swallow is typed once.
 - **Fallback.** A Claude Code turn that ends on a usage limit, overload or sign-in error before doing anything
   holds that agent and model back and moves the fire on, as for a Pi model; so does a program that doesn't take
   its prompt within two minutes. Holds are per entry, so one account can fall back to another.
