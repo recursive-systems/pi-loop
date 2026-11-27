@@ -1982,3 +1982,43 @@ test("words sent while a finished run is starting again wait for its prompt; the
 	assert.match(users.at(-1) ?? "", /First words from the owner/, `the run's own prompt went first: ${users.join(" | ")}`);
 	await stopped(pi);
 });
+
+// ------------------------------------------------------------ native runs --
+// A loop model whose provider names one of the loop's `agents` runs as that agent's own program in a host's
+// terminal (native.ts). These cases have no host: the native attempt can't start, so its fire must move on.
+
+const nativeLoop = (id: string, extra: object = {}) => due(id, { run: "fresh", nextAt: Date.now() + 3_600_000,
+	agents: { "claude-x": { run: "claude", env: { CLAUDE_CONFIG_DIR: "/nonexistent-login", LOOPTEST_SCOPE: id } } }, ...extra });
+
+test("a native agent with no terminal host doesn't start: its fire moves on to the loop's next model, and says why", { timeout: 120_000 }, async t => {
+	const p = project(t, { loops: [nativeLoop("nat", { prompt: "say hi", model: ["claude-x/claude-haiku-5-5", "closed/none"] })] });
+	const pi = new Pi(t, p, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
+	await pi.ready();
+	assert.match(await pi.command("/loop run nat"), /fired nat/);
+	const fb = await until("the fallback", () => logOf(p.cwd).find(e => e.action === "fallback" && e.id === "nat"), 60_000);
+	assert.deepEqual([fb.from, fb.to, fb.why], ["claude-x/claude-haiku-5-5", "closed/none", "not_started"]);
+	const rec = await until("the Pi attempt recorded", () => { const r = loopOf(p, "nat")?.lastRun; return r?.model === "closed/none" && !["starting", "running"].includes(r.status) && r; }, 90_000);
+	assert.equal(rec.fallback, true);
+	assert.equal(rec.native, undefined, "the attempt that ran is a Pi run");
+	assert.deepEqual(rec.passedOver.map((x: any) => [x.model, x.why]), [["claude-x/claude-haiku-5-5", "not_started"]]);
+	assert.ok(!fs.existsSync(path.join(p.cwd, ".pi/loop-state/nat/native")) || fs.readdirSync(path.join(p.cwd, ".pi/loop-state/nat/native")).every(d =>
+		!fs.existsSync(path.join(p.cwd, ".pi/loop-state/nat/native", d, "events.jsonl"))), "no native program ran");
+});
+
+test("a declaration can't give a native agent an API key", { timeout: 60_000 }, async t => {
+	const p = project(t, { files: { ".pi/loop.json": JSON.stringify({ loops: [{ id: "keyed", prompt: "x", every: "1h", run: "fresh", model: "claude-x/claude-haiku-5-5",
+		agents: { "claude-x": { run: "claude", env: { ANTHROPIC_API_KEY: "sk-test" } } } }] }) } });
+	const pi = new Pi(t, p, {}, { sessionDir: tmp(t, "pi-loop-e2e-sessions-") });
+	await pi.ready();
+	await until("the refusal", () => /can't set ANTHROPIC_API_KEY/.test(pi.notes()), 45_000);
+	assert.equal(fs.existsSync(path.join(p.cwd, ".pi/loops.json")) ? loopOf(p, "keyed") : undefined, undefined, "the loop was not made");
+});
+
+test("a native loop's agent environment never reaches its Pi fallback run", { skip: real, timeout: 300_000 }, async t => {
+	const { p, pi } = await bgSession(t, { loops: [nativeLoop("scoped", { model: ["claude-x/claude-haiku-5-5", `${PROVIDER}/${MODEL}`],
+		prompt: `Run the shell command: echo "scope=\${LOOPTEST_SCOPE:-unset} config=\${CLAUDE_CONFIG_DIR:-unset}". ${REPORT(false, "<the line it printed>")}` })] });
+	await pi.command("/loop run scoped");
+	const rec = await until("the Pi run done", () => { const r = loopOf(p, "scoped")?.lastRun; return r?.status === "done" && r; });
+	assert.match(rec.result, /scope=unset config=unset/);
+	assert.equal(process.env.LOOPTEST_SCOPE, undefined);
+});

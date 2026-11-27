@@ -9,6 +9,9 @@ no mode migrate to forks on load. Optional gates decide whether a due loop wakes
   holds intervals, daily times and DST. `gate.ts` runs gates. `models.ts` holds model fallback
   (lists, held-back models, the optional check command). `prompt.ts` builds a fire's
   message. `background.ts` runs a loop's turn in a child Pi over RPC (fork, thread or fresh) and
+  `native.ts` runs a loop's turn as Claude Code or Codex itself (a loop's `agents`), in a terminal a host opens from the
+  start event's `native`; `bin/native-hook.sh` and `bin/loop-report.mjs` are what that program calls. Keep its
+  environment scoped to that program, its fallback as strict as a Pi run's, and never read a login folder.
   `view.ts` is the loops view and `watch.ts` a run full screen, drawn with Pi's own message components. `standalone.ts` is that watcher on its own (a Pi started with `PI_LOOP_WATCH`), and `control.ts` the private local socket it uses to reach the owning session (state, steer, take over, finished). `liveness.ts` is explicitly loaded in each RPC child: it implements the
   optional session-liveness v1 host contract and sends only busy/idle/error, so a settled turn with
   detached work or queued completions is not mistaken for a completed loop. Background runs and the folder lock live process-wide (`shared` in

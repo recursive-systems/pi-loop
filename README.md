@@ -212,6 +212,41 @@ Before going back to a release without fallback, change model lists back to sing
 releases refuse a list declared in `.pi/loop.json`, and pass one saved by `loop_manage` to Pi as a
 single comma-joined value, which fails.
 
+### Native runs: Claude Code or Codex
+
+A background loop's run can be the agent's own program instead of a hidden Pi: open its terminal and it is an
+ordinary Claude Code or Codex session. Name the agents in the loop's declaration, and use an agent's name as the
+provider of a `model` entry. Entries of other providers still run in Pi, so a list can fall back from one to the other:
+
+```json
+{"id": "health", "prompt": "/health", "every": "15m", "gate": "gates/health", "run": "fresh",
+ "agents": {"claude-a": {"run": "claude", "env": {"CLAUDE_CONFIG_DIR": "~/.claude-a"}},
+            "codex":    {"run": "codex"}},
+ "model": ["claude-a/claude-sonnet-5-5", "codex/gpt-6.2-sol:high", "provider/fallback-model"]}
+```
+
+- **It needs a terminal host.** pi-loop never opens terminals: an integration such as pi-loop-herdr starts the
+  program it is given (the start event's `native`) and hands back a handle. With none, the run doesn't start and
+  the fire moves on to the next model.
+- **It signs in as itself.** `env` reaches that agent's program and nothing else (not this session, not other
+  loops, not the loop's Pi runs). pi-loop never reads a login folder, removes API-key and gateway variables
+  (`ANTHROPIC_*`, `OPENAI_API_KEY`, ...) from the program's environment, and refuses them in `env`.
+- **It reports and ends as a Pi run does.** The prompt (templates expanded, as for Pi; a Pi command can't run
+  natively) tells it to report with `bin/loop-report.mjs` (same report, same fields). Claude Code's hooks and
+  status line, or Codex's notify command, tell pi-loop when it took the prompt and when its turn ended, through a
+  private folder per run. A fresh run that finished well stays open for you; a failed one, or a thread, ends.
+- **Unattended.** Claude Code runs with `bypassPermissions` (as a Pi run, it has no approval prompts), Codex with
+  `-a never -s danger-full-access`. First-run screens (theme, security notes, trusting the loop's folder) are
+  passed on their default, and a prompt they swallow is typed once.
+- **Fallback.** A Claude Code turn that ends on a usage limit, overload or sign-in error before doing anything
+  holds that agent and model back and moves the fire on, as for a Pi model; so does a program that doesn't take
+  its prompt within two minutes. Holds are per entry, so one account can fall back to another.
+- **Modes.** `fresh`, and `thread` (Claude Code `--resume`, Codex `resume`, on the agent's own session); `fork`
+  runs fresh. `/loop take` points you at the terminal instead. Pi-only tools and tool-policy extensions don't
+  apply to a native run, so keep a loop that depends on one in Pi.
+- **Usage.** Each run's record and a `native-usage` line in `.pi/loops.log.jsonl` say what Claude Code's status
+  line showed (tokens, its own cost estimate, rate limits); Codex shows none, so its usage is unknown, not zero.
+
 Each run ends with `loop_report`: whether it found something, one line, and optionally when to run
 next (only sooner, on a gated loop with a fixed schedule) or to stop. Only reports that need you enter the conversation; other results stay in the loops
 view, as described above.

@@ -44,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { Run, RUN_MODES, extensionFlags, piCommand, groundAttention, lastAssistantText, sessionFolder, transcriptOf, type Report, type RunMode, type RunRecord, type Surface } from "./background.ts";
 import { DEFAULT_GATE_TIMEOUT_MS, logDecision, resolveGate, runGate, type GateConfig, type GateDecision, type GateSession } from "./gate.ts";
 import { compose, type CommandInfo } from "./prompt.ts";
+import { NativeRun, agentFor, parseAgents, type Agents } from "./native.ts";
 import { FolderLock, lockAvailable } from "./lock.ts";
 import { DEFAULT_MODEL_BACKOFF_MS, MAX_BACKOFF_FACTOR, checkModels, holdModel, modelKey, modelList, parseModels, pickModel, readHolds, skippedFor, splitModel, writeHolds, type CheckAnswer, type Holds, type ModelSpec } from "./models.ts";
 import { LoopsView, GLYPH, type Dot, type LoopRow, type ViewAction } from "./view.ts";
@@ -144,11 +145,14 @@ interface Instance {
  *   check_unavailable  the same, for any model error, and the check command then lists the model as unavailable
  *   no_credentials     Pi lists no credentials for its provider, so the prompt was never sent
  *   not_started        its Pi didn't start, so the prompt was never sent
+ *   agent_unavailable  a native run (native.ts): its agent's turn ended on a usage limit, overload or sign-in error,
+ *                      with no content and no tool run
  */
-type Unavailable = "gave_up_retrying" | "check_unavailable" | "no_credentials" | "not_started";
+type Unavailable = "gave_up_retrying" | "check_unavailable" | "no_credentials" | "not_started" | "agent_unavailable";
 const UNAVAILABLE: Record<Unavailable, string> = {
 	gave_up_retrying: "Pi gave up retrying a transient model error", check_unavailable: "the check command lists it as unavailable",
 	no_credentials: "Pi lists no credentials for it", not_started: "a run on it didn't start, and one on another model did",
+	agent_unavailable: "its native agent said it can't serve now (a usage limit, overload or sign-in error) before doing anything",
 };
 /** One fire of a background loop, as its runs are started: on its first available model, then the next ones. */
 interface Launch {
@@ -190,6 +194,8 @@ export interface RunEventBase {
 	title: string; description: string;
 	/** The folder its Pi works in, and the model it asks for. */
 	folder: string; model?: string;
+	/** A native run (native.ts): the loop's agent name and its kind of program; its start event also carries `native`. */
+	agent?: string; agentKind?: "claude" | "codex";
 	/** The project whose session runs the loop. */
 	project: string;
 	/** Opens a live view of the run in any terminal: steer it, or Tab to take it over there. */
@@ -204,12 +210,15 @@ function emitRun(data: object) { try { shared.bus?.emit("loop:run", data); } cat
 async function announceStart(run: Run, base: RunEventBase): Promise<void> {
 	runEvents.set(run, base);
 	const env: Record<string, string> = {}, waits: Promise<unknown>[] = [];
-	emitRun({ ...base, phase: "start", env, waitFor: (p: Promise<unknown>) => { waits.push(Promise.resolve(p).catch(() => undefined)); } });
+	// A native run (native.ts): its host starts exactly this program in a terminal, and hands the run that terminal.
+	const native = run instanceof NativeRun ? { agent: run.native.agent, kind: run.kind, argv: run.argv(), cwd: run.cwd, host: (h: any) => run.provide(h) } : undefined;
+	emitRun({ ...base, phase: "start", env, ...(native ? { native } : {}), waitFor: (p: Promise<unknown>) => { waits.push(Promise.resolve(p).catch(() => undefined)); } });
 	if (waits.length) {
 		let t: ReturnType<typeof setTimeout> | undefined;
 		await Promise.race([Promise.allSettled(waits), new Promise(r => { t = setTimeout(r, RUN_START_WAIT_MS); })]);
 		if (t) clearTimeout(t);
 	}
+	if (native) return; // its program runs in its host's terminal, with its own environment
 	const add: Record<string, string> = {};
 	for (const [k, v] of Object.entries(env)) if (typeof v === "string" && !OWN_ENV.test(k)) add[k] = v;
 	if (Object.keys(add).length) run.addEnv(add);
@@ -278,6 +287,8 @@ interface Loop {
 	run: LoopMode;
 	/** A background run's model, provider/id[:thinking], or a list to fall back through (first choice first); absent = this session's. */
 	model?: ModelSpec;
+	/** Native agents (native.ts): a model whose provider is one of these names runs as that agent's own program. */
+	agents?: Agents;
 	/** It ends then: ad hoc loops after 7 days unless they say otherwise; absent = never. */
 	expiresAt?: number;
 	/** Its latest background run. */
@@ -332,7 +343,7 @@ interface Declared {
 	id: string; prompt: string; every?: string; at?: string; timezone?: string;
 	gate?: string; maxSleep?: string; gateTimeout?: string; gateOnError?: string;
 	priority?: number; context?: string[]; paused?: boolean;
-	run?: string; for?: string; until?: string; model?: ModelSpec;
+	run?: string; for?: string; until?: string; model?: ModelSpec; agents?: unknown;
 }
 
 // ------------------------------------------------------------ settings --
@@ -1346,9 +1357,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	/** The gate log's line for a run that started: links a wake (the line before it) to the run's session. */
-	function logFired(m: RunMeta, session?: string, on?: Pick<RunRecord, "model" | "fallback" | "passedOver">) {
+	function logFired(m: RunMeta, session?: string, on?: Pick<RunRecord, "model" | "fallback" | "passedOver" | "native">) {
 		logDecision(gateLog, { ts: new Date().toISOString(), id: m.loop, action: "fired", fire: m.fire, by: m.by, mode: m.mode, ...(m.late ? { late: m.late } : {}), ...(session ? { session } : {}),
-			...(on?.model ? { model: on.model } : {}), ...(on?.fallback ? { fallback: true } : {}), ...(on?.passedOver?.length ? { passedOver: on.passedOver } : {}) });
+			...(on?.model ? { model: on.model } : {}), ...(on?.fallback ? { fallback: true } : {}), ...(on?.passedOver?.length ? { passedOver: on.passedOver } : {}),
+			...(on?.native ? { native: { agent: on.native.agent, run: on.native.run, ...(on.native.session ? { session: on.native.session } : {}) } } : {}) });
 	}
 
 	/** The deep judge's answer to the loop's last report, for its next fire (a fork or fresh loop). */
@@ -1510,7 +1522,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** Start one run of a fire: on `choice`, or with a fallback list, on the first model the holds and a check (if any) allow. */
 	function launch(l: Loop, a: Launch, place: ReturnType<typeof runPlace>, choice: string | undefined, s: { args: string[]; mode: RunMode }, attemptId: string) {
-		const run = new Run(l.id, a.meta.fire, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, a.report, a.meta), attemptId });
+		const native = agentFor(place.model, l.agents);
+		const run = native ? nativeRun(l, a, place, native, s.mode, attemptId)
+			: new Run(l.id, a.meta.fire, s.mode, { ...place, sessionArgs: s.args, env: childEnv(l, a.report, a.meta), attemptId });
 		run.origin = originOf(l);
 		(shared.launches ??= new WeakMap()).set(run, a);
 		shared.runs.set(l.id, run);
@@ -1519,8 +1533,22 @@ export default function loopExtension(pi: ExtensionAPI) {
 		a.noCredentials = false;
 		void (async () => {
 			try {
+				// A loop with native agents picks its model before its start event: the model decides what starts.
+				if (l.agents && a.chain.length > 1 && !a.tried.length) {
+					const picked = await firstPick(l, a);
+					if (picked && picked !== choice && (agentFor(picked, l.agents) || native)) {
+						if (shared.runs.get(l.id) === run) shared.runs.delete(l.id);
+						a.tried.push(picked);
+						launch(l, a, runPlace(l, picked), picked, s, attemptId);
+						return;
+					}
+					if (picked !== choice && picked) { const m = splitModel(picked); run.useModel(m.model, m.thinking); }
+					choice = picked;
+					a.tried.push(choice!);
+				}
+				if (native && a.text.startsWith("/")) throw new Error(`a native ${native.spec.run} run can't run the Pi command ${a.text.split(/\s/)[0]}`);
 				await announceStart(run, runEvent(l, run, a.meta.by, a.gate));
-				if (a.chain.length > 1) {
+				if (a.chain.length > 1 && !a.tried.includes(choice!)) {
 					if (!a.tried.length) {
 						const check = await checkNow(l.id, a.chain);
 						if (check) a.check = { unavailable: [...check.unavailable], available: [...check.available] };
@@ -1556,6 +1584,26 @@ export default function loopExtension(pi: ExtensionAPI) {
 		})();
 	}
 
+	/** A fire's first model, as the holds and the check command (asked now) allow; what it passed over is recorded. */
+	async function firstPick(l: Loop, a: Launch): Promise<string | undefined> {
+		const check = await checkNow(l.id, a.chain);
+		if (check) a.check = { unavailable: [...check.unavailable], available: [...check.available] };
+		const now = Date.now(), picked = pickModel(a.chain, holds, now, [], check);
+		if (picked) a.passedOver.push(...skippedFor(a.chain, picked, holds, now, [], check));
+		return picked;
+	}
+
+	/** A native run (native.ts) of `l` on `native`: fresh, or a thread carried on in the agent's own session. */
+	function nativeRun(l: Loop, a: Launch, place: ReturnType<typeof runPlace>, native: NonNullable<ReturnType<typeof agentFor>>, mode: RunMode, attemptId: string): NativeRun {
+		const runMode: RunMode = mode === "thread" ? "thread" : "fresh";
+		const last = l.lastRun?.native;
+		const resume = runMode === "thread" && last?.agent === native.name && last.session ? last.session : undefined;
+		return new NativeRun(l.id, a.meta.fire, runMode, { ...place, sessionArgs: [], env: childEnv(l, a.report, a.meta), attemptId }, {
+			agent: native.name, spec: native.spec, agentModel: place.model!.slice(native.name.length + 1), thinking: place.thinking,
+			dir: path.join(stateDirOf(l), "native", attemptId), text: a.text, resume, agentDir: agentDir(), label: `loop ${l.id} #${a.meta.fire}`,
+		});
+	}
+
 	/**
 	 * A run of a loop with fallback models couldn't use its model, and did nothing (see Unavailable): hold
 	 * the model back where that is evidence against it, and start the same fire again on the next model.
@@ -1567,7 +1615,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const failed = modelKey(a.tried[a.tried.length - 1]!);
 		// A Pi that didn't start may have failed for a reason of its own: held back only once another one starts.
 		// Credentials Pi doesn't list may only be late: never held, so the next fire asks again.
-		if (why === "gave_up_retrying" || why === "check_unavailable") holdFor(l, failed, run.fire, why);
+		if (why === "gave_up_retrying" || why === "check_unavailable" || why === "agent_unavailable") holdFor(l, failed, run.fire, why);
 		else if (why === "not_started") a.unstarted.push(failed);
 		if (l.paused || !background(l) || !loops.includes(l)) return false;
 		const now = Date.now(), next = pickModel(a.chain, holds, now, a.tried, checkOf(a));
@@ -1587,10 +1635,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	/** The model a run of `l` uses, for its record, whether that is a fallback (not its first choice), and what this fire passed over. */
-	function modelOf(l: Loop, run: Run, a = shared.launches?.get(run)): Pick<RunRecord, "model" | "fallback" | "passedOver"> {
+	function modelOf(l: Loop, run: Run, a = shared.launches?.get(run)): Pick<RunRecord, "model" | "fallback" | "passedOver" | "native"> {
 		const model = run.reportedModel ?? run.model, chain = chainOf(l);
 		return { ...(model ? { model } : {}), ...(chain.length > 1 && run.model && modelKey(chain[0]!) !== run.model ? { fallback: true as const } : {}),
-			...(a?.passedOver.length ? { passedOver: [...a.passedOver] } : {}) };
+			...(a?.passedOver.length ? { passedOver: [...a.passedOver] } : {}), ...(run instanceof NativeRun ? { native: run.info() } : {}) };
 	}
 
 	const checkOf = (a: Launch): CheckAnswer | undefined => a.check && { unavailable: new Set(a.check.unavailable), available: new Set(a.check.available) };
@@ -1709,7 +1757,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	async function finishRun(id: string, run: Run, report: string) {
 		if (run.handedOver || run.recorded || run.finishing) return;
 		run.finishing = true;
-		const text = run.exited ? (run.sessionFile ? lastAssistantText(run.sessionFile) : undefined) : await run.lastText();
+		const text = run instanceof NativeRun ? run.lastKnownText : run.exited ? (run.sessionFile ? lastAssistantText(run.sessionFile) : undefined) : await run.lastText();
 		if (run.handedOver) return; // taken over while its answer was being read
 		// A completion can start the next turn while get_last_assistant_text is in flight.
 		if (!run.exited && !run.cancelled && !run.livenessError && (run.working || run.backgroundWork)) {
@@ -1732,7 +1780,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// retrying a transient error, or the check command (asked afresh) lists the model. A quota error Pi
 		// doesn't retry is only known through a check.
 		if (status === "failed" && !crashed && run.failedBeforeWork && chain.length > 1 && run.model) {
-			if (run.gaveUpRetrying) unavailable = "gave_up_retrying";
+			if (run.gaveUpRetrying) unavailable = run instanceof NativeRun ? "agent_unavailable" : "gave_up_retrying";
 			else {
 				const check = await checkNow(id, chain, true), a = shared.launches?.get(run);
 				// The fresh answer also chooses the next model.
@@ -1753,6 +1801,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const l = candidate && sameRun(candidate, run) ? candidate : undefined;
 		const ask = o.rep?.ask?.trim() || undefined;
 		traceRun(run, "terminal", { status: o.status, session: run.sessionFile, findings: o.findings, hasAsk: !!ask, needsPermission: !!run.needsYou, error: o.status === "failed" });
+		// A native run's usage, as its agent showed it (unknown, not zero, when it shows none), for the scorecard.
+		if (run instanceof NativeRun) logDecision(gateLog, { ts: new Date().toISOString(), id, action: "native-usage", fire: run.fire, attemptId: run.attemptId, status: o.status,
+			...run.info(), ...(run.model ? { model: run.model } : {}), usage: run.usage ?? run.readUsage() ?? null, reported: !!o.rep });
 		endRun(run, o.status, { findings: o.findings, result: o.summary.slice(0, 500), ...(ask ? { ask } : {}), ...(run.needsYou ? { needsYou: true } : {}) });
 		// A model that served a run is available. One that couldn't, for want of it, is held back and the fire
 		// goes on on the next model; that attempt leaves no record of its own (the next run's passedOver has it).
@@ -2017,6 +2068,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
 		const run = shared.runs.get(l.id);
+		const nat = run instanceof NativeRun ? run.info() : !run ? l.lastRun?.native : undefined;
+		if (nat) return `${l.id}'s run is a native ${nat.run} session: open it in its terminal${nat.terminal ? ` (${nat.terminal})` : ""} and type there`;
 		if (run?.backgroundWork && !now && !anyway) return `${l.id}'s run is waiting for background work it started, which reports back only to that run; watch or steer it, or /loop take ${l.id} now to stop it anyway (that work may not report back)`;
 		const file = run?.sessionFile ?? l.lastRun?.session;
 		if (!file) return `${l.id} has no run to go into`;
@@ -2084,6 +2137,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			title: `loop ${l.id} #${run.fire}`,
 			description: `${first} · ${desc(l)} · ${why}`,
 			folder: run.cwd, ...(run.model ? { model: run.model } : {}), project: ctx?.cwd ?? run.cwd,
+			...(run instanceof NativeRun ? { agent: run.native.agent, agentKind: run.kind } : {}),
 			watch: { argv, env, cwd: run.cwd, command: `cd ${q(run.cwd)} && ${Object.entries(env).map(([k, v]) => `${k}=${q(v)}`).join(" ")} ${argv.map(q).join(" ")}` },
 		};
 	}
@@ -2517,11 +2571,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 					loops.push(loop); changed = true;
 					continue;
 				}
-				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context, x.run, x.model, x.expiresAt]);
+				const defOf = (x: Loop) => JSON.stringify([x.prompt, x.schedule, x.tz, x.gate, x.priority, x.dir, x.context, x.run, x.model, x.expiresAt, ...(x.agents ? [x.agents] : [])]);
 				const before = defOf(l);
 				const reschedule = JSON.stringify(l.schedule) !== JSON.stringify(def.schedule) || l.tz !== def.tz;
 				Object.assign(l, def);
-				for (const k of ["tz", "gate", "priority", "dir", "context", "run", "model", "expiresAt"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
+				for (const k of ["tz", "gate", "priority", "dir", "context", "run", "model", "agents", "expiresAt"] as const) if ((def as any)[k] === undefined) delete (l as any)[k];
 				l.catchUp = catchUpOf(l.schedule);
 				// Only a change to the declared `paused` pauses or resumes; /loop pause and resume hold otherwise.
 				if (l.declaredPaused !== declaredPaused) {
@@ -2538,7 +2592,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (changed) { save(); refreshStatus(); }
 	}
 
-	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context" | "run" | "model" | "expiresAt"> {
+	function fromDeclared(d: Declared, folder: string): Pick<Loop, "id" | "prompt" | "schedule" | "tz" | "gate" | "priority" | "dir" | "context" | "run" | "model" | "agents" | "expiresAt"> {
 		if (!d || typeof d !== "object") throw new Error("not an object");
 		if (typeof d.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(d.id)) throw new Error("id: letters, digits, . _ -");
 		if (typeof d.prompt !== "string" || !d.prompt.trim()) throw new Error("prompt is required");
@@ -2556,6 +2610,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		const run = executionMode(d.run);
 		const model = backgroundModel(d.model, run);
+		const agents = parseAgents(d.agents);
+		if (agents && run === "foreground") throw new Error("agents apply to a background loop (run: fresh or thread)");
 		const tz = d.timezone ? validZone(d.timezone) : undefined;
 		if (d.timezone && !tz) throw new Error(`unknown time zone "${d.timezone}"`);
 		if (tz && !zoned(schedule)) throw new Error("a time zone applies only to at loops and whole-day intervals");
@@ -2572,7 +2628,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (typeof ends === "string") throw new Error(ends);
 		return { id: d.id, prompt: d.prompt.trim(), schedule, ...(tz ? { tz } : {}), ...(gate ? { gate } : {}),
 			...(d.priority ? { priority: d.priority } : {}), ...(dir ? { dir } : {}), ...(context ? { context } : {}),
-			run, ...(model ? { model } : {}), ...(ends ? { expiresAt: ends } : {}) };
+			run, ...(model ? { model } : {}), ...(agents ? { agents } : {}), ...(ends ? { expiresAt: ends } : {}) };
 	}
 
 	/** A loop's `model` (one, or a list to fall back through), which only a background loop can have. Throws with what is wrong. */

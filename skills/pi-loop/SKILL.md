@@ -120,6 +120,10 @@ One session can carry several responsibilities, each a loop:
   Other failures are reported as before. A quota error Pi doesn't retry is only caught through
   `loop.modelCheck`. `loop.fallbackModels` in settings adds fallbacks to background loops that name
   no model; a loop that names one keeps exactly that.
+  A loop's `agents` (`{"claude-a": {"run": "claude", "env": {"CLAUDE_CONFIG_DIR": "~/.claude-a"}}}`) make a
+  model entry with that provider (`claude-a/claude-sonnet-5-5`) run as Claude Code or Codex itself, in a terminal
+  a host such as pi-loop-herdr opens; it reports with `bin/loop-report.mjs` and falls back like a Pi model. See
+  the README's "Native runs".
   Stepping into a run from another folder isn't possible from here (Pi would move your session
   there): watch and steer it instead.
 - **One agent for several folders:** `loop.folders` in the project's settings adopts sibling folders
