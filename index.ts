@@ -119,6 +119,8 @@ interface Shared {
 	pending: ((cur: Instance) => void | Promise<void>)[];
 	/** The event bus of the instance that owns the loops now (Pi rebuilds extensions, and may rebuild the bus, on a switch). */
 	bus?: ExtensionAPI["events"];
+	/** Original event metadata for runs that may finish after a new extension instance takes ownership. */
+	runEvents?: WeakMap<Run, RunEventBase>;
 	/** Recent runs by `<loop>#<fire>`, for standalone watchers of runs a newer one has replaced. */
 	runInfo?: Map<string, RunInfo>;
 	/** Runs taken over from a standalone watcher in another terminal, by loop id; the watcher's Pi is in its conversation. */
@@ -201,7 +203,12 @@ export interface RunEventBase {
 	/** Opens a live view of the run in any terminal: steer it, or Tab to take it over there. */
 	watch: { argv: string[]; env: Record<string, string>; cwd: string; command: string };
 }
-const runEvents = new WeakMap<Run, RunEventBase>();
+const runEvents = shared.runEvents ??= new WeakMap<Run, RunEventBase>();
+
+/** A run can outlive the module that constructed it when Pi reloads extensions. */
+function isNativeRun(run: Run): run is NativeRun {
+	return "native" in run;
+}
 /** The longest a run waits for `start` listeners' `waitFor` promises. */
 const RUN_START_WAIT_MS = 5_000;
 const OWN_ENV = /^PI_LOOP_/;
@@ -211,7 +218,7 @@ async function announceStart(run: Run, base: RunEventBase): Promise<void> {
 	runEvents.set(run, base);
 	const env: Record<string, string> = {}, waits: Promise<unknown>[] = [];
 	// A native run (native.ts): its host starts exactly this program in a terminal, and hands the run that terminal.
-	const native = run instanceof NativeRun ? { agent: run.native.agent, kind: run.kind, argv: run.argv(), cwd: run.cwd, host: (h: any) => run.provide(h) } : undefined;
+	const native = isNativeRun(run) ? { agent: run.native.agent, kind: run.kind, argv: run.argv(), cwd: run.cwd, host: (h: any) => run.provide(h) } : undefined;
 	emitRun({ ...base, phase: "start", env, ...(native ? { native } : {}), waitFor: (p: Promise<unknown>) => { waits.push(Promise.resolve(p).catch(() => undefined)); } });
 	if (waits.length) {
 		let t: ReturnType<typeof setTimeout> | undefined;
@@ -1638,7 +1645,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function modelOf(l: Loop, run: Run, a = shared.launches?.get(run)): Pick<RunRecord, "model" | "fallback" | "passedOver" | "native"> {
 		const model = run.reportedModel ?? run.model, chain = chainOf(l);
 		return { ...(model ? { model } : {}), ...(chain.length > 1 && run.model && modelKey(chain[0]!) !== run.model ? { fallback: true as const } : {}),
-			...(a?.passedOver.length ? { passedOver: [...a.passedOver] } : {}), ...(run instanceof NativeRun ? { native: run.info() } : {}) };
+			...(a?.passedOver.length ? { passedOver: [...a.passedOver] } : {}), ...(isNativeRun(run) ? { native: run.info() } : {}) };
 	}
 
 	const checkOf = (a: Launch): CheckAnswer | undefined => a.check && { unavailable: new Set(a.check.unavailable), available: new Set(a.check.available) };
@@ -1757,7 +1764,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	async function finishRun(id: string, run: Run, report: string) {
 		if (run.handedOver || run.recorded || run.finishing) return;
 		run.finishing = true;
-		const text = run instanceof NativeRun ? run.lastKnownText : run.exited ? (run.sessionFile ? lastAssistantText(run.sessionFile) : undefined) : await run.lastText();
+		const text = isNativeRun(run) ? run.lastKnownText : run.exited ? (run.sessionFile ? lastAssistantText(run.sessionFile) : undefined) : await run.lastText();
 		if (run.handedOver) return; // taken over while its answer was being read
 		// A completion can start the next turn while get_last_assistant_text is in flight.
 		if (!run.exited && !run.cancelled && !run.livenessError && (run.working || run.backgroundWork)) {
@@ -1780,7 +1787,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		// retrying a transient error, or the check command (asked afresh) lists the model. A quota error Pi
 		// doesn't retry is only known through a check.
 		if (status === "failed" && !crashed && run.failedBeforeWork && chain.length > 1 && run.model) {
-			if (run.gaveUpRetrying) unavailable = run instanceof NativeRun ? "agent_unavailable" : "gave_up_retrying";
+			if (run.gaveUpRetrying) unavailable = isNativeRun(run) ? "agent_unavailable" : "gave_up_retrying";
 			else {
 				const check = await checkNow(id, chain, true), a = shared.launches?.get(run);
 				// The fresh answer also chooses the next model.
@@ -1802,7 +1809,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const ask = o.rep?.ask?.trim() || undefined;
 		traceRun(run, "terminal", { status: o.status, session: run.sessionFile, findings: o.findings, hasAsk: !!ask, needsPermission: !!run.needsYou, error: o.status === "failed" });
 		// A native run's usage, as its agent showed it (unknown, not zero, when it shows none), for the scorecard.
-		if (run instanceof NativeRun) logDecision(gateLog, { ts: new Date().toISOString(), id, action: "native-usage", fire: run.fire, attemptId: run.attemptId, status: o.status,
+		if (isNativeRun(run)) logDecision(gateLog, { ts: new Date().toISOString(), id, action: "native-usage", fire: run.fire, attemptId: run.attemptId, status: o.status,
 			...run.info(), ...(run.model ? { model: run.model } : {}), usage: run.usage ?? run.readUsage() ?? null, reported: !!o.rep });
 		endRun(run, o.status, { findings: o.findings, result: o.summary.slice(0, 500), ...(ask ? { ask } : {}), ...(run.needsYou ? { needsYou: true } : {}) });
 		// A model that served a run is available. One that couldn't, for want of it, is held back and the fire
@@ -2068,7 +2075,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const l = find(id);
 		if (!l) return `no loop "${id}"`;
 		const run = shared.runs.get(l.id);
-		const nat = run instanceof NativeRun ? run.info() : !run ? l.lastRun?.native : undefined;
+		const nat = run && isNativeRun(run) ? run.info() : !run ? l.lastRun?.native : undefined;
 		if (nat) return `${l.id}'s run is a native ${nat.run} session: open it in its terminal${nat.terminal ? ` (${nat.terminal})` : ""} and type there`;
 		if (run?.backgroundWork && !now && !anyway) return `${l.id}'s run is waiting for background work it started, which reports back only to that run; watch or steer it, or /loop take ${l.id} now to stop it anyway (that work may not report back)`;
 		const file = run?.sessionFile ?? l.lastRun?.session;
@@ -2137,7 +2144,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			title: `loop ${l.id} #${run.fire}`,
 			description: `${first} · ${desc(l)} · ${why}`,
 			folder: run.cwd, ...(run.model ? { model: run.model } : {}), project: ctx?.cwd ?? run.cwd,
-			...(run instanceof NativeRun ? { agent: run.native.agent, agentKind: run.kind } : {}),
+			...(isNativeRun(run) ? { agent: run.native.agent, agentKind: run.kind } : {}),
 			watch: { argv, env, cwd: run.cwd, command: `cd ${q(run.cwd)} && ${Object.entries(env).map(([k, v]) => `${k}=${q(v)}`).join(" ")} ${argv.map(q).join(" ")}` },
 		};
 	}
